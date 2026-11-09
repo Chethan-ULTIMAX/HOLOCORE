@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>HOLOCORE — procedural model previews</title>
+<style>
+  body { margin:0; background:#05070c; color:#dbe7f1; font-family:Inter,system-ui,sans-serif; padding:28px; }
+  h1 { font-size:18px; letter-spacing:.16em; font-weight:600; margin:0 0 4px; }
+  p.note { color:#7d93a6; font-size:12px; margin:0 0 24px; max-width:760px; line-height:1.6; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:18px; }
+  figure { margin:0; border:1px solid rgba(120,170,210,.16); border-radius:10px; overflow:hidden; background:#080c12; }
+  img { display:block; width:100%; height:auto; }
+  figcaption { padding:10px 12px; display:flex; flex-direction:column; gap:3px; }
+  figcaption strong { font-size:12.5px; font-weight:600; }
+  figcaption span { font-size:10px; color:#7d93a6; letter-spacing:.04em; }
+  figcaption a { font-size:10px; color:#3fd0ff; text-decoration:none; letter-spacing:.04em; }
+  figcaption a:hover { text-decoration:underline; }
+</style></head>
+<body>
+  <h1>HOLOCORE · PROCEDURAL MODEL PREVIEWS</h1>
+  <p class="note">Software-rasterised from the real scene graph in modelFactory.js using the same camera
+  the application uses. No GPU was available in the authoring environment, so these renders are the
+  visual verification that each assembly is real geometry rather than a placeholder.
+  The <a href="../index.html">live application</a> needs WebGL and a browser.</p>
+  <div class="grid">
+  <figure>
+    <img src="launchVehicle.png" alt="Astra-9 Launch Vehicle">
+    <figcaption>
+      <strong>Astra-9 Launch Vehicle</strong>
+      <span>Aerospace · 13 parts · 17,293 triangles</span>
+      <a href="launchVehicle-parts.png">part-id colouring</a>
+    </figcaption>
+  </figure>
+
+  <figure>
+    <img src="turbojet.png" alt="Single-Spool Turbojet">
+    <figcaption>
+      <strong>Single-Spool Turbojet</strong>
+      <span>Aerospace · 11 parts · 11,926 triangles</span>
+      <a href="turbojet-parts.png">part-id colouring</a>
+    </figcaption>
+  </figure>
+
+  <figure>
+    <img src="inlineEngine.png" alt="Inline-4 Automotive Engine">
+    <figcaption>
+      <strong>Inline-4 Automotive Engine</strong>
+      <span>Automotive · 13 parts · 18,544 triangles</span>
+      <a href="inlineEngine-parts.png">part-id colouring</a>
+    </figcaption>
+  </figure>
+
+  <figure>
+    <img src="gearTrain.png" alt="Spur Gear Train">
+    <figcaption>
+      <strong>Spur Gear Train</strong>
+      <span>Mechanical · 8 parts · 14,735 triangles</span>
+      <a href="gearTrain-parts.png">part-id colouring</a>
+    </figcaption>
+  </figure>
+
+  <figure>
+    <img src="robotArm.png" alt="6-Axis Industrial Robot">
+    <figcaption>
+      <strong>6-Axis Industrial Robot</strong>
+      <span>Robotics · 9 parts · 7,944 triangles</span>
+      <a href="robotArm-parts.png">part-id colouring</a>
+    </figcaption>
+  </figure>
+
+  <figure>
+    <img src="controlPCB.png" alt="Control Board (PCB)">
+    <figcaption>
+      <strong>Control Board (PCB)</strong>
+      <span>Electronics · 9 parts · 3,874 triangles</span>
+      <a href="controlPCB-parts.png">part-id colouring</a>
+    </figcaption>
+  </figure>
+
+  <figure>
+    <img src="cpuPackage.png" alt="CPU Package">
+    <figcaption>
+      <strong>CPU Package</strong>
+      <span>Computing · 7 parts · 4,952 triangles</span>
+      <a href="cpuPackage-parts.png">part-id colouring</a>
+    </figcaption>
+  </figure>
+
+  <figure>
+    <img src="windTurbine.png" alt="Utility Wind Turbine">
+    <figcaption>
+      <strong>Utility Wind Turbine</strong>
+      <span>Industrial · 10 parts · 10,406 triangles</span>
+      <a href="windTurbine-parts.png">part-id colouring</a>
+    </figcaption>
+  </figure></div>
+</body></html>

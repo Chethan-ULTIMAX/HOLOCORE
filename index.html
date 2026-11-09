@@ -1,117 +1,546 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HOLOCORE — Spatial Engineering</title>
-
-    <link rel="stylesheet" href="styles.css">
-
-    <script type="importmap">
-    {
-        "imports": {
-            "three": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js",
-            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/"
-        }
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#05070c">
+  <title>HOLOCORE — Spatial Engineering Workstation</title>
+  <meta name="description" content="A browser-based 3D engineering workstation with real webcam hand tracking, natural two-hand manipulation and component inspection.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2306080d'/%3E%3Cpath d='M9 8v16M23 8v16M9 16h14' stroke='%233fd0ff' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./vendor/three/three.module.js",
+      "three/addons/": "./vendor/three/addons/"
     }
-    </script>
+  }
+  </script>
 </head>
+<body data-permission="idle">
 
-<body>
-    <header class="topbar">
-        <div class="brand">
-            <span class="brand-mark">H</span>
-            <span>HOLOCORE</span>
+  <!-- ===================== TOP BAR ===================== -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M8 7v18M24 7v18M8 16h16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+          <circle cx="16" cy="16" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6" opacity="0.7"/>
+        </svg>
+        <div class="brand-text">
+          <span class="brand-name">HOLOCORE</span>
+          <span class="brand-sub">SPATIAL ENGINEERING</span>
+        </div>
+      </div>
+      <div class="topbar-divider" aria-hidden="true"></div>
+      <div class="workspace-chip">
+        <span class="workspace-chip-label">WORKSPACE</span>
+        <span class="workspace-chip-value" id="workspace-model">Astra-9 Launch Vehicle</span>
+      </div>
+    </div>
+
+    <div class="topbar-center" role="group" aria-label="Primary view controls">
+      <button class="chip-btn" id="camera-toggle" data-role="camera-toggle" autocomplete="off">
+        <span class="dot dot-off" id="camera-dot"></span>
+        <span id="camera-toggle-label">Enable camera</span>
+      </button>
+      <button class="chip-btn" id="layout-toggle" title="Toggle panels (L)">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1" y="2.5" width="4" height="11" rx="1"/><rect x="6.5" y="2.5" width="8.5" height="11" rx="1" opacity="0.45"/></svg>
+        Panels
+      </button>
+    </div>
+
+    <div class="topbar-right">
+      <div class="status-pills">
+        <span class="pill" id="pill-camera"><i class="pill-dot"></i><span>CAMERA OFF</span></span>
+        <span class="pill" id="pill-hands"><i class="pill-dot"></i><span>0 HANDS</span></span>
+        <span class="pill" id="pill-gesture"><i class="pill-dot"></i><span>IDLE</span></span>
+      </div>
+      <button class="icon-btn" id="open-settings" title="Settings (S)" aria-label="Open settings">
+        <svg viewBox="0 0 20 20" aria-hidden="true">
+          <circle cx="10" cy="10" r="2.6"/>
+          <path d="M10 2.2v2M10 15.8v2M2.2 10h2M15.8 10h2M4.5 4.5l1.4 1.4M14.1 14.1l1.4 1.4M15.5 4.5l-1.4 1.4M5.9 14.1l-1.4 1.4"/>
+        </svg>
+      </button>
+      <button class="icon-btn" id="open-help" title="Interaction guide (?)" aria-label="Open interaction guide">
+        <svg viewBox="0 0 20 20" aria-hidden="true">
+          <circle cx="10" cy="10" r="7.4"/>
+          <path d="M7.9 7.6a2.2 2.2 0 1 1 3.3 2c-.8.5-1.2 1-1.2 1.9"/>
+          <circle cx="10" cy="14.2" r="0.9" fill="currentColor" stroke="none"/>
+        </svg>
+      </button>
+      <button class="icon-btn" id="fullscreen-toggle" title="Fullscreen (F)" aria-label="Toggle fullscreen">
+        <svg viewBox="0 0 20 20" aria-hidden="true">
+          <path d="M3 7V3h4M17 7V3h-4M3 13v4h4M17 13v4h-4"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ===================== WORKSPACE ===================== -->
+  <main class="workspace" id="workspace">
+
+    <!-- ---------- LEFT: MODEL LIBRARY ---------- -->
+    <aside class="panel panel-left" id="panel-left" aria-label="Model library">
+      <div class="panel-head">
+        <span class="panel-title">MODEL LIBRARY</span>
+        <button class="panel-collapse" data-collapse="left" title="Collapse panel" aria-label="Collapse model library">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5"/></svg>
+        </button>
+      </div>
+
+      <div class="library-scroll">
+        <div class="category-row" id="category-row" role="tablist" aria-label="Model categories"></div>
+        <div class="model-list" id="model-list"></div>
+
+        <div class="panel-section">
+          <div class="panel-section-head">
+            <span>PARTS IN ASSEMBLY</span>
+            <span class="count-badge" id="part-count">—</span>
+          </div>
+          <div class="part-list" id="part-list"></div>
         </div>
 
-        <div class="workspace-name">SPATIAL ENGINEERING WORKSPACE</div>
-
-        <div class="system-status">
-            <span class="status-dot"></span>
-            SYSTEM ONLINE
+        <div class="panel-section">
+          <div class="panel-section-head"><span>SCENE</span></div>
+          <div class="scene-controls">
+            <button class="tool-btn" id="tool-explode">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v4M8 10v4M2 8h4M10 8h4"/></svg>
+              Explode
+            </button>
+            <button class="tool-btn" id="tool-isolate" disabled>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3"/><circle cx="8" cy="8" r="6.2" opacity="0.5"/></svg>
+              Isolate
+            </button>
+            <button class="tool-btn" id="tool-focus" disabled>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4"/></svg>
+              Focus
+            </button>
+            <button class="tool-btn" id="tool-reset">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8a5 5 0 1 0 1.6-3.7M3 3v3h3"/></svg>
+              Reset
+            </button>
+            <button class="tool-btn" id="tool-grid">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6h12M2 10h12M6 2v12M10 2v12"/></svg>
+              Grid
+            </button>
+            <button class="tool-btn" id="tool-shadows">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.5" cy="6.5" r="3.6"/><ellipse cx="9.5" cy="12" rx="4" ry="1.6" opacity="0.5"/></svg>
+              Shadows
+            </button>
+            <button class="tool-btn" id="tool-rotate">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.6-3.7M13 3.6V7h-3.4"/></svg>
+              Auto-orbit
+            </button>
+            <button class="tool-btn" id="tool-import">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 11V3M5 6l3-3 3 3M3 12.5V13h10v-.5"/></svg>
+              Import GLB
+            </button>
+          </div>
+          <input type="file" id="file-input" accept=".glb,.gltf" hidden>
+          <p class="panel-note" id="import-note">Load your own GLB/GLTF assembly. Each mesh becomes an inspectable part.</p>
         </div>
-    </header>
+      </div>
 
-    <main class="workspace">
+      <div class="panel-foot">
+        <span id="library-foot-model">—</span>
+      </div>
+    </aside>
 
-        <aside class="panel explorer-panel">
-            <div class="panel-heading">
-                <span>ASSEMBLY EXPLORER</span>
-                <span class="panel-icon">◈</span>
+    <!-- ---------- CENTER: VIEWPORT ---------- -->
+    <section class="viewport-wrap" id="viewport-wrap">
+
+      <div class="viewport" id="viewport">
+        <div class="viewport-hud viewport-hud-tl">
+          <div class="hud-line">
+            <span class="hud-label">VIEWPORT</span>
+            <span class="hud-value" id="hud-model-status">INITIALISING</span>
+          </div>
+          <div class="hud-line">
+            <span class="hud-label">SELECTION</span>
+            <span class="hud-value hud-value-dim" id="hud-selection">NONE</span>
+          </div>
+        </div>
+
+        <div class="viewport-hud viewport-hud-tr">
+          <div class="hud-stat"><span id="hud-fps">—</span><small>FPS</small></div>
+          <div class="hud-stat"><span id="hud-tris">—</span><small>TRIS</small></div>
+          <div class="hud-stat"><span id="hud-hands">0</span><small>HANDS</small></div>
+        </div>
+
+        <!-- Aiming reticle projected from the index fingertip -->
+        <div class="reticle" id="reticle" hidden>
+          <span class="reticle-ring"></span>
+          <span class="reticle-dot"></span>
+          <span class="reticle-label" id="reticle-label"></span>
+        </div>
+
+        <!-- Click-to-select hint shown when nothing has been selected yet -->
+        <div class="viewport-hint" id="viewport-hint">
+          <span class="kbd">DRAG</span> orbit
+          <span class="kbd">SCROLL</span> zoom
+          <span class="kbd">CLICK</span> inspect
+          <span class="kbd">PINCH</span> grab
+        </div>
+
+        <!-- Transform readout -->
+        <div class="transform-readout">
+          <div><span>POS</span><b id="readout-pos">0.00, 0.00, 0.00</b></div>
+          <div><span>ROT</span><b id="readout-rot">0°</b></div>
+          <div><span>SCALE</span><b id="readout-scale">1.00×</b></div>
+        </div>
+      </div>
+
+      <!-- Live camera preview, overlaying the viewport corner -->
+      <div class="camera-card" id="camera-card" data-state="off">
+        <div class="camera-head">
+          <span class="camera-title">
+            <i class="live-dot"></i>
+            LIVE TRACKING
+          </span>
+          <div class="camera-head-actions">
+            <button class="mini-btn" id="camera-hide" title="Hide preview" aria-label="Hide camera preview">–</button>
+            <button class="mini-btn" id="camera-stop" title="Stop camera" aria-label="Stop camera">×</button>
+          </div>
+        </div>
+
+        <div class="camera-stage" id="camera-stage">
+          <video id="camera-video" playsinline muted autoplay></video>
+          <canvas id="camera-overlay"></canvas>
+          <div class="camera-placeholder" id="camera-placeholder">
+            <svg viewBox="0 0 48 48" aria-hidden="true"><rect x="6" y="12" width="36" height="26" rx="4"/><circle cx="24" cy="25" r="7"/><path d="M18 12l2.5-3.5h7L30 12"/></svg>
+            <strong>Camera inactive</strong>
+            <span>Activate the camera to track your hands</span>
+            <button class="btn btn-primary btn-sm" id="camera-activate">Enable camera</button>
+          </div>
+          <div class="camera-error" id="camera-error" hidden>
+            <strong>Camera unavailable</strong>
+            <p id="camera-error-text"></p>
+            <button class="btn btn-sm" id="camera-retry">Try again</button>
+          </div>
+          <div class="camera-statusbar">
+            <span class="tracking-state" id="tracking-state">CAMERA INACTIVE</span>
+            <span class="tracking-metric" id="tracking-metrics">—</span>
+          </div>
+        </div>
+
+        <div class="camera-foot">
+          <div class="hand-readouts" id="hand-readouts">
+            <div class="hand-readout" data-hand="Left">
+              <span class="hand-key">L</span>
+              <div><b>Left hand</b><small>not detected</small></div>
             </div>
-
-            <div class="assembly-info">
-                <div class="assembly-symbol">⬡</div>
-                <div>
-                    <strong>Demo Rocket</strong>
-                    <small id="component-count">Loading components...</small>
-                </div>
+            <div class="hand-readout" data-hand="Right">
+              <span class="hand-key">R</span>
+              <div><b>Right hand</b><small>not detected</small></div>
             </div>
+          </div>
+        </div>
+      </div>
 
-            <div class="section-label">COMPONENTS</div>
+      <button class="camera-restore" id="camera-restore" hidden>
+        <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="4" width="13" height="9" rx="1.6"/><circle cx="8" cy="8.5" r="2.4"/></svg>
+        Show camera
+      </button>
+    </section>
 
-            <div id="component-list" class="component-list"></div>
+    <!-- ---------- RIGHT: INSPECTOR / ASSISTANT ---------- -->
+    <aside class="panel panel-right" id="panel-right" aria-label="Inspector and assistant">
+      <div class="right-tabs" role="tablist" aria-label="Inspector and assistant">
+        <button class="right-tab active" data-tab="inspector" role="tab" aria-selected="true">INSPECTOR</button>
+        <button class="right-tab" data-tab="assistant" role="tab" aria-selected="false">ASSISTANT</button>
+        <button class="panel-collapse" data-collapse="right" title="Collapse panel" aria-label="Collapse inspector">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5"/></svg>
+        </button>
+      </div>
 
-            <div class="panel-footer">
-                HOLOCORE ENGINEERING
-            </div>
-        </aside>
+      <div class="right-pane" id="pane-inspector">
+        <div class="inspector-scroll" id="inspector-root"></div>
+      </div>
 
-        <section id="viewport">
+      <div class="right-pane" id="pane-assistant" hidden>
+        <div class="assistant-context" id="assistant-context">No context</div>
+        <div class="chat-scroll" id="chat-scroll">
+          <div class="chat-empty" id="chat-empty">
+            <strong>HOLOCORE Engineering Assistant</strong>
+            <p>Answers come from the structured engineering knowledge base and always use
+              the model and component you are inspecting.</p>
+            <div class="chat-suggestions" id="chat-suggestions"></div>
+          </div>
+          <div class="chat-log" id="chat-log" aria-live="polite"></div>
+        </div>
+        <form class="chat-form" id="chat-form" autocomplete="off">
+          <input type="text" id="chat-input" placeholder="Ask about this component…" aria-label="Ask the engineering assistant">
+          <button type="submit" class="send-btn" aria-label="Send question">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10h11M10 5.5 14.5 10 10 14.5"/></svg>
+          </button>
+        </form>
+      </div>
+    </aside>
+  </main>
 
-            <div class="scene-info">
-                <span>3D VIEWPORT</span>
-                <span id="model-status">INITIALIZING...</span>
-            </div>
+  <!-- ===================== BOTTOM STATUS BAR ===================== -->
+  <footer class="statusbar">
+    <div class="status-item">
+      <span class="status-key">CAM</span>
+      <span class="status-val" id="status-camera">Inactive</span>
+    </div>
+    <div class="status-item">
+      <span class="status-key">HANDS</span>
+      <span class="status-val" id="status-hands">0</span>
+    </div>
+    <div class="status-item">
+      <span class="status-key">GESTURE</span>
+      <span class="status-val" id="status-gesture">—</span>
+    </div>
+    <div class="status-item">
+      <span class="status-key">TRACK</span>
+      <span class="status-val" id="status-tracking">—</span>
+    </div>
+    <div class="status-item grow">
+      <span class="status-key">SELECTED</span>
+      <span class="status-val" id="status-selected">None</span>
+    </div>
+    <div class="status-item">
+      <span class="status-key">MODE</span>
+      <span class="status-val" id="status-mode">MOUSE</span>
+    </div>
+    <div class="status-item">
+      <span class="status-key">APP</span>
+      <span class="status-val status-ok" id="status-app">ONLINE</span>
+    </div>
+  </footer>
 
-            <div class="viewport-toolbar">
-                <button id="explode-btn" class="tool-button">
-                    Explode
-                </button>
+  <!-- ===================== SETTINGS DRAWER ===================== -->
+  <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+  <aside class="drawer" id="settings-drawer" aria-hidden="true" aria-label="Settings">
+    <div class="drawer-head">
+      <div>
+        <span class="drawer-eyebrow">WORKSPACE</span>
+        <h2>Settings</h2>
+      </div>
+      <button class="icon-btn" id="close-settings" aria-label="Close settings">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5 5 15"/></svg>
+      </button>
+    </div>
 
-                <button id="focus-btn" class="tool-button" disabled>
-                    Focus
-                </button>
+    <div class="drawer-body">
 
-                <button id="isolate-btn" class="tool-button" disabled>
-                    Isolate
-                </button>
+      <section class="settings-group">
+        <h3>Camera</h3>
+        <label class="field">
+          <span>Device</span>
+          <select id="set-camera-device">
+            <option value="">Default camera</option>
+          </select>
+        </label>
+        <label class="switch-field">
+          <span>Show camera preview</span>
+          <input type="checkbox" id="set-preview">
+        </label>
+        <label class="switch-field">
+          <span>Show hand landmarks</span>
+          <input type="checkbox" id="set-landmarks">
+        </label>
+        <label class="switch-field">
+          <span>Show skeleton connections</span>
+          <input type="checkbox" id="set-skeleton">
+        </label>
+        <label class="switch-field">
+          <span>Mirror preview</span>
+          <input type="checkbox" id="set-mirror">
+        </label>
+        <label class="field">
+          <span>Maximum hands <b id="val-maxhands">2</b></span>
+          <input type="range" id="set-maxhands" min="1" max="2" step="1">
+        </label>
+        <button class="btn btn-sm" id="refresh-devices">Refresh camera list</button>
+      </section>
 
-                <button id="reset-btn" class="tool-button">
-                    Reset
-                </button>
-            </div>
+      <section class="settings-group">
+        <h3>Hand tracking</h3>
+        <label class="field">
+          <span>Detection confidence <b id="val-detection">0.55</b></span>
+          <input type="range" id="set-detection" min="0.2" max="0.9" step="0.05">
+        </label>
+        <label class="field">
+          <span>Tracking confidence <b id="val-tracking">0.50</b></span>
+          <input type="range" id="set-tracking" min="0.2" max="0.9" step="0.05">
+        </label>
+      </section>
 
-            <div class="controls-info">
-                DRAG TO ROTATE · SCROLL TO ZOOM · CLICK TO SELECT
-            </div>
+      <section class="settings-group">
+        <h3>Gestures</h3>
+        <label class="field">
+          <span>Pinch grab threshold <b id="val-pinch">0.62</b></span>
+          <input type="range" id="set-pinch" min="0.3" max="0.9" step="0.02">
+        </label>
+        <label class="field">
+          <span>Pinch release threshold <b id="val-release">0.44</b></span>
+          <input type="range" id="set-release" min="0.15" max="0.85" step="0.02">
+        </label>
+        <label class="field">
+          <span>Tracking smoothing <b id="val-smoothing">0.45</b></span>
+          <input type="range" id="set-smoothing" min="0" max="1" step="0.05">
+        </label>
+        <label class="switch-field">
+          <span>Rotational inertia on release</span>
+          <input type="checkbox" id="set-inertia">
+        </label>
+      </section>
 
-        </section>
+      <section class="settings-group">
+        <h3>Object response</h3>
+        <label class="field">
+          <span>Movement sensitivity <b id="val-move">1.0</b></span>
+          <input type="range" id="set-move" min="0.3" max="2.5" step="0.1">
+        </label>
+        <label class="field">
+          <span>Rotation sensitivity <b id="val-rotate">1.0</b></span>
+          <input type="range" id="set-rotate" min="0.3" max="2.5" step="0.1">
+        </label>
+        <label class="field">
+          <span>Scale sensitivity <b id="val-scale">1.0</b></span>
+          <input type="range" id="set-scale" min="0.3" max="2.5" step="0.1">
+        </label>
+        <label class="field">
+          <span>Depth sensitivity <b id="val-depth">1.0</b></span>
+          <input type="range" id="set-depth" min="0" max="2.5" step="0.1">
+        </label>
+      </section>
 
-        <aside class="panel inspector-panel">
+      <section class="settings-group">
+        <h3>Visualisation</h3>
+        <label class="switch-field">
+          <span>Ground grid</span>
+          <input type="checkbox" id="set-grid">
+        </label>
+        <label class="switch-field">
+          <span>Shadows</span>
+          <input type="checkbox" id="set-shadows">
+        </label>
+        <label class="switch-field">
+          <span>Auto-orbit</span>
+          <input type="checkbox" id="set-autorotate">
+        </label>
+        <label class="switch-field">
+          <span>Bloom (glow)</span>
+          <input type="checkbox" id="set-bloom">
+        </label>
+        <label class="field">
+          <span>Render quality</span>
+          <select id="set-quality">
+            <option value="performance">Performance</option>
+            <option value="balanced">Balanced</option>
+            <option value="quality">Quality</option>
+          </select>
+        </label>
+      </section>
 
-            <div class="panel-heading">
-                <span>COMPONENT INSPECTOR</span>
-                <span class="panel-icon">⌘</span>
-            </div>
+      <section class="settings-group">
+        <h3>Calibration & reset</h3>
+        <p class="settings-note">
+          Calibration re-arms the gesture engine: it forgets any held grab, resets the
+          smoothing filters and returns the object to a neutral pose. Use it whenever
+          the object feels offset from your hands — for a new user, a moved webcam, or
+          after tracking loss.
+        </p>
+        <button class="btn btn-sm" id="calibrate-btn">Calibrate now</button>
+        <button class="btn btn-sm btn-ghost" id="reset-settings-btn">Reset all settings</button>
+        <div class="calibration-log" id="calibration-log"></div>
+      </section>
 
-            <div id="inspector-content" class="inspector-content">
-                <div class="empty-inspector">
-                    <div class="empty-icon">◇</div>
-                    <strong>No component selected</strong>
-                    <p>Select a component from the explorer or directly from the 3D viewport.</p>
-                </div>
-            </div>
+      <section class="settings-group">
+        <h3>Keyboard</h3>
+        <div class="keycap-grid">
+          <span><kbd>C</kbd> camera</span>
+          <span><kbd>L</kbd> panels</span>
+          <span><kbd>F</kbd> fullscreen</span>
+          <span><kbd>S</kbd> settings</span>
+          <span><kbd>A</kbd> assistant</span>
+          <span><kbd>R</kbd> reset view</span>
+          <span><kbd>E</kbd> explode</span>
+          <span><kbd>I</kbd> isolate</span>
+          <span><kbd>G</kbd> grid</span>
+          <span><kbd>←↑↓→</kbd> move</span>
+          <span><kbd>Q</kbd>/<kbd>W</kbd> depth</span>
+          <span><kbd>Z</kbd>/<kbd>X</kbd> roll</span>
+          <span><kbd>?</kbd> guide</span>
+        </div>
+      </section>
 
-            <div class="panel-footer">
-                GEOMETRY · ENGINEERING DATA
-            </div>
+    </div>
+  </aside>
 
-        </aside>
+  <!-- ===================== HELP SHEET ===================== -->
+  <div class="modal-backdrop" id="help-backdrop" hidden></div>
+  <div class="modal" id="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title" hidden>
+    <div class="modal-head">
+      <div>
+        <span class="drawer-eyebrow">INTERACTION</span>
+        <h2 id="help-title">How to use HOLOCORE</h2>
+      </div>
+      <button class="icon-btn" id="close-help" aria-label="Close guide">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5 5 15"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="help-grid">
+        <article>
+          <h3>1 · Activate the camera</h3>
+          <p>Press <kbd>C</kbd> or click <em>Enable camera</em>. Your browser asks for
+             permission; the preview appears bottom-left with live 21-point landmarks.</p>
+        </article>
+        <article>
+          <h3>2 · Grab with a pinch</h3>
+          <p>Touch your thumb and index fingertip. The object locks to your pinch point —
+             it never jumps, because the grab captures a reference frame. Move your hand
+             to translate. Open the pinch to release.</p>
+        </article>
+        <article>
+          <h3>3 · Scale and rotate with two hands</h3>
+          <p>Show both hands. Spread them apart to scale up, bring them together to scale
+             down, and rotate the line between your hands to rotate the object. Moving both
+             hands together translates it.</p>
+        </article>
+        <article>
+          <h3>4 · Point to inspect</h3>
+          <p>Extend your index finger. A reticle follows your fingertip in the 3D
+             workspace and highlights whatever it is over. The inspector explains the
+             component, its specification, connections and failure behaviour.</p>
+        </article>
+      </div>
+      <div class="help-tip">
+        <strong>Mouse fallback:</strong> drag to orbit, scroll to zoom, click to inspect.
+        Arrow keys move the object, Q/W push it away or pull it closer.
+      </div>
+      <div class="help-tip help-tip-warn" id="help-https-note" hidden>
+        <strong>Camera needs a secure origin.</strong> Open HOLOCORE over
+        <code>https://</code> or <code>http://localhost</code>. File:// pages and plain
+        HTTP on a LAN address cannot access the camera.
+      </div>
+    </div>
+  </div>
 
-    </main>
+  <!-- ===================== BOOT OVERLAY ===================== -->
+  <div class="boot" id="boot">
+    <div class="boot-inner">
+      <div class="boot-mark">
+        <svg viewBox="0 0 64 64" aria-hidden="true">
+          <circle cx="32" cy="32" r="26" fill="none" stroke="currentColor" stroke-width="0.8" opacity="0.35"/>
+          <circle cx="32" cy="32" r="18" fill="none" stroke="currentColor" stroke-width="0.8" opacity="0.5"/>
+          <path d="M20 16v32M44 16v32M20 32h24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div class="boot-title">HOLOCORE</div>
+      <div class="boot-status" id="boot-status">Initialising renderer…</div>
+      <div class="boot-bar"><i id="boot-bar-fill"></i></div>
+    </div>
+  </div>
 
-    <script type="module" src="main.js"></script>
+  <div class="toast-stack" id="toast-stack"></div>
+
+  <script type="module" src="main.js"></script>
 </body>
 </html>

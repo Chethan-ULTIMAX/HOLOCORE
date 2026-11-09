@@ -1,0 +1,22 @@
+{
+  "name": "holocore",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser-based 3D engineering workstation with real webcam hand tracking.",
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 8000 --bind 0.0.0.0",
+    "validate": "node tools/validate.js",
+    "validate:ui": "node tools/validate-ui.js",
+    "validate:boot": "node tools/validate-boot.js",
+    "validate:all": "node tools/validate.js && node tools/validate-ui.js && node tools/validate-boot.js",
+    "preview": "node tools/render-preview.js",
+    "preview:parts": "node tools/render-preview.js --parts"
+  },
+  "dependencies": {
+    "three": "0.187.0"
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.0"
+  }
+}
