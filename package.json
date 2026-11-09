@@ -5,7 +5,8 @@
   "description": "Browser-based 3D engineering workstation with real webcam hand tracking.",
   "type": "module",
   "scripts": {
-    "start": "python3 -m http.server 8000 --bind 0.0.0.0",
+    "start": "node server.js",
+    "start:python": "python3 -m http.server 8000 --bind 127.0.0.1",
     "validate": "node tools/validate.js",
     "validate:ui": "node tools/validate-ui.js",
     "validate:boot": "node tools/validate-boot.js",
