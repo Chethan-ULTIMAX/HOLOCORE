@@ -378,8 +378,6 @@ function renderModel(modelId, cameraPosition, cameraTarget, mode = "shaded") {
     }
   }
 
-  const viewportY = Math.round(0.82 * H);
-  void viewportY;
   return { png: encodePNG(colour, W, H), trianglesDrawn, parts: assembly.parts.map(p => p.userData.partId) };
 }
 

@@ -79,13 +79,12 @@ function lathe(profile, segments = 56) {
  * The opening faces +Z so it reads as a cutaway from the default camera.
  */
 function halfShellX(radius, length, { thickness = 0.03, segments = 40 } = {}) {
-  // Cylinder(θ) starts at +X and sweeps toward +Z, so θ∈[0,π] is the half that
-  // faces +Z. Rotate about Z to lay it along X; that leaves the opening on +Z,
-  // which is the side the default camera looks from.
-  const outer = new THREE.CylinderGeometry(radius, radius, length, segments, 1, true, 0, Math.PI);
-  // CylinderGeometry sweeps theta from +Z toward +X, so sweeps 0..π cover the
-  // +X half. Lay the axis along X (rotateZ) and roll the shell to the -Z half
+  // CylinderGeometry sweeps theta from +Z toward +X, so 0..π is the +X half.
+  // Lay the axis along X (rotateZ) and roll the shell onto the -Z half
   // (rotateX) so the missing half — the cutaway — faces the camera at +Z.
+  // `thickness` is a latent inner skin used by the shaded build; it has no
+  // geometry of its own yet, hence the unused parameter.
+  const outer = new THREE.CylinderGeometry(radius, radius, length, segments, 1, true, 0, Math.PI);
   outer.rotateZ(Math.PI / 2);
   outer.rotateX(-Math.PI / 2);
   void thickness;
@@ -150,21 +149,6 @@ function bladeGeometry(stations, { closedTip = true, closedRoot = true } = {}) {
   geometry.setIndex(indices);
   geometry.computeVertexNormals();
   return geometry;
-}
-
-/**
- * Place a pinion and a gear so their teeth mesh.
- *
- * `pitch` is the radius at which the teeth roll, which for the profile used by
- * gearGeometry() is slightly inside the tooth tip. Two gears mesh when the
- * distance between their axes equals the sum of their pitch radii, so the
- * positions are derived rather than eyeballed.
- */
-function meshPair(parent, { x, y, radius, teeth, thickness, bore, material, pitch = 0.92 }) {
-  const gear = new THREE.Mesh(gearGeometry(radius, teeth, thickness, bore), material);
-  gear.position.set(x, y, 0);
-  parent.add(gear);
-  return radius * pitch;
 }
 
 /** Half-cylinder cutaway shell standing vertically (open toward +Z). */
