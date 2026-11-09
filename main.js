@@ -20,6 +20,8 @@ import {
   LM
 } from "./gestures.js";
 import { HandOverlay } from "./handOverlay.js";
+import { MODES, getMode, isMode, instructionFor } from "./interactionModes.js";
+import { landmarkToNdc, landmarkToStage } from "./handGeometry.js";
 import { ComponentInspector } from "./componentInspector.js";
 import { createAssistant } from "./assistant.js";
 import { SettingsStore } from "./store.js";
@@ -82,6 +84,23 @@ const dom = {
   readoutRot: $("#readout-rot"),
   readoutScale: $("#readout-scale"),
 
+  workspaceVideo: $("#workspace-video"),
+  workspaceOverlay: $("#workspace-overlay"),
+  workspaceScrim: $("#workspace-scrim"),
+  workspaceCamNote: $("#workspace-cam-note"),
+  workspaceCamEnable: $("#workspace-cam-enable"),
+
+  modeBar: $("#mode-bar"),
+  modeButtons: $("#mode-buttons"),
+  modeInstruction: $("#mode-instruction"),
+  modeDot: $("#mode-dot"),
+  modeInstructionText: $("#mode-instruction-text"),
+  modeInstructionTarget: $("#mode-instruction-target"),
+
+  explodeSlider: $("#explode-slider"),
+  explodeValue: $("#explode-value"),
+  cameraView: $("#camera-view"),
+
   cameraCard: $("#camera-card"),
   cameraStage: $("#camera-stage"),
   cameraVideo: $("#camera-video"),
@@ -143,6 +162,17 @@ const state = {
   hoverId: null,
   gestureMode: "idle",
   intent: "none",
+  /** Active interaction mode id (select | move | rotate | scale | explode). */
+  mode: "select",
+  /** Full-workspace camera vs. small preview card. */
+  cameraView: "workspace",
+  /** True while the workspace video element is actually showing frames. */
+  cameraLive: false,
+  /** Per-part transform captured when a MOVE/ROTATE/SCALE gesture begins. */
+  gestureTarget: null,
+  gestureStart: null,
+  /** Last hovered part under the fingertip. */
+  pointerTarget: null,
   activePinches: [],
   lastFrameTime: performance.now(),
   lastAppliedTarget: null,
@@ -154,6 +184,7 @@ const state = {
 
 const animator = new Animator();
 const analyzers = new Map(); // keyed by handedness slot
+let overlayWorkspace = null;
 const overlayHands = [];
 const overlayPinched = [];
 
@@ -245,8 +276,23 @@ function setupChrome() {
 
 /** Settings that do not depend on the 3D renderer. */
 function applyNonSceneSettings() {
+  if (dom.workspaceOverlay) {
+    overlayWorkspace = new HandOverlay({
+      canvas: dom.workspaceOverlay,
+      video: dom.workspaceVideo,
+      settings: settings.camera
+    });
+  }
+
   dom.cameraStage.classList.toggle("no-landmarks", !settings.camera.showLandmarks);
   dom.cameraVideo.classList.toggle("unmirrored", !settings.camera.mirror);
+  dom.workspaceVideo?.classList.toggle("unmirrored", !settings.camera.mirror);
+  overlay?.updateSettings?.(settings.camera);
+  overlayWorkspace?.updateSettings?.(settings.camera);
+  dom.viewport?.style.setProperty("--scrim-strength", String(settings.camera.scrim ?? 0.4));
+  const workspaceViewInput = document.getElementById("set-workspace-view");
+  if (workspaceViewInput) workspaceViewInput.checked = settings.camera.workspaceView !== false;
+  syncWorkspaceVideo();
   setRightTab(settings.ui.rightTab || "inspector");
   setPanelState({ left: settings.ui.leftOpen, right: settings.ui.rightOpen }, { persist: false });
 }
@@ -292,6 +338,7 @@ function boot() {
     dom.libraryFootModel.textContent = "3D renderer unavailable";
     toast(reason, "error", 12000);
     setupAssistant();
+    initInteraction();
     finishBoot();
     return;
   }
@@ -338,7 +385,7 @@ function boot() {
       setupAssistant();
       setupOverlay();
       applySettings({ section: "all" });
-      setupShortcuts();
+      initInteraction();
       startLoop();
       finishBoot();
       window.setTimeout(() => {
@@ -515,6 +562,9 @@ function handleSelect(partId, source) {
   if (partId && source !== "hand") dom.viewportHint?.classList.add("dimmed");
   if (label) dom.hudSelection.textContent = label.toUpperCase();
   else dom.hudSelection.textContent = "NONE";
+
+  // The mode strip names what the next gesture will act on.
+  updateModeTargetLabel();
 }
 
 function updatePartListSelection() {
@@ -555,10 +605,13 @@ function updateStatusSelection(partId) {
 function setupSceneTools() {
   dom.toolExplode.addEventListener("click", () => {
     if (!workspace) return;
-    const exploded = workspace.toggleExplode();
-    dom.toolExplode.classList.toggle("is-on", exploded);
-    dom.toolExplode.lastChild.textContent = exploded ? " Reassemble" : " Explode";
-    toast(exploded ? "Exploded view" : "Assembly reassembled", "", 1600);
+    const next = (workspace.explodeAmount ?? 0) > 0.001 ? 0 : 100;
+    setExplodeAmount(next);
+    toast(next ? "Exploded view" : "Assembly reassembled", "", 1600);
+  });
+
+  dom.explodeSlider?.addEventListener("input", event => {
+    setExplodeAmount(Number(event.target.value), { fromSlider: true });
   });
 
   dom.toolIsolate.addEventListener("click", () => toggleIsolate());
@@ -566,6 +619,7 @@ function setupSceneTools() {
   dom.toolReset.addEventListener("click", () => {
     if (!workspace) return;
     workspace.resetView();
+    setExplodeAmount(0);
     dom.toolExplode.classList.remove("is-on");
     dom.toolIsolate.classList.remove("is-on");
     workspace.clearSelection();
@@ -686,12 +740,29 @@ function setupOverlay() {
   tracker = new HandTracker({
     video: dom.cameraVideo,
     settings: settings.tracking,
-    onState: trackerState => updateTrackingUI(trackerState),
+    onState: trackerState => {
+      updateTrackingUI(trackerState);
+      syncWorkspaceVideo();
+      if (trackerState.status === TRACKER_STATUS.ERROR) {
+        showCameraError(trackerState.error);
+      } else if (trackerState.status !== TRACKER_STATUS.IDLE) {
+        hideCameraError();
+      }
+    },
     onFrame: () => {} // per-frame work happens in the render loop
   });
 
+  if (dom.workspaceOverlay) {
+    overlayWorkspace = new HandOverlay({
+      canvas: dom.workspaceOverlay,
+      video: dom.workspaceVideo,
+      settings: settings.camera
+    });
+  }
+
   dom.cameraStage.classList.toggle("no-landmarks", !settings.camera.showLandmarks);
   dom.cameraVideo.classList.toggle("unmirrored", !settings.camera.mirror);
+  dom.workspaceVideo?.classList.toggle("unmirrored", !settings.camera.mirror);
 }
 
 async function toggleCamera() {
@@ -725,6 +796,173 @@ function setupCameraControls() {
   dom.cameraRestore?.addEventListener("click", () => {
     store.update("camera", { previewVisible: true });
   });
+  dom.cameraView?.addEventListener("click", toggleCameraView);
+  dom.workspaceCamEnable?.addEventListener("click", toggleCamera);
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* INTERACTION MODES                                                         */
+/* ------------------------------------------------------------------------- */
+
+const MODE_ICONS = {
+  select: '<circle cx="8" cy="8" r="2.2"/><circle cx="8" cy="8" r="5.4" opacity="0.55"/>',
+  move: '<path d="M8 2v12M2 8h12M8 2 6 4M8 2l2 2M8 14l-2-2M8 14l2-2M2 8l2-2M2 8l2 2M14 8l-2-2M14 8l-2 2"/>',
+  rotate: '<path d="M13 8a5 5 0 1 1-1.6-3.7M13 3.6V7h-3.4"/>',
+  scale: '<path d="M3 13V9M3 13h4M13 3v4M13 3h-4M3 13 7 9M13 3 9 7"/>',
+  explode: '<path d="M8 2v3M8 11v3M2 8h3M11 8h3M4 4l2 2M12 4l-2 2M4 12l2-2M12 12l-2-2"/>'
+};
+
+function buildModeBar() {
+  if (!dom.modeButtons) return;
+  dom.modeButtons.innerHTML = "";
+  for (const mode of MODES) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "mode-btn";
+    button.dataset.mode = mode.id;
+    button.style.setProperty("--mode", mode.colour);
+    button.setAttribute("aria-pressed", "false");
+    button.title = `${mode.label} mode — ${mode.instruction}`;
+    button.innerHTML =
+      `<svg viewBox="0 0 16 16" aria-hidden="true">${MODE_ICONS[mode.id] || ""}</svg>` +
+      `<span>${mode.label.toUpperCase()}</span><kbd>${mode.shortcut}</kbd>`;
+    button.addEventListener("click", () => setMode(mode.id));
+    dom.modeButtons.appendChild(button);
+  }
+  setMode(state.mode, { silent: true });
+}
+
+/** Switch interaction mode. This is the only thing that changes what a gesture does. */
+function setMode(modeId, { silent = false } = {}) {
+  if (!isMode(modeId)) return state.mode;
+  state.mode = modeId;
+  const mode = getMode(modeId);
+
+  for (const button of $$("#mode-buttons .mode-btn")) {
+    const active = button.dataset.mode === modeId;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+
+  // The solver is the enforcement point: outside a real mode it keeps its
+  // legacy "auto" behaviour, inside one it can only emit that mode's intent.
+  solver.setMode(modeId);
+
+  if (dom.modeInstructionText) dom.modeInstructionText.textContent = mode.instruction;
+  if (dom.modeDot) dom.modeDot.style.background = mode.colour;
+  if (dom.modeInstruction) dom.modeInstruction.style.setProperty("--mode-accent", mode.colour);
+  updateModeTargetLabel();
+
+  if (!silent) toast(`${mode.label} mode — ${mode.hint}`, "accent", 2200);
+  return state.mode;
+}
+
+function updateModeTargetLabel() {
+  if (!dom.modeInstructionTarget) return;
+  const mode = getMode(state.mode);
+  // EXPLODE acts on the whole assembly; the others act on the selected part
+  // (falling back to the whole assembly when nothing is selected).
+  if (mode.id === "explode") {
+    dom.modeInstructionTarget.textContent = "WHOLE ASSEMBLY";
+    return;
+  }
+  if (state.partId) {
+    const label = inspector?.lastComponent?.name || state.partId;
+    dom.modeInstructionTarget.textContent = label.toUpperCase();
+    return;
+  }
+  dom.modeInstructionTarget.textContent = "WHOLE ASSEMBLY";
+}
+
+/* ------------------------------------------------------------------------- */
+/* WORKSPACE CAMERA LAYER                                                    */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Attach the tracker's stream to the full-workspace video element.
+ *
+ * The tracker owns one MediaStream; the small preview and the workspace layer
+ * are two video elements reading the same stream. Sharing the stream (rather
+ * than calling getUserMedia twice) is what keeps both in sync and avoids a
+ * second camera indicator.
+ */
+function syncWorkspaceVideo() {
+  const video = dom.workspaceVideo;
+  if (!video) return;
+
+  const stream = tracker?.stream || null;
+  if (stream && video.srcObject !== stream) {
+    video.srcObject = stream;
+    video.play?.().catch(() => {});
+  } else if (!stream && video.srcObject) {
+    video.srcObject = null;
+  }
+
+  const live = Boolean(stream) && tracker?.status !== TRACKER_STATUS.ERROR;
+  state.cameraLive = live;
+
+  if (dom.workspaceVideo) {
+    dom.workspaceVideo.classList.toggle("is-live", live && state.cameraView === "workspace");
+    dom.workspaceVideo.classList.toggle("unmirrored", !settings.camera.mirror);
+  }
+  if (dom.workspaceScrim) {
+    dom.workspaceScrim.classList.toggle("is-live", live);
+  }
+  if (dom.workspaceCamNote) {
+    dom.workspaceCamNote.hidden = live || state.cameraView !== "workspace";
+  }
+  if (dom.workspaceOverlay) {
+    dom.workspaceOverlay.style.display = state.cameraView === "workspace" ? "" : "none";
+  }
+  // The small preview card is hidden while the feed fills the workspace.
+  if (dom.cameraCard) {
+    dom.cameraCard.classList.toggle("is-minimised", state.cameraView === "workspace" && live);
+  }
+  if (dom.cameraView) {
+    dom.cameraView.setAttribute("aria-pressed", String(state.cameraView === "workspace"));
+  }
+}
+
+function setCameraView(view) {
+  state.cameraView = view === "workspace" ? "workspace" : "preview";
+  store.update("camera", { workspaceView: state.cameraView === "workspace" });
+  const workspaceViewInput = document.getElementById("set-workspace-view");
+  if (workspaceViewInput) workspaceViewInput.checked = state.cameraView === "workspace";
+  syncWorkspaceVideo();
+  toast(
+    state.cameraView === "workspace"
+      ? "Camera fills the workspace"
+      : "Camera shown as a small preview",
+    "",
+    1800
+  );
+}
+
+function toggleCameraView() {
+  setCameraView(state.cameraView === "workspace" ? "preview" : "workspace");
+}
+
+/* ------------------------------------------------------------------------- */
+/* EXPLODE AMOUNT                                                            */
+/* ------------------------------------------------------------------------- */
+
+function setExplodeAmount(percent, { fromSlider = false } = {}) {
+  const amount = clamp(percent, 0, 100) / 100;
+  if (workspace) workspace.setExplodeAmount(amount);
+
+  if (dom.explodeSlider && !fromSlider) {
+    dom.explodeSlider.value = String(Math.round(amount * 100));
+  }
+  if (dom.explodeValue) dom.explodeValue.textContent = `${Math.round(amount * 100)}%`;
+  if (dom.explodeSlider) {
+    dom.explodeSlider.setAttribute("aria-valuetext", `${Math.round(amount * 100)} percent`);
+  }
+  if (dom.toolExplode) {
+    dom.toolExplode.classList.toggle("is-on", amount > 0.001);
+    const label = dom.toolExplode.lastChild;
+    if (label?.nodeType === 3) label.textContent = amount > 0.001 ? " Reassemble" : " Explode";
+  }
 }
 
 function showCameraError(message) {
@@ -795,6 +1033,12 @@ function updateTrackingUI(trackerState) {
     : "—";
 
   updateHandReadouts();
+
+  // The workspace camera layer mirrors the same state so the two views agree.
+  syncWorkspaceVideo();
+  if (dom.workspaceCamNote) {
+    dom.workspaceCamNote.hidden = live || state.cameraView !== "workspace";
+  }
 }
 
 function updateHandReadouts() {
@@ -844,6 +1088,17 @@ function checkSecureContext() {
 /* INTERACTION LOOP                                                         */
 /* ------------------------------------------------------------------------- */
 
+function initInteraction() {
+  buildModeBar();
+  setupShortcuts();
+  // Restore the camera view preference (defaults to full workspace).
+  state.cameraView = settings.camera.workspaceView === false ? "preview" : "workspace";
+  syncWorkspaceVideo();
+  if (dom.workspaceCamNote) {
+    dom.workspaceCamNote.hidden = state.cameraLive || state.cameraView !== "workspace";
+  }
+}
+
 function startLoop() {
   const loop = () => {
     const now = performance.now();
@@ -859,6 +1114,76 @@ function startLoop() {
   requestAnimationFrame(loop);
 }
 
+const solver = new ManipulationSolver({
+  settings: {
+    mode: "select",
+    moveSensitivity: settings.object.moveSensitivity,
+    rotateSensitivity: settings.object.rotateSensitivity,
+    scaleSensitivity: settings.object.scaleSensitivity,
+    zSensitivity: settings.object.depthSensitivity
+  },
+  onModeChange: mode => {
+    state.gestureMode = mode;
+    updateGestureLabels(overlayHands.map(hand => hand.state), { mode });
+  }
+});
+
+/**
+ * The rectangle the camera image is displayed in. In workspace mode that is the
+ * viewport itself; in preview mode it is the small card. This is the box the
+ * landmark mapping must use, and it must match the CSS exactly.
+ */
+function cameraDisplayBox() {
+  const el = state.cameraView === "workspace" ? dom.workspaceVideo : dom.cameraVideo;
+  const rect = el?.getBoundingClientRect?.();
+  if (!rect || !rect.width) {
+    const vp = dom.viewport.getBoundingClientRect();
+    return { width: vp.width, height: vp.height, left: 0, top: 0 };
+  }
+  const host = dom.viewport.getBoundingClientRect();
+  return {
+    width: rect.width,
+    height: rect.height,
+    // Offsets relative to the viewport, so a preview card in a corner maps to
+    // the same place in the viewport it visually occupies.
+    left: rect.left - host.left,
+    top: rect.top - host.top
+  };
+}
+
+function videoSize() {
+  const video = dom.workspaceVideo?.videoWidth ? dom.workspaceVideo : dom.cameraVideo;
+  return {
+    videoWidth: video?.videoWidth || 0,
+    videoHeight: video?.videoHeight || 0
+  };
+}
+
+/** Map a landmark to viewport NDC using the exact display box + mirror. */
+function landmarkNdc(landmark) {
+  const video = videoSize();
+  const box = cameraDisplayBox();
+  const viewRect = dom.viewport.getBoundingClientRect();
+  return landmarkToNdc(
+    landmark,
+    { ...video, boxWidth: box.width, boxHeight: box.height },
+    { width: viewRect.width, height: viewRect.height },
+    { mirror: settings.camera.mirror !== false }
+  );
+}
+
+/** Map a landmark to pixels within the viewport (for the reticle). */
+function landmarkViewportPixels(landmark) {
+  const video = videoSize();
+  const box = cameraDisplayBox();
+  const stage = landmarkToStage(
+    landmark,
+    { ...video, boxWidth: box.width, boxHeight: box.height },
+    { mirror: settings.camera.mirror !== false }
+  );
+  return { x: stage.x + box.left, y: stage.y + box.top, inside: stage.inside };
+}
+
 function processHands(now) {
   if (!tracker || !workspace) return;
 
@@ -871,187 +1196,240 @@ function processHands(now) {
 
   hands.forEach((landmarks, index) => {
     const side = handedness[index] || "Unknown";
-    const key = `${side}`;
-    let analyzer = analyzers.get(key);
+    let analyzer = analyzers.get(side);
     if (!analyzer) {
       analyzer = new HandAnalyzer(analyzerSettings());
-      analyzers.set(key, analyzer);
+      analyzers.set(side, analyzer);
     }
     const handState = analyzer.update(landmarks, side, now);
     activeStates.push(handState);
-
     overlayHands.push({ state: handState, side, landmarks });
     overlayPinched.push(handState.pinched);
   });
 
-  // Drop analyzers for hands that are no longer visible.
   if (hands.length === 0) {
     for (const analyzer of analyzers.values()) analyzer.reset();
   }
 
-  overlay?.draw(hands, handedness, { pinched: overlayPinched });
+  // ---- draw both overlays ---------------------------------------------------
+  const activity = activeStates.map(hand => (hand.pinched ? 1 : 0.15));
+  const targets = activeStates.map(() => state.pointerTarget);
+
+  const tethers = activeStates.map(hand =>
+    hand.pinched ? projectedTarget(hand) : null
+  );
+
+  overlay?.draw(hands, handedness, { pinched: overlayPinched, activity, targets });
+  drawWorkspaceOverlay(hands, handedness, activeStates, activity, targets, tethers);
+
+  // ---- run the solver -------------------------------------------------------
+  // A pinch in MOVE/ROTATE grabs what you are pointing at. Promote the hovered
+  // component to the selection on gesture start so the gesture has a target.
+  if ((state.mode === "move" || state.mode === "rotate") && state.pointerTarget &&
+      state.pointerTarget !== state.partId && activeStates.some(hand => hand?.pinched) &&
+      !state.gestureTarget) {
+    workspace.select(state.pointerTarget);
+    handleSelect(state.pointerTarget, "hand");
+    state.gestureTarget = state.pointerTarget;
+  }
+  if (!activeStates.some(hand => hand?.pinched)) state.gestureTarget = null;
 
   const objectState = {
-    position: {
-      x: workspace.transform.position.x,
-      y: workspace.transform.position.y,
-      z: workspace.transform.position.z
-    },
-    rotationZ: workspace.transform.rotationZ,
-    scale: workspace.transform.scale
+    position: { x: 0, y: 0, z: 0 },
+    rotationZ: 0,
+    rotationX: 0,
+    scale: 1,
+    explode: workspace.explodeAmount ?? 0
   };
+
+  // In a real mode the transform applies to the selected component when there
+  // is one; EXPLODE and SCALE always act on the assembly.
+  const part = getGesturePart();
+  if (part && state.mode !== "explode") {
+    objectState.position = { ...part.offset };
+    objectState.rotationZ = part.rotationZ;
+    objectState.rotationX = part.rotationX;
+    objectState.scale = part.scale;
+  } else {
+    const t = workspace.transform;
+    objectState.position = { x: t.position.x, y: t.position.y, z: t.position.z };
+    objectState.rotationZ = t.rotationZ;
+    objectState.rotationX = t.rotationX;
+    objectState.scale = t.scale;
+  }
 
   const result = solver.update(activeStates, objectState, now);
   state.gestureMode = result.mode;
   state.intent = result.intent;
 
-  if (result.active) {
-    if (result.position || typeof result.rotationZ === "number" || typeof result.scale === "number") {
-      workspace.setTransform({
-        position: result.position,
-        rotationZ: result.rotationZ,
-        scale: result.scale
-      });
-    }
-    // Remember the target so a lost hand freezes the last stable state.
-    state.lastAppliedTarget = result;
-    updateGestureLabels(activeStates, result);
-  } else if (result.intent === "release" && settings.gesture.inertia) {
-    const dt = 1 / 60;
-    const delta = solver.applyInertia(objectState, dt);
-    if (delta.x || delta.y || delta.roll || delta.scale) {
-      workspace.applyDelta(delta);
-    }
-    updateGestureLabels(activeStates, result);
-  } else {
-    updateGestureLabels(activeStates, result);
-  }
+  applyGestureResult(result, part);
 
-  // Fingertip reticle + pointing selection.
+  // ---- pointer, hover and selection ----------------------------------------
   const pointer = pickPointer(activeStates);
-  if (pointer) {
-    const px = overlay.fingertipPixels({ indexTip: pointer.hand.indexTip });
-    if (px) {
-      const stageRect = dom.cameraStage.getBoundingClientRect();
-      const viewRect = dom.viewport.getBoundingClientRect();
-      // Map the camera stage onto the viewport using the same normalised point.
-      const u = dom.cameraStage.clientWidth ? px.x / dom.cameraStage.clientWidth : 0;
-      const v = dom.cameraStage.clientHeight ? px.y / dom.cameraStage.clientHeight : 0;
-      const targetX = viewRect.width * u;
-      const targetY = viewRect.height * v;
+  updatePointer(pointer, activeStates, result);
 
-      dom.reticle.hidden = false;
-      dom.reticle.style.left = `${clamp(targetX, 0, viewRect.width)}px`;
-      dom.reticle.style.top = `${clamp(targetY, 0, viewRect.height)}px`;
+  updateGestureLabels(activeStates, result);
+}
 
-      const ndc = {
-        x: (targetX / viewRect.width) * 2 - 1,
-        y: -((targetY / viewRect.height) * 2 - 1)
-      };
-      const hit = workspace.raycast(ndc);
-      hoverFromHand(pointer.hand, hit);
+/** The component a gesture should transform, or null for the whole assembly. */
+function getGesturePart() {
+  if (!state.partId || !workspace) return null;
+  const transform = workspace.getPartTransform(state.partId);
+  if (!transform) return null;
+  return { partId: state.partId, ...transform };
+}
+
+/**
+ * Apply a solver result.
+ *
+ * The solver is mode-gated, so `result.intent` is the single kind of change it
+ * is allowed to request. This function refuses anything else — that refusal is
+ * what stops a SCALE gesture from also translating.
+ */
+function applyGestureResult(result, part) {
+  if (!result?.active) return;
+
+  switch (result.intent) {
+    case "translate": {
+      if (!result.position) return;
+      if (part) {
+        // result.position is already absolute: the solver starts from the
+        // part's current offset, so the depth must not be added again.
+        workspace.setPartTransform(part.partId, {
+          offset: {
+            x: result.position.x,
+            y: result.position.y,
+            z: result.position.z
+          }
+        });
+      } else {
+        workspace.setTransform({ position: result.position });
+      }
+      break;
     }
-    // Unused variables retained for clarity of the mapping above.
-    void stageRect;
-  } else {
+    case "rotate": {
+      if (part) {
+        workspace.setPartTransform(part.partId, {
+          rotationZ: result.rotationZ,
+          rotationX: result.rotationX
+        });
+      } else {
+        workspace.setTransform({ rotationZ: result.rotationZ, rotationX: result.rotationX });
+      }
+      break;
+    }
+    case "scale": {
+      // Scale always applies to the assembly, even with a component selected:
+      // a part scaled in isolation reads as a rendering bug, not a resize.
+      if (typeof result.scale === "number") workspace.setTransform({ scale: result.scale });
+      break;
+    }
+    case "explode": {
+      if (typeof result.explode === "number") setExplodeAmount(result.explode * 100);
+      break;
+    }
+    case "select": {
+      handleHandSelect();
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+/** Confirm the component under the pointer as the selection. */
+function handleHandSelect() {
+  if (!state.pointerTarget) return;
+  if (state.partId === state.pointerTarget) {
+    flash(dom.inspectorRoot, "flash");
+    return;
+  }
+  workspace.select(state.pointerTarget);
+  handleSelect(state.pointerTarget, "hand");
+  flash(dom.inspectorRoot, "flash");
+  toast(`Selected ${inspector?.lastComponent?.name || state.pointerTarget}`, "accent", 1700);
+}
+
+/** Draw the landmark skeleton onto the full-workspace overlay. */
+function drawWorkspaceOverlay(hands, handedness, states, activity, targets, tethers) {
+  if (!overlayWorkspace || state.cameraView !== "workspace") return;
+  overlayWorkspace.draw(hands, handedness, {
+    pinched: states.map(hand => hand.pinched),
+    activity,
+    targets,
+    tethers
+  });
+}
+
+/**
+ * Where the current gesture target projects into the overlay canvas.
+ *
+ * Returns null when there is nothing to link to (whole-assembly moves have no
+ * single point, so no tether is drawn for them).
+ */
+function projectedTarget() {
+  if (!workspace || !state.partId) return null;
+  if (state.mode === "explode" || state.mode === "scale") return null;
+  const projected = workspace.projectPart(state.partId);
+  if (!projected || !projected.visible) return null;
+
+  // projectPart returns viewport pixels; the overlay canvas is inset:0 over the
+  // viewport, so those coordinates are already in its space.
+  return { x: projected.x, y: projected.y };
+}
+
+/** Place the reticle and resolve what it is pointing at. */
+function updatePointer(pointer, states, result) {
+  if (!pointer || state.cameraView !== "workspace") {
+    if (pointer && state.cameraView === "preview") {
+      // Keep the reticle usable with the preview card too.
+    } else {
+      dom.reticle.hidden = true;
+      if (state.pointerTarget) {
+        state.pointerTarget = null;
+        workspace.setHover(null);
+      }
+      return;
+    }
+  }
+
+  const tip = pointer.hand.indexTip;
+  const pixels = landmarkViewportPixels(tip);
+  const viewRect = dom.viewport.getBoundingClientRect();
+
+  if (!pixels.inside) {
     dom.reticle.hidden = true;
-    if (state.lastSelectionSource === "hand") {
-      // Leave the hover highlight alone; workspace handles pointer-leave.
-    }
-  }
-}
-
-let hoverLock = null;
-let hoverTimer = 0;
-
-function hoverFromHand(hand, hit) {
-  // While pinching (grabbing the assembly) the reticle must not hover-select.
-  if (hand?.pinched) {
-    hoverLock = null;
-    return;
-  }
-  if (!hit) {
-    if (hoverLock) {
-      hoverLock = null;
-      workspace.setHover(null);
-    }
     return;
   }
 
-  if (hoverLock === hit) {
-    // Dwell-to-select: hold the pointer over a part for 900 ms.
-    if (performance.now() - state.hoverDwellStart > 900 && state.partId !== hit) {
-      state.hoverDwellStart = performance.now();
-      workspace.select(hit);
-      handleSelect(hit, "hand");
-      flash(dom.inspectorRoot, "flash");
+  dom.reticle.hidden = false;
+  dom.reticle.style.left = `${clamp(pixels.x, 0, viewRect.width)}px`;
+  dom.reticle.style.top = `${clamp(pixels.y, 0, viewRect.height)}px`;
+
+  const ndc = landmarkNdc(tip);
+  const hit = workspace.raycast({ x: ndc.x, y: ndc.y });
+
+  // Hover highlight follows the pointer, but never while dragging.
+  const dragging = result?.intent === "translate" || result?.intent === "rotate";
+  if (!dragging) {
+    if (hit !== state.pointerTarget) {
+      state.pointerTarget = hit;
+      workspace.setHover(hit);
+      if (hit) hoverFromHand(pointer.hand, hit);
     }
-    return;
   }
 
-  hoverLock = hit;
-  state.hoverDwellStart = performance.now();
-  workspace.setHover(hit);
-}
-
-function pickPointer(hands) {
-  if (!hands.length) return null;
-  // Only one pointing hand at a time: pick the most confidently pointing.
-  const candidates = hands
-    .filter(hand => hand.pointing > 0.5 && !hand.pinched)
-    .sort((a, b) => b.pointing - a.pointing);
-  if (!candidates.length) return null;
-  return { hand: candidates[0] };
-}
-
-function analyzerSettings() {
-  return {
-    pinchThreshold: settings.gesture.pinchThreshold,
-    pinchRelease: settings.gesture.pinchRelease,
-    smoothing: settings.gesture.smoothing
-  };
-}
-
-const solver = new ManipulationSolver({
-  settings: {
-    moveSensitivity: settings.object.moveSensitivity,
-    rotateSensitivity: settings.object.rotateSensitivity,
-    scaleSensitivity: settings.object.scaleSensitivity,
-    zSensitivity: settings.object.depthSensitivity
-  },
-  onModeChange: mode => {
-    state.gestureMode = mode;
-    updateGestureLabels(overlayHands.map(hand => hand.state), { mode });
+  // Always resolve the *hovered* part's own name — inspector.lastComponent
+  // belongs to the current selection and would mislabel a different part.
+  const label = hit
+    ? (getComponentData(state.modelId, hit)?.name || hit)
+    : "";
+  dom.reticle.classList.toggle("is-over", Boolean(hit));
+  dom.reticle.classList.toggle("is-active", Boolean(pointer.hand.pinched));
+  if (dom.reticleLabel) {
+    dom.reticleLabel.textContent = pointer.hand.pinched && hit ? `GRAB · ${label}` : label;
   }
-});
-
-function updateGestureLabels(handStates, result) {
-  const count = handStates.length;
-  let label = "No hand";
-
-  if (count === 0) {
-    label = tracker?.status === TRACKER_STATUS.LOST ? "Tracking lost" : "No hand";
-  } else if (result?.mode === "frame") {
-    label = "Two-hand frame";
-  } else if (result?.mode === "grab") {
-    label = "Grasp";
-  } else {
-    label = describeGesture(handStates[0], count);
-  }
-
-  dom.statusGesture.textContent = label;
-  dom.statusGesture.className = "status-val is-accent";
-
-  dom.pillGesture.className = `pill ${count ? "is-live" : ""}`.trim();
-  dom.pillGesture.querySelector("span").textContent = label.toUpperCase().slice(0, 22);
-
-  dom.hudHands.textContent = String(count);
-
-  const modeLabel =
-    result?.mode === "frame" ? "TWO-HAND" :
-    result?.mode === "grab" ? "GRASP" :
-    count ? "TRACKING" : "MOUSE";
-  dom.statusMode.textContent = modeLabel;
+  updateModeTargetLabel();
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1309,6 +1687,7 @@ const BINDINGS = [
   ["set-landmarks", "camera", "showLandmarks", "checkbox"],
   ["set-skeleton", "camera", "showSkeleton", "checkbox"],
   ["set-mirror", "camera", "mirror", "checkbox"],
+  ["set-scrim", "camera", "scrim", "number", "val-scrim", 2],
   ["set-maxhands", "tracking", "maxHands", "number", "val-maxhands"],
   ["set-detection", "tracking", "minDetectionConfidence", "number", "val-detection", 2],
   ["set-tracking", "tracking", "minTrackingConfidence", "number", "val-tracking", 2],
@@ -1360,6 +1739,14 @@ function setupSettingsUI() {
         const target = document.getElementById(valueId);
         if (target) target.textContent = formatValue(next, decimals);
       }
+    });
+  }
+
+  const workspaceViewInput = document.getElementById("set-workspace-view");
+  if (workspaceViewInput) {
+    workspaceViewInput.checked = settings.camera.workspaceView !== false;
+    workspaceViewInput.addEventListener("change", () => {
+      setCameraView(workspaceViewInput.checked ? "workspace" : "preview");
     });
   }
 
@@ -1473,7 +1860,15 @@ function applySettings({ section, keys } = {}) {
       dom.cameraRestore.hidden = false;
     }
 
-    dom.cameraStage.classList.toggle("no-landmarks", !settings.camera.showLandmarks);
+    if (dom.workspaceOverlay) {
+    overlayWorkspace = new HandOverlay({
+      canvas: dom.workspaceOverlay,
+      video: dom.workspaceVideo,
+      settings: settings.camera
+    });
+  }
+
+  dom.cameraStage.classList.toggle("no-landmarks", !settings.camera.showLandmarks);
     dom.cameraVideo.classList.toggle("unmirrored", !settings.camera.mirror);
     overlay?.updateSettings(settings.camera);
   }
@@ -1715,6 +2110,16 @@ function setupShortcuts() {
 
     const key = event.key.toLowerCase();
     switch (key) {
+      case "1": case "2": case "3": case "4": case "5": {
+        event.preventDefault();
+        const mode = MODES[Number(key) - 1];
+        if (mode) setMode(mode.id);
+        break;
+      }
+      case "v":
+        event.preventDefault();
+        toggleCameraView();
+        break;
       case "c":
         event.preventDefault();
         toggleCamera();
@@ -1824,6 +2229,10 @@ window.HOLOCORE = {
   switchModel,
   calibrate,
   toast,
+  setMode,
+  setExplodeAmount,
+  setCameraView,
+  syncWorkspaceVideo,
   // Deliberately exposed for automated verification (see tools/).
   _internals: { store, animator, analyzers, LM }
 };

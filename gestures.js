@@ -400,7 +400,24 @@ const DEFAULTS = {
   moveSensitivity: 1.0,
   rotateSensitivity: 1.0,
   scaleSensitivity: 1.0,
-  zSensitivity: 1.0
+  zSensitivity: 1.0,
+  /**
+   * Active interaction mode. "auto" preserves the original behaviour (pinch to
+   * grab, two hands to frame) and is the default so the mode gate is opt-in.
+   * Once the UI sets a real mode, the solver refuses to produce any transform
+   * that the mode does not allow — that is the guarantee behind "the selected
+   * mode determines exactly what the gesture does".
+   */
+  mode: "auto",
+  /** Scale clamps for SCALE mode. */
+  minScale: 0.3,
+  maxScale: 3.2,
+  /** Rotate: radians of yaw per unit of normalised horizontal hand travel. */
+  rotateGain: Math.PI * 1.6,
+  /** Rotate: radians of pitch per unit of normalised vertical hand travel. */
+  rotatePitchGain: Math.PI * 0.9,
+  /** Explode: two-hand spread sensitivity. */
+  explodeSensitivity: 1.0
 };
 
 /**
@@ -423,8 +440,11 @@ export class ManipulationSolver {
       ...(options.settings || {})
     };
     this.mode = "idle";       // idle | grab | frame
-    this.grab = null;         // { hand, handStart, objectStart }
-    this.frame = null;        // { distance, angle, mid, objectStart }
+    this.grab = null;          // { handStart, objectStart }      MOVE
+    this.frame = null;         // { distance, angle, mid, ... }    two-hand (auto)
+    this.rotationFrame = null; // { handStart, objectStart }      ROTATE
+    this.scaleFrame = null;    // { distance, objectStart }       SCALE
+    this.explodeFrame = null;  // { distance, start }             EXPLODE
     this.velocity = { x: 0, y: 0, roll: 0, scale: 0 };
     this.lastHandSeen = 0;
     this.onModeChange = options.onModeChange || null;
@@ -438,6 +458,9 @@ export class ManipulationSolver {
     this.mode = "idle";
     this.grab = null;
     this.frame = null;
+    this.rotationFrame = null;
+    this.scaleFrame = null;
+    this.explodeFrame = null;
     this.velocity = { x: 0, y: 0, roll: 0, scale: 0 };
     this._setMode("idle");
   }
@@ -448,21 +471,49 @@ export class ManipulationSolver {
     this.onModeChange?.(mode);
   }
 
+  /** The active mode id ("auto" | "select" | "move" | "rotate" | "scale" | "explode"). */
+  get modeId() {
+    return this.settings.mode || "auto";
+  }
+
+  /**
+   * Set the interaction mode. Changing mode mid-gesture releases the current
+   * interaction so a half-finished drag can never leak into the next mode.
+   */
+  setMode(mode, objectState = null) {
+    if (mode === this.settings.mode) return this.settings.mode;
+    this.settings.mode = mode;
+    if (mode !== "auto") {
+      // Drop any reference frame captured under the old mode.
+      this.grab = null;
+      this.frame = null;
+      this.explodeFrame = null;
+      this.rotationFrame = null;
+      this.scaleFrame = null;
+      this.velocity = { x: 0, y: 0, roll: 0, scale: 0 };
+      this._setMode("idle");
+      void objectState;
+    }
+    return this.settings.mode;
+  }
+
   /**
    * Advance the solver.
    * @param hands array of HandAnalyzer states (0..2)
-   * @param objectState { position {x,y,z}, rotationZ, scale }
+   * @param objectState { position {x,y,z}, rotationZ, rotationX, scale, explode }
    * @param now seconds
-   * @returns {{position?:object, rotationZ?:number, scale?:number, mode:string,
-   *            active:boolean, intent:string}}
+   * @returns {{position?:object, rotationZ?:number, rotationX?:number,
+   *            scale?:number, explode?:number, mode:string, active:boolean,
+   *            intent:string, pointer?:object}}
    */
   update(hands, objectState, now = 0) {
+    const state = objectState || {};
     const result = { mode: this.mode, active: false, intent: "none" };
 
     if (!hands || hands.length === 0) {
       if (this.mode !== "idle") {
         // Freeze the last stable state; drop the grab/frame reference.
-        this._release(objectState);
+        this._release(state);
       }
       // Report the mode *after* the release so callers see the settled state.
       result.mode = this.mode;
@@ -472,11 +523,226 @@ export class ManipulationSolver {
 
     this.lastHandSeen = now;
 
-    if (hands.length >= 2) {
-      return this._updateTwoHand(hands, objectState);
+    const mode = this.modeId;
+    if (mode === "auto") {
+      if (hands.length >= 2) return this._updateTwoHand(hands, state);
+      return this._updateOneHand(hands[0], state);
     }
 
-    return this._updateOneHand(hands[0], objectState);
+    return this._updateModal(mode, hands, state);
+  }
+
+  /**
+   * Mode-gated update. Every branch produces at most one kind of change, and the
+   * `intent` it reports is the only transform the caller is allowed to apply.
+   */
+  _updateModal(mode, hands, objectState) {
+    switch (mode) {
+      case "select": return this._modeSelect(hands, objectState);
+      case "move": return this._modeMove(hands, objectState);
+      case "rotate": return this._modeRotate(hands, objectState);
+      case "scale": return this._modeScale(hands, objectState);
+      case "explode": return this._modeExplode(hands, objectState);
+      default: return { mode: "idle", active: false, intent: "none" };
+    }
+  }
+
+  /* ---- SELECT ---------------------------------------------------------- */
+  _modeSelect(hands, objectState) {
+    const hand = hands[0];
+    const result = { mode: "idle", active: false, intent: "none" };
+
+    if (hand.pinched) {
+      this._setMode("grab");
+      result.active = true;
+      result.mode = "grab";
+      result.intent = "select";
+      // Selection is a discrete event: report the pinch point, apply nothing.
+      result.pointer = hand.indexTip || hand.pinch;
+      result.selectAt = hand.pinch;
+      return result;
+    }
+
+    if (this.mode === "grab") this._release(objectState);
+    this._setMode("idle");
+    result.intent = hand.pointing > 0.5 ? "hover" : "none";
+    result.pointer = hand.indexTip;
+    // Nothing is transformed in SELECT mode, ever.
+    void objectState;
+    return result;
+  }
+
+  /* ---- MOVE ------------------------------------------------------------ */
+  _modeMove(hands, objectState) {
+    const hand = hands[0];
+    if (!hand.pinched) {
+      if (this.mode === "grab") {
+        this._release(objectState);
+        return { mode: "idle", active: false, intent: "release" };
+      }
+      this._setMode("idle");
+      return { mode: "idle", active: false, intent: "none", pointer: hand.indexTip };
+    }
+
+    if (this.mode !== "grab" || !this.grab) {
+      this.grab = {
+        handStart: { x: hand.pinch.x, y: hand.pinch.y, z: hand.pinch.z },
+        objectStart: { position: { ...objectState.position } }
+      };
+      this.velocity = { x: 0, y: 0, roll: 0, scale: 0 };
+    }
+    this._setMode("grab");
+
+    const sensitivity = 6.2 * this.settings.moveSensitivity;
+    const dx = (hand.pinch.x - this.grab.handStart.x) * sensitivity;
+    const dy = -(hand.pinch.y - this.grab.handStart.y) * sensitivity;
+    const dz = -(hand.pinch.z - this.grab.handStart.z) * sensitivity * 6 * this.settings.zSensitivity;
+
+    const position = {
+      x: clamp(this.grab.objectStart.position.x + dx, -6, 6),
+      y: clamp(this.grab.objectStart.position.y + dy, -5, 5),
+      z: clamp((this.grab.objectStart.position.z || 0) + dz, -5, 5)
+    };
+
+    this.velocity.x = position.x - objectState.position.x;
+    this.velocity.y = position.y - objectState.position.y;
+
+    return { mode: "grab", active: true, intent: "translate", position, pointer: hand.indexTip };
+  }
+
+  /* ---- ROTATE ---------------------------------------------------------- */
+  _modeRotate(hands, objectState) {
+    const hand = hands[0];
+    if (!hand.pinched) {
+      if (this.mode === "grab") {
+        this._release(objectState);
+        return { mode: "idle", active: false, intent: "release" };
+      }
+      this._setMode("idle");
+      return { mode: "idle", active: false, intent: "none", pointer: hand.indexTip };
+    }
+
+    if (this.mode !== "grab" || !this.rotationFrame) {
+      this.rotationFrame = {
+        handStart: { x: hand.pinch.x, y: hand.pinch.y },
+        objectStart: {
+          rotationZ: objectState.rotationZ || 0,
+          rotationX: objectState.rotationX || 0
+        }
+      };
+      this.velocity = { x: 0, y: 0, roll: 0, scale: 0 };
+    }
+    this._setMode("grab");
+
+    const frame = this.rotationFrame;
+    // Horizontal travel yaws the target; vertical travel pitches it. Both are
+    // relative to the grabbed frame, so the target never jumps on pinch.
+    const yawDelta =
+      (hand.pinch.x - frame.handStart.x) * this.settings.rotateGain * this.settings.rotateSensitivity;
+    const pitchDelta =
+      -(hand.pinch.y - frame.handStart.y) * this.settings.rotatePitchGain * this.settings.rotateSensitivity;
+
+    const rotationZ = frame.objectStart.rotationZ + yawDelta;
+    const rotationX = clamp(frame.objectStart.rotationX + pitchDelta, -Math.PI / 2, Math.PI / 2);
+
+    this.velocity.roll = rotationZ - (objectState.rotationZ || 0);
+
+    // ROTATE never emits position or scale.
+    return { mode: "grab", active: true, intent: "rotate", rotationZ, rotationX, pointer: hand.indexTip };
+  }
+
+  /* ---- SCALE ----------------------------------------------------------- */
+  _modeScale(hands, objectState) {
+    const both = hands.length >= 2 && hands[0].pinched && hands[1].pinched;
+
+    if (!both) {
+      if (this.mode === "frame") {
+        this._release(objectState);
+        this.scaleFrame = null;
+        return { mode: "idle", active: false, intent: "release" };
+      }
+      this.scaleFrame = null;
+      this._setMode("idle");
+      return {
+        mode: "idle",
+        active: false,
+        intent: "none",
+        pointer: hands[0]?.indexTip
+      };
+    }
+
+    const [a, b] = hands;
+    // Pinch-to-pinch distance is the scale reference; it is stable even when the
+    // palms rotate, which palm distance is not.
+    const distance = Math.max(0.001, Math.hypot(a.pinch.x - b.pinch.x, a.pinch.y - b.pinch.y));
+
+    if (this.mode !== "frame" || !this.scaleFrame) {
+      this.scaleFrame = {
+        distance,
+        objectStart: { scale: objectState.scale ?? 1 }
+      };
+      this.velocity = { x: 0, y: 0, roll: 0, scale: 0 };
+    }
+    this._setMode("frame");
+
+    // Ratio-based so equal gesture → equal result regardless of hand size.
+    const rawRatio = distance / this.scaleFrame.distance;
+    const ratio = 1 + (rawRatio - 1) * this.settings.scaleSensitivity;
+    const scale = clamp(
+      this.scaleFrame.objectStart.scale * ratio,
+      this.settings.minScale,
+      this.settings.maxScale
+    );
+
+    this.velocity.scale = scale - (objectState.scale ?? 1);
+
+    // SCALE never emits position or rotation.
+    return { mode: "frame", active: true, intent: "scale", scale };
+  }
+
+  /* ---- EXPLODE --------------------------------------------------------- */
+  _modeExplode(hands, objectState) {
+    const both = hands.length >= 2;
+    const current = clamp(objectState.explode ?? 0, 0, 1);
+
+    if (!both) {
+      if (this.mode === "frame") {
+        this._release(objectState);
+        this.explodeFrame = null;
+        return { mode: "idle", active: false, intent: "release" };
+      }
+      this.explodeFrame = null;
+      this._setMode("idle");
+      return {
+        mode: "idle",
+        active: false,
+        intent: "none",
+        pointer: hands[0]?.indexTip
+      };
+    }
+
+    const [a, b] = hands;
+    const distance = Math.max(
+      0.001,
+      Math.hypot(a.palm.x - b.palm.x, a.palm.y - b.palm.y)
+    );
+
+    if (this.mode !== "frame" || !this.explodeFrame) {
+      this.explodeFrame = { distance, start: current };
+      this._setMode("frame");
+    }
+
+    const frame = this.explodeFrame;
+    // Spread by 10% of the reference distance → 10% more explosion.
+    const ratio = distance / frame.distance;
+    const explode = clamp(
+      1 - (1 - frame.start) / Math.max(0.05, ratio * this.settings.explodeSensitivity),
+      0,
+      1
+    );
+
+    // EXPLODE never moves, rotates or scales the model.
+    return { mode: "frame", active: true, intent: "explode", explode };
   }
 
   _updateOneHand(hand, objectState) {
@@ -614,6 +880,9 @@ export class ManipulationSolver {
   _release() {
     this.grab = null;
     this.frame = null;
+    this.rotationFrame = null;
+    this.scaleFrame = null;
+    this.explodeFrame = null;
     this._setMode("idle");
   }
 

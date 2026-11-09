@@ -47,8 +47,10 @@ export class Workspace {
     this.modelId = null;
     this.selected = null;
     this.hovered = null;
-    this.exploded = false;
+    this.exploded = false;          // kept for compatibility (true when amount > 0)
+    this.explodeAmount = 0;         // continuous 0..1
     this.isolated = false;
+    this.partTransforms = new Map(); // part -> {offset, rotationX, rotationZ, scale}
     this._previousVisibility = null;
     this._selectedOrigEmissive = null;
 
@@ -75,10 +77,14 @@ export class Workspace {
   /* ===================================================================== */
 
   _initRenderer() {
+    // `alpha: true` is what lets the live camera feed sit *behind* the canvas.
+    // With an opaque drawing buffer the renderer paints over the video and the
+    // user only ever sees the scene background, no matter how the layers stack.
     const options = {
       antialias: this.settings.quality !== "performance",
       powerPreference: "high-performance",
-      alpha: false,
+      alpha: true,
+      premultipliedAlpha: true,
       stencil: false
     };
     this.renderer = this.rendererFactory
@@ -86,9 +92,14 @@ export class Workspace {
       : new THREE.WebGLRenderer({
       antialias: this.settings.quality !== "performance",
       powerPreference: "high-performance",
-      alpha: false,
+      alpha: true,
+      premultipliedAlpha: true,
       stencil: false
     });
+    // Clear to fully transparent, then paint a subtle scrim in the scene itself
+    // (see _initScene) so the model stays legible over a bright camera image.
+    this.renderer.setClearColor(0x000000, 0);
+    this.renderer.autoClear = true;
     this.renderer.setPixelRatio(
       Math.min(window.devicePixelRatio || 1, this.settings.quality === "performance" ? 1 : 1.75)
     );
@@ -104,8 +115,12 @@ export class Workspace {
 
   _initScene() {
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x05070c);
-    this.scene.fog = new THREE.FogExp2(0x05070c, 0.022);
+    // No scene.background: the drawing buffer stays transparent so the camera
+    // video behind the canvas remains visible. Legibility over bright footage is
+    // handled by a CSS scrim layered between the video and the canvas, which is
+    // cheaper than compositing a quad and can be faded independently.
+    this.scene.background = null;
+    this.scene.fog = new THREE.FogExp2(0x05070c, 0.018);
 
     this.camera = new THREE.PerspectiveCamera(
       42,
@@ -329,8 +344,10 @@ export class Workspace {
     if (!definition) throw new Error(`Unknown model "${modelId}"`);
 
     this.clearSelection({ silent: true });
-    this.exploded = false;
+    this.exploded = false;          // kept for compatibility (true when amount > 0)
+    this.explodeAmount = 0;         // continuous 0..1
     this.isolated = false;
+    this.partTransforms = new Map(); // part -> {offset, rotationX, rotationZ, scale}
     this._previousVisibility = null;
 
     if (this.assembly) {
@@ -494,20 +511,152 @@ export class Workspace {
   /* VIEW CONTROLS                                                         */
   /* ===================================================================== */
 
+  /**
+   * Set the explosion amount continuously, 0 (assembled) .. 1 (fully exploded).
+   *
+   * Parts move along their own `explodeDirection`, scaled by the amount, so the
+   * same geometry produces every intermediate state. The motion itself is eased
+   * in update(dt), which is why dragging the slider looks like an assembly coming
+   * apart rather than a series of jumps.
+   */
+  setExplodeAmount(amount) {
+    const next = Math.max(0, Math.min(1, Number.isFinite(amount) ? amount : 0));
+    this.explodeAmount = next;
+    this.exploded = next > 0.001;
+    this._applyExplodeTargets();
+    return this.explodeAmount;
+  }
+
+  /** Add to the explosion amount (used by the two-hand explode gesture). */
+  nudgeExplode(delta) {
+    return this.setExplodeAmount(this.explodeAmount + delta);
+  }
+
+  /** Legacy boolean API, expressed in terms of the continuous amount. */
   toggleExplode(force) {
-    this.exploded = typeof force === "boolean" ? force : !this.exploded;
+    const wanted = typeof force === "boolean" ? force : !this.exploded;
+    return this.setExplodeAmount(wanted ? 1 : 0) > 0.001;
+  }
+
+  _applyExplodeTargets() {
+    const amount = this.explodeAmount;
     for (const part of this.parts) {
       const target = this._partTargets.get(part);
+      if (!target) continue;
       const home = part.userData.home;
-      if (this.exploded) {
-        const dir = part.userData.explodeDirection;
-        const distance = part.userData.explodeDistance ?? 1;
-        target.position.copy(home).addScaledVector(dir, 1.9 * distance);
-      } else {
-        target.position.copy(home);
+      const dir = part.userData.explodeDirection;
+      const distance = part.userData.explodeDistance ?? 1;
+      // A per-part offset (from MOVE on a single component) is preserved so
+      // exploding does not throw away a component the user has placed.
+      const offset = this.partTransforms.get(part)?.offset;
+      target.position.copy(home);
+      if (offset) target.position.add(offset);
+      if (dir) target.position.addScaledVector(dir, 1.9 * distance * amount);
+    }
+  }
+
+  /* ---- per-part transforms --------------------------------------------- */
+
+  /** The transform record for a part, created on demand. */
+  _partTransform(part) {
+    if (!part) return null;
+    let record = this.partTransforms.get(part);
+    if (!record) {
+      record = {
+        offset: new THREE.Vector3(),
+        rotationX: 0,
+        rotationZ: 0,
+        scale: 1
+      };
+      this.partTransforms.set(part, record);
+    }
+    return record;
+  }
+
+  /** Read a part's current local transform (offset from its home position). */
+  getPartTransform(partId) {
+    const part = this.getPart(partId);
+    if (!part) return null;
+    const record = this.partTransforms.get(part);
+    const home = part.userData.home;
+    return {
+      offset: {
+        x: part.position.x - home.x,
+        y: part.position.y - home.y,
+        z: part.position.z - home.z
+      },
+      rotationX: record?.rotationX ?? 0,
+      rotationZ: record?.rotationZ ?? 0,
+      scale: record?.scale ?? 1
+    };
+  }
+
+  /**
+   * Move / rotate / scale a single component.
+   *
+   * The offset is stored relative to the part's home position, then folded into
+   * the explode target, so a part can be dragged *and* the assembly exploded
+   * without the two fighting over `part.position`.
+   */
+  setPartTransform(partId, { offset, rotationX, rotationZ, scale } = {}) {
+    const part = this.getPart(partId);
+    if (!part) return false;
+    const record = this._partTransform(part);
+
+    if (offset) {
+      if (typeof offset.x === "number") record.offset.x = offset.x;
+      if (typeof offset.y === "number") record.offset.y = offset.y;
+      if (typeof offset.z === "number") record.offset.z = offset.z;
+    }
+    if (typeof rotationX === "number") record.rotationX = rotationX;
+    if (typeof rotationZ === "number") record.rotationZ = rotationZ;
+    if (typeof scale === "number") record.scale = THREE.MathUtils.clamp(scale, 0.15, 4);
+
+    this._applyExplodeTargets();
+    this._applyPartTransform(part);
+    return true;
+  }
+
+  /** Add a delta to a part's stored offset (used by the MOVE gesture). */
+  applyPartDelta(partId, { x = 0, y = 0, z = 0, roll = 0, pitch = 0, scale = 0 } = {}) {
+    const part = this.getPart(partId);
+    if (!part) return false;
+    const record = this._partTransform(part);
+    record.offset.x = THREE.MathUtils.clamp(record.offset.x + x, -6, 6);
+    record.offset.y = THREE.MathUtils.clamp(record.offset.y + y, -5, 5);
+    record.offset.z = THREE.MathUtils.clamp(record.offset.z + z, -5, 5);
+    record.rotationZ += roll;
+    record.rotationX = THREE.MathUtils.clamp(record.rotationX + pitch, -Math.PI, Math.PI);
+    record.scale = THREE.MathUtils.clamp(record.scale + scale, 0.15, 4);
+    this._applyExplodeTargets();
+    this._applyPartTransform(part);
+    return true;
+  }
+
+  /** Clear every per-part transform, returning components to their homes. */
+  resetPartTransforms() {
+    for (const part of this.partTransforms.keys()) {
+      part.rotation.set(0, 0, 0);
+      part.scale.setScalar(1);
+      if (part.userData.outline) {
+        part.userData.outline.rotation.set(0, 0, 0);
+        part.userData.outline.scale.setScalar(1);
       }
     }
-    return this.exploded;
+    this.partTransforms.clear();
+    this._applyExplodeTargets();
+    for (const part of this.parts) part.rotation.set(0, 0, 0), part.scale.setScalar(1);
+  }
+
+  _applyPartTransform(part) {
+    const record = this.partTransforms.get(part);
+    if (!record) return;
+    part.rotation.set(record.rotationX, 0, record.rotationZ);
+    part.scale.setScalar(record.scale);
+    if (part.userData.outline) {
+      part.userData.outline.rotation.copy(part.rotation);
+      part.userData.outline.scale.copy(part.scale);
+    }
   }
 
   toggleIsolate(force) {
@@ -555,7 +704,9 @@ export class Workspace {
   resetView() {
     this._restoreVisibility();
     this.isolated = false;
+    this.explodeAmount = 0;
     this.exploded = false;
+    this.resetPartTransforms();
     for (const part of this.parts) {
       this._partTargets.get(part)?.position.copy(part.userData.home);
     }
@@ -798,6 +949,8 @@ export class Workspace {
       }
       if (part.userData.outline) {
         part.userData.outline.position.copy(part.position);
+        part.userData.outline.rotation.copy(part.rotation);
+        part.userData.outline.scale.copy(part.scale);
       }
     }
 

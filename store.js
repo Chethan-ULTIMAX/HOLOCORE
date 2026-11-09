@@ -14,7 +14,11 @@ export const DEFAULT_SETTINGS = {
     previewVisible: true,
     showLandmarks: true,
     showSkeleton: true,
-    mirror: true
+    mirror: true,
+    /** true = camera fills the 3D workspace; false = small preview card. */
+    workspaceView: true,
+    /** How strongly the legibility wash dims the camera image, 0..1. */
+    scrim: 0.4
   },
   tracking: {
     maxHands: 2,

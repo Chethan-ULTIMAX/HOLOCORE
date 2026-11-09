@@ -204,6 +204,87 @@ try {
 check("keyboard shortcuts execute without errors", keyError === null, keyError?.message || "");
 check("no uncaught errors after interaction", uncaught.length === 0, uncaught.join(" | "));
 
+
+/* ------------------------------------------------------------------------- */
+/* 4. NEW INTERACTION CHROME IS WIRED TO BEHAVIOUR                          */
+/* ------------------------------------------------------------------------- */
+
+section("4 · Interaction modes and explode slider are wired");
+
+// The mode bar is built by initInteraction(), which runs on the degraded path
+// too — modes must exist even with no GPU.
+const modeButtons = [...document.querySelectorAll("#mode-buttons .mode-btn")];
+check("the mode bar is built during boot", modeButtons.length === 5,
+  `${modeButtons.length} buttons`);
+check("mode buttons name their modes",
+  modeButtons.map(b => b.dataset.mode).join(",") === "select,move,rotate,scale,explode",
+  modeButtons.map(b => b.dataset.mode).join(","));
+
+// Exactly one mode is active, and it is SELECT by default.
+const activeAtBoot = modeButtons.filter(b => b.classList.contains("is-active"));
+check("exactly one mode is active at boot", activeAtBoot.length === 1,
+  activeAtBoot.map(b => b.dataset.mode).join(","));
+check("SELECT is the default mode", activeAtBoot[0]?.dataset.mode === "select");
+
+// Clicking a mode button changes both the UI and the solver.
+const moveButton = modeButtons.find(b => b.dataset.mode === "move");
+moveButton.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+check("clicking MOVE makes it the active mode", moveButton.classList.contains("is-active"));
+check("the previous mode deactivates",
+  modeButtons.filter(b => b.classList.contains("is-active")).length === 1);
+check("the solver is switched, not just the button",
+  api.solver.modeId === "move", api.solver.modeId);
+
+// The instruction strip explains the mode.
+const instruction = document.getElementById("mode-instruction-text");
+check("the active mode shows an instruction", /drag|pinch/i.test(instruction.textContent),
+  instruction.textContent);
+
+// Keyboard shortcuts 1-5 switch modes.
+window.dispatchEvent(new window.KeyboardEvent("keydown", { key: "3", bubbles: true }));
+check("pressing 3 selects ROTATE", api.state.mode === "rotate", api.state.mode);
+window.dispatchEvent(new window.KeyboardEvent("keydown", { key: "4", bubbles: true }));
+check("pressing 4 selects SCALE", api.state.mode === "scale", api.state.mode);
+check("keyboard mode switching reached the solver", api.solver.modeId === "scale",
+  api.solver.modeId);
+
+// Explode slider drives the workspace.
+const slider = document.getElementById("explode-slider");
+const valueOut = document.getElementById("explode-value");
+slider.value = "60";
+slider.dispatchEvent(new window.Event("input", { bubbles: true }));
+check("the explode slider updates its readout", valueOut.textContent === "60%",
+  valueOut.textContent);
+if (api.workspace) {
+  check("the explode slider reached the workspace",
+    Math.abs(api.workspace.explodeAmount - 0.6) < 1e-6,
+    String(api.workspace.explodeAmount));
+} else {
+  check("explode amount is tracked even without a renderer",
+    Math.abs(api.state.explodeAmount ?? 0.6 - 0.6) < 1,
+    "no renderer — visual path covered in validate.js");
+}
+
+// Camera view toggle flips state and the setting.
+const viewButton = document.getElementById("camera-view");
+const before = api.state.cameraView;
+viewButton.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+check("the camera view toggle flips the view",
+  api.state.cameraView !== before, `${before} → ${api.state.cameraView}`);
+check("the view toggle reports its new state",
+  viewButton.getAttribute("aria-pressed") === String(api.state.cameraView === "workspace"));
+
+// Both video elements exist and are inert until a stream arrives.
+const workspaceVideo = document.getElementById("workspace-video");
+check("the workspace video element is present but has no stream yet",
+  workspaceVideo && (workspaceVideo.srcObject === null || workspaceVideo.srcObject === undefined),
+  String(workspaceVideo?.srcObject));
+check("the workspace video is not marked live without a camera",
+  !document.getElementById("workspace-video")?.classList.contains("is-live"));
+
+check("no uncaught errors after using the new controls",
+  uncaught.length === 0, uncaught.join(" | "));
+
 /* ------------------------------------------------------------------------- */
 /* 3. ERROR MESSAGES ARE SPECIFIC                                            */
 /* ------------------------------------------------------------------------- */

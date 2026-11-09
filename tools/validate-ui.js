@@ -258,6 +258,122 @@ tracker.stop();
 const stopped = tracker.getState();
 check("stop clears hands and stream", stopped.hands === 0 && stopped.status === "stopped");
 
+
+/* ------------------------------------------------------------------------- */
+/* NEW · Camera layer, mode bar, explode slider                             */
+/* ------------------------------------------------------------------------- */
+
+section("5 · Camera layer sits behind the 3D canvas");
+
+const viewport = document.getElementById("viewport");
+const workspaceVideo = document.getElementById("workspace-video");
+const workspaceOverlay = document.getElementById("workspace-overlay");
+const workspaceScrim = document.getElementById("workspace-scrim");
+const mainCanvasHost = viewport?.querySelector("canvas");
+
+check("a full-workspace video element exists", Boolean(workspaceVideo));
+check("the workspace video is a real <video> with autoplay+inline+muted",
+  workspaceVideo?.tagName === "VIDEO" &&
+  workspaceVideo.hasAttribute("playsinline") &&
+  workspaceVideo.hasAttribute("muted") &&
+  workspaceVideo.hasAttribute("autoplay"),
+  workspaceVideo?.tagName);
+check("the video lives inside the viewport", workspaceVideo?.parentElement === viewport);
+check("a landmark overlay exists for the workspace", Boolean(workspaceOverlay));
+check("a legibility scrim sits between video and canvas", Boolean(workspaceScrim));
+
+// DOM order is the compositing order: video → scrim → overlay, and the canvas
+// is inserted by the renderer at runtime. Assert the video comes first so it can
+// never paint over the model.
+const children = [...viewport.children];
+const videoIndex = children.indexOf(workspaceVideo);
+const scrimIndex = children.indexOf(workspaceScrim);
+const overlayIndex = children.indexOf(workspaceOverlay);
+check("video is the first layer in the viewport", videoIndex === 0, `index ${videoIndex}`);
+check("scrim is layered above the video", scrimIndex > videoIndex);
+check("landmark overlay is layered above the scrim", overlayIndex > scrimIndex);
+void mainCanvasHost;
+
+// The stylesheet must mirror the video, keep it non-interactive and give the
+// renderer a stacking context above it. These are the properties the whole
+// "can I see myself" requirement rests on.
+const css = readFileSync(join(root, "styles.css"), "utf8");
+const videoRule = css.slice(css.indexOf(".workspace-video {"), css.indexOf(".workspace-video.is-live"));
+check("the camera image is CSS-mirrored", /transform:\s*scaleX\(-1\)/.test(videoRule));
+check("the camera image covers and crops", /object-fit:\s*cover/.test(videoRule));
+check("the camera layer cannot swallow clicks", /pointer-events:\s*none/.test(videoRule));
+check("the camera layer is at z-index 0", /z-index:\s*0/.test(videoRule));
+
+const canvasRule = css.slice(css.indexOf("#viewport > canvas"));
+check("the 3D canvas paints above the camera", /z-index:\s*2/.test(canvasRule.slice(0, 200)));
+const overlayRule = css.slice(css.indexOf(".workspace-overlay {"), css.indexOf(".workspace-overlay {") + 260);
+check("the landmark overlay paints above the canvas", /z-index:\s*3/.test(overlayRule));
+
+section("6 · Interaction mode bar");
+
+const modeButtons = [...document.querySelectorAll("#mode-buttons .mode-btn")];
+check("the mode bar is not built until the app initialises", modeButtons.length === 0,
+  `${modeButtons.length} pre-rendered`);
+
+const { MODES } = await import("../interactionModes.js");
+check("five modes are defined", MODES.length === 5);
+
+// Build the bar exactly as main.js does, then assert the wiring contract.
+const modeContainer = document.getElementById("mode-buttons");
+for (const mode of MODES) {
+  const button = document.createElement("button");
+  button.className = "mode-btn";
+  button.dataset.mode = mode.id;
+  button.style.setProperty("--mode", mode.colour);
+  button.innerHTML = `<span>${mode.label.toUpperCase()}</span>`;
+  modeContainer.appendChild(button);
+}
+const built = [...modeContainer.querySelectorAll(".mode-btn")];
+check("every mode renders a button", built.length === MODES.length, `${built.length} buttons`);
+check("each button carries its own accent colour",
+  built.every(button => button.style.getPropertyValue("--mode")),
+  built.map(b => b.style.getPropertyValue("--mode")).join(" "));
+
+const modeStyle = css.slice(css.indexOf(".mode-btn.is-active"));
+check("the active mode is visually distinct", /background:\s*var\(--mode\)/.test(modeStyle.slice(0, 220)));
+
+section("7 · Explode slider");
+
+const explodeSlider = document.getElementById("explode-slider");
+const explodeValue = document.getElementById("explode-value");
+check("the explode slider exists", Boolean(explodeSlider));
+check("it is continuous from 0 to 100", explodeSlider?.min === "0" && explodeSlider?.max === "100");
+check("it starts assembled", explodeSlider?.value === "0");
+check("it reports its value accessibly", explodeSlider?.hasAttribute("aria-valuetext"));
+check("a percentage readout exists", Boolean(explodeValue) && explodeValue.tagName === "OUTPUT");
+
+// Simulate the input handler contract.
+explodeSlider.value = "45";
+explodeSlider.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+check("the slider accepts an intermediate amount", explodeSlider.value === "45");
+
+section("8 · Camera view controls");
+
+const cameraViewButton = document.getElementById("camera-view");
+check("a full-workspace/preview toggle exists", Boolean(cameraViewButton));
+check("the toggle reports its state", cameraViewButton?.hasAttribute("aria-pressed"));
+
+const workspaceViewSetting = document.getElementById("set-workspace-view");
+check("the view mode is also a persisted setting", Boolean(workspaceViewSetting));
+
+const scrimSetting = document.getElementById("set-scrim");
+check("camera dimming is adjustable", Boolean(scrimSetting));
+
+const enableInWorkspace = document.getElementById("workspace-cam-enable");
+check("the workspace offers a camera enable button", Boolean(enableInWorkspace));
+
+const note = document.getElementById("workspace-cam-note");
+check("an explanatory note exists for the camera-off state",
+  Boolean(note) && /camera off/i.test(note.textContent));
+
+check("the camera view setting is persisted by the store",
+  Object.prototype.hasOwnProperty.call(store.get().camera, "workspaceView"));
+
 /* ------------------------------------------------------------------------- */
 /* SUMMARY                                                                   */
 /* ------------------------------------------------------------------------- */

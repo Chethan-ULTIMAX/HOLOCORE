@@ -138,6 +138,12 @@
               Import GLB
             </button>
           </div>
+          <div class="explode-row">
+            <label class="explode-label" for="explode-slider">Explode</label>
+            <input type="range" id="explode-slider" min="0" max="100" step="1" value="0"
+                   aria-label="Explosion amount" aria-valuetext="0 percent">
+            <output class="explode-value" id="explode-value" for="explode-slider">0%</output>
+          </div>
           <input type="file" id="file-input" accept=".glb,.gltf" hidden>
           <p class="panel-note" id="import-note">Load your own GLB/GLTF assembly. Each mesh becomes an inspectable part.</p>
         </div>
@@ -152,6 +158,19 @@
     <section class="viewport-wrap" id="viewport-wrap">
 
       <div class="viewport" id="viewport">
+        <!-- Live camera feed. Sits behind the WebGL canvas, which clears to
+             transparent so this stays visible. -->
+        <video id="workspace-video" class="workspace-video" playsinline muted autoplay
+               aria-label="Live camera feed"></video>
+        <div class="workspace-scrim" id="workspace-scrim" aria-hidden="true"></div>
+        <!-- Landmark + pointer overlay for the full-workspace view. -->
+        <canvas id="workspace-overlay" class="workspace-overlay" aria-hidden="true"></canvas>
+        <div class="workspace-cam-note" id="workspace-cam-note" hidden>
+          <strong>Camera off</strong>
+          <span>Enable the camera to see yourself and use gestures</span>
+          <button class="btn btn-primary btn-sm" id="workspace-cam-enable">Enable camera</button>
+        </div>
+
         <div class="viewport-hud viewport-hud-tl">
           <div class="hud-line">
             <span class="hud-label">VIEWPORT</span>
@@ -184,6 +203,19 @@
           <span class="kbd">PINCH</span> grab
         </div>
 
+        <!-- Interaction mode bar -->
+        <div class="mode-bar" id="mode-bar" role="toolbar" aria-label="Interaction mode">
+          <span class="mode-bar-label">MODE</span>
+          <div class="mode-buttons" id="mode-buttons"></div>
+        </div>
+
+        <!-- Instruction strip for the active mode -->
+        <div class="mode-instruction" id="mode-instruction">
+          <span class="mode-dot" id="mode-dot"></span>
+          <span class="mode-instruction-text" id="mode-instruction-text">Select a mode</span>
+          <span class="mode-instruction-target" id="mode-instruction-target"></span>
+        </div>
+
         <!-- Transform readout -->
         <div class="transform-readout">
           <div><span>POS</span><b id="readout-pos">0.00, 0.00, 0.00</b></div>
@@ -200,6 +232,8 @@
             LIVE TRACKING
           </span>
           <div class="camera-head-actions">
+            <button class="mini-btn" id="camera-view" title="Toggle full-workspace camera"
+                    aria-label="Toggle full-workspace camera" aria-pressed="false">⤢</button>
             <button class="mini-btn" id="camera-hide" title="Hide preview" aria-label="Hide camera preview">–</button>
             <button class="mini-btn" id="camera-stop" title="Stop camera" aria-label="Stop camera">×</button>
           </div>
@@ -351,6 +385,14 @@
           <span>Mirror preview</span>
           <input type="checkbox" id="set-mirror">
         </label>
+        <label class="switch-field">
+          <span>Camera fills workspace</span>
+          <input type="checkbox" id="set-workspace-view">
+        </label>
+        <label class="field">
+          <span>Camera dimming <b id="val-scrim">0.4</b></span>
+          <input type="range" id="set-scrim" min="0" max="0.9" step="0.05">
+        </label>
         <label class="field">
           <span>Maximum hands <b id="val-maxhands">2</b></span>
           <input type="range" id="set-maxhands" min="1" max="2" step="1">
@@ -465,6 +507,8 @@
           <span><kbd>G</kbd> grid</span>
           <span><kbd>←↑↓→</kbd> move</span>
           <span><kbd>Q</kbd>/<kbd>W</kbd> depth</span>
+          <span><kbd>1</kbd>–<kbd>5</kbd> mode</span>
+          <span><kbd>V</kbd> camera view</span>
           <span><kbd>Z</kbd>/<kbd>X</kbd> roll</span>
           <span><kbd>?</kbd> guide</span>
         </div>
@@ -488,27 +532,37 @@
     <div class="modal-body">
       <div class="help-grid">
         <article>
-          <h3>1 · Activate the camera</h3>
-          <p>Press <kbd>C</kbd> or click <em>Enable camera</em>. Your browser asks for
-             permission; the preview appears bottom-left with live 21-point landmarks.</p>
+          <h3>1 · Show yourself</h3>
+          <p>Press <kbd>C</kbd> or click <em>Enable camera</em>. Once you allow
+             permission your live, mirrored camera fills the 3D workspace — the
+             assembly floats in front of you. Press <kbd>V</kbd> to shrink the feed
+             back to a corner preview.</p>
         </article>
         <article>
-          <h3>2 · Grab with a pinch</h3>
-          <p>Touch your thumb and index fingertip. The object locks to your pinch point —
-             it never jumps, because the grab captures a reference frame. Move your hand
-             to translate. Open the pinch to release.</p>
+          <h3>2 · Pick a mode</h3>
+          <p>The mode decides what a pinch does, so nothing happens twice by accident.
+             Choose with <kbd>1</kbd>–<kbd>5</kbd> or the mode bar:</p>
+          <ul class="help-list">
+            <li><b>Select</b> — point and pinch to select a component</li>
+            <li><b>Move</b> — pinch and drag</li>
+            <li><b>Rotate</b> — pinch and sweep left/right or up/down</li>
+            <li><b>Scale</b> — pinch with both hands and spread</li>
+            <li><b>Explode</b> — slider, or spread both hands</li>
+          </ul>
         </article>
         <article>
-          <h3>3 · Scale and rotate with two hands</h3>
-          <p>Show both hands. Spread them apart to scale up, bring them together to scale
-             down, and rotate the line between your hands to rotate the object. Moving both
-             hands together translates it.</p>
+          <h3>3 · Pinch means press and hold</h3>
+          <p>Touch your thumb and index fingertip: a green ring closes and the pinch
+             engages. The grab records a reference frame, so the object never jumps to
+             your fingertip. Open the pinch to release. If your hand leaves the frame,
+             the grab is released safely instead of sticking.</p>
         </article>
         <article>
-          <h3>4 · Point to inspect</h3>
-          <p>Extend your index finger. A reticle follows your fingertip in the 3D
-             workspace and highlights whatever it is over. The inspector explains the
-             component, its specification, connections and failure behaviour.</p>
+          <h3>4 · Explode, then inspect</h3>
+          <p>Drag the explode slider (or press <kbd>E</kbd>) to open the assembly from
+             0–100%. Every component keeps its own highlight, so you can select
+             individual parts mid-explosion and inspect its specification, connections
+             and failure behaviour.</p>
         </article>
       </div>
       <div class="help-tip">
