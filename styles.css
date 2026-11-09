@@ -500,7 +500,81 @@ kbd, .kbd {
 
 /* ============================ VIEWPORT ============================ */
 .viewport-wrap { position: relative; min-width: 0; overflow: hidden; background: var(--bg-0); }
-.viewport { position: absolute; inset: 0; }
+.viewport { position: absolute; inset: 0; isolation: isolate; }
+
+/* ---- webcam layers -----------------------------------------------------
+   Stacking order, bottom to top:
+     0  workspace-video  (the real camera feed, mirrored)
+     1  workspace-scrim  (legibility wash, opacity is a setting)
+     2  three.js canvas  (alpha:true, clears to transparent)
+     3  workspace-overlay (landmark skeleton + pointer)
+     4+ existing HUD / mode bar / readout
+   ---------------------------------------------------------------------- */
+.workspace-video {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  /* Mirror so moving your right hand moves the pointer right. */
+  transform: scaleX(-1);
+  opacity: 0;
+  transition: opacity 0.35s ease;
+  pointer-events: none;
+}
+.workspace-video.is-live { opacity: 1; }
+.workspace-video.unmirrored { transform: none; }
+
+.workspace-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.35s ease;
+  /* A vignette that darkens the edges (where the HUD sits) but leaves the
+     subject in the middle clearly visible. */
+  background:
+    radial-gradient(ellipse at 50% 42%, rgba(3, 8, 14, 0) 28%, rgba(3, 8, 14, 0.55) 92%),
+    linear-gradient(180deg, rgba(3, 8, 14, 0.35), rgba(3, 8, 14, 0.06) 38%, rgba(3, 8, 14, 0.45));
+}
+.workspace-scrim.is-live { opacity: var(--scrim-strength, 0.4); }
+
+.workspace-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.workspace-cam-note {
+  position: absolute;
+  z-index: 5;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 18px 22px;
+  border-radius: 12px;
+  border: 1px solid var(--line-strong);
+  background: rgba(6, 10, 16, 0.92);
+  backdrop-filter: blur(14px);
+  text-align: center;
+}
+.workspace-cam-note strong { font-size: 12px; letter-spacing: 0.08em; }
+.workspace-cam-note span { font-size: 10px; color: var(--text-dim); max-width: 240px; line-height: 1.5; }
+.workspace-cam-note .btn { margin-top: 6px; }
+.workspace-cam-note[hidden] { display: none; }
+
+/* The Three.js canvas must never paint an opaque background over the video. */
+#viewport > canvas { position: relative; z-index: 2; display: block; width: 100%; height: 100%; }
 .viewport canvas { display: block; width: 100%; height: 100%; }
 
 .viewport-hud {
@@ -560,6 +634,20 @@ kbd, .kbd {
   box-shadow: 0 0 16px rgba(79, 227, 163, 0.5);
   transform: scale(1.15);
 }
+/* Active pinch: the ring closes in and turns solid green, matching the overlay. */
+.reticle.is-active .reticle-ring {
+  border-color: #5ef2c0;
+  border-width: 2.5px;
+  transform: scale(0.82);
+  box-shadow: 0 0 22px rgba(94, 242, 192, 0.75), inset 0 0 12px rgba(94, 242, 192, 0.3);
+  transition: transform 0.1s ease, box-shadow 0.1s ease, border-color 0.1s ease;
+}
+.reticle.is-active .reticle-dot {
+  background: #5ef2c0;
+  box-shadow: 0 0 12px #5ef2c0;
+  transform: scale(1.5);
+}
+
 .reticle-label {
   position: absolute;
   left: 20px;
@@ -619,6 +707,139 @@ kbd, .kbd {
 .transform-readout span { color: var(--text-faint); }
 .transform-readout b { color: var(--text-dim); font-weight: 500; }
 
+/* ============================ MODE BAR ============================ */
+.mode-bar {
+  position: absolute;
+  z-index: 6;
+  left: 50%;
+  bottom: 64px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--line-strong);
+  background: rgba(6, 10, 16, 0.82);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 14px 34px -16px rgba(0, 0, 0, 0.9);
+}
+.mode-bar-label {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.16em;
+  color: var(--text-faint);
+  padding-left: 3px;
+}
+.mode-buttons { display: flex; gap: 4px; }
+
+.mode-btn {
+  --mode: #3fd0ff;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 11px 6px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  transition: 0.16s ease;
+  white-space: nowrap;
+}
+.mode-btn svg {
+  width: 13px;
+  height: 13px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+  flex-shrink: 0;
+}
+.mode-btn kbd {
+  font-family: var(--mono);
+  font-size: 8px;
+  opacity: 0.5;
+  padding: 1px 3px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.mode-btn:hover { color: var(--text); border-color: var(--line-strong); background: rgba(255, 255, 255, 0.05); }
+.mode-btn.is-active {
+  color: #04080d;
+  background: var(--mode);
+  border-color: var(--mode);
+  box-shadow: 0 0 0 1px var(--mode), 0 6px 22px -8px var(--mode);
+}
+.mode-btn.is-active kbd { opacity: 0.7; }
+
+/* Instruction strip */
+.mode-instruction {
+  position: absolute;
+  z-index: 6;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  max-width: min(680px, calc(100% - 48px));
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: rgba(6, 10, 16, 0.86);
+  backdrop-filter: blur(16px);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.mode-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--mode-accent, var(--cyan));
+  box-shadow: 0 0 9px var(--mode-accent, var(--cyan));
+  flex-shrink: 0;
+}
+.mode-instruction-text { color: var(--text); }
+.mode-instruction-target {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--mode-accent, var(--cyan));
+  padding-left: 9px;
+  border-left: 1px solid var(--line);
+  letter-spacing: 0.06em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mode-instruction-target:empty { display: none; }
+
+/* Explode slider */
+.explode-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 2px;
+}
+.explode-label {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  color: var(--text-faint);
+  text-transform: uppercase;
+}
+.explode-row input[type="range"] { width: 100%; }
+.explode-value {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--cyan);
+  min-width: 30px;
+  text-align: right;
+}
+
 /* ============================ CAMERA CARD ============================ */
 .camera-card {
   position: absolute;
@@ -635,6 +856,12 @@ kbd, .kbd {
   transition: width 0.28s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.2s ease, transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
   transform-origin: bottom left;
 }
+.camera-card.is-minimised {
+  width: 210px;
+}
+.camera-card.is-minimised .camera-stage { display: none; }
+.camera-card.is-minimised .camera-foot { display: none; }
+
 .camera-card[data-state="hidden"] {
   width: 190px;
 }
@@ -1506,6 +1733,29 @@ input[type="range"]::-moz-range-thumb {
   letter-spacing: 0.02em;
 }
 .help-grid p { font-size: 10.5px; line-height: 1.6; color: var(--text-dim); }
+.help-list {
+  margin: 6px 0 0;
+  padding-left: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.help-list li { display: flex; gap: 6px; align-items: baseline; }
+.help-list li::before {
+  content: "";
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--cyan);
+  opacity: 0.7;
+  flex-shrink: 0;
+  margin-top: 5px;
+}
+.help-list b { color: var(--text); font-weight: 600; }
+
 .help-tip {
   padding: 9px 12px;
   border-radius: 8px;
@@ -1650,6 +1900,12 @@ input[type="range"]::-moz-range-thumb {
   .workspace.hide-left, .workspace.hide-right { grid-template-columns: minmax(0, 1fr); }
   .status-item:nth-child(4), .status-item:nth-child(6) { display: none; }
   .camera-card { width: 200px; left: 12px; bottom: 12px; }
+  .mode-bar { bottom: 58px; padding: 6px 8px; gap: 6px; max-width: calc(100% - 20px); }
+  .mode-bar-label { display: none; }
+  .mode-buttons { overflow-x: auto; scrollbar-width: none; }
+  .mode-btn { padding: 6px 8px; font-size: 9px; }
+  .mode-btn kbd { display: none; }
+  .mode-instruction { bottom: 16px; font-size: 9.5px; max-width: calc(100% - 24px); }
   .topbar { padding: 0 10px; gap: 8px; }
   .status-pills { display: none; }
 }
@@ -1662,6 +1918,13 @@ input[type="range"]::-moz-range-thumb {
   .camera-foot { display: none !important; }
   .viewport-hud-tr { display: none; }
   .status-item:nth-child(3) { display: none; }
+}
+
+@media (max-width: 560px) {
+  .mode-btn span { display: none; }
+  .mode-btn { padding: 7px; }
+  .mode-btn svg { width: 15px; height: 15px; }
+  .mode-instruction-target { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

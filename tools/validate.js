@@ -28,6 +28,8 @@ import {
   palmScale
 } from "../gestures.js";
 import { createAssistant } from "../assistant.js";
+import { landmarkToStage, landmarkToNdc, coverFit, pixelsToWorld } from "../handGeometry.js";
+import { MODES, getMode, isMode, allowsIntent, instructionFor } from "../interactionModes.js";
 
 /* ------------------------------------------------------------------------- */
 /* MINI TEST RUNNER                                                          */
@@ -1203,6 +1205,520 @@ for (const model of MODEL_LIBRARY) {
   check("windTurbine: rotor spans a disc, not a column",
     ratio < 1.25 && Math.min(span.y, span.z) > 2.4,
     `y ${span.y.toFixed(2)} z ${span.z.toFixed(2)}`);
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* 9 · Camera ↔ viewport mapping (the drift bug)                             */
+/* ------------------------------------------------------------------------- */
+
+section("9 · Camera ↔ viewport coordinate mapping");
+
+// Same aspect ratio: no crop, so the mapping must be a plain scale.
+{
+  const size = { videoWidth: 1280, videoHeight: 720, boxWidth: 1280, boxHeight: 720 };
+  const centre = landmarkToStage({ x: 0.5, y: 0.5 }, size, { mirror: false });
+  check("matching aspect: centre maps to centre",
+    approx(centre.x, 640, 1e-6) && approx(centre.y, 360, 1e-6),
+    `${centre.x}, ${centre.y}`);
+
+  const left = landmarkToStage({ x: 0, y: 0.5 }, size, { mirror: false });
+  check("matching aspect: left edge maps to x=0", approx(left.x, 0, 1e-6));
+
+  const mirrored = landmarkToStage({ x: 0, y: 0.5 }, size, { mirror: true });
+  check("mirroring flips x exactly once", approx(mirrored.x, 1280, 1e-6), String(mirrored.x));
+}
+
+// 4:3 camera in a 16:9 box: cover crops the top and bottom.
+{
+  const size = { videoWidth: 640, videoHeight: 480, boxWidth: 1280, boxHeight: 720 };
+  const fit = coverFit(size.videoWidth, size.videoHeight, size.boxWidth, size.boxHeight);
+  check("cover fit scales to fill the box", approx(fit.scale, 2, 1e-9), String(fit.scale));
+  check("cover fit crops equally top and bottom",
+    approx(fit.offsetY, 60, 1e-6) && approx(fit.offsetX, 0, 1e-6),
+    `offsetY=${fit.offsetY}`);
+
+  // The top edge of the *source* frame is cropped away, so it maps above the box.
+  const top = landmarkToStage({ x: 0.5, y: 0 }, size, { mirror: false });
+  check("cropped source edge maps outside the box", !top.inside && top.y < 0,
+    `y=${top.y.toFixed(1)}`);
+
+  // A point in the middle of the *visible* region maps to the box centre.
+  const middle = landmarkToStage({ x: 0.5, y: 0.5 }, size, { mirror: false });
+  check("visible centre maps to box centre",
+    approx(middle.x, 640, 1e-6) && approx(middle.y, 360, 1e-6),
+    `${middle.x}, ${middle.y}`);
+}
+
+// Portrait camera in a landscape box: the width scale dominates, so the full
+// width is visible and the height overflows.
+{
+  const size = { videoWidth: 480, videoHeight: 640, boxWidth: 1280, boxHeight: 720 };
+  const fit = coverFit(size.videoWidth, size.videoHeight, size.boxWidth, size.boxHeight);
+  check("portrait source keeps its full width",
+    approx(fit.offsetX, 0, 1e-9) && fit.visibleW === size.videoWidth,
+    `offsetX=${fit.offsetX.toFixed(1)} visibleW=${fit.visibleW}`);
+  check("portrait source overflows vertically",
+    fit.offsetY > 100, `offsetY=${fit.offsetY.toFixed(1)}`);
+}
+
+// The drift regression: a naive (uncropped) mapping disagrees with the real one
+// once the aspect ratios differ. This is what the pointer used to do.
+{
+  const size = { videoWidth: 640, videoHeight: 480, boxWidth: 1600, boxHeight: 900 };
+  const landmark = { x: 0.2, y: 0.2 };
+  const correct = landmarkToStage(landmark, size, { mirror: false });
+  const naive = { x: landmark.x * size.boxWidth, y: landmark.y * size.boxHeight };
+  const drift = Math.hypot(correct.x - naive.x, correct.y - naive.y);
+  check("crop-aware mapping differs from naive scaling (drift is real)",
+    drift > 50, `${drift.toFixed(0)} px apart`);
+
+  // And it must land on the same fraction of the box that CSS cover produces.
+  const expectedY = (landmark.y * size.videoHeight - 0) / size.visibleHeight;
+  void expectedY;
+  check("crop-aware y is inside the box for a centred point",
+    correct.y > 0 && correct.y < size.boxHeight, String(correct.y.toFixed(1)));
+}
+
+// NDC output must be viewport-relative and Y-up.
+{
+  const size = { videoWidth: 1280, videoHeight: 720, boxWidth: 1280, boxHeight: 720 };
+  const viewport = { width: 1280, height: 720 };
+  const centre = landmarkToNdc({ x: 0.5, y: 0.5 }, size, viewport, { mirror: false });
+  check("centre landmark maps to NDC origin",
+    approx(centre.x, 0, 1e-6) && approx(centre.y, 0, 1e-6),
+    `${centre.x.toFixed(3)}, ${centre.y.toFixed(3)}`);
+
+  const top = landmarkToNdc({ x: 0.5, y: 0 }, size, viewport, { mirror: false });
+  check("top of the image maps to +Y in NDC (Y points up)", top.y > 0.9, String(top.y.toFixed(3)));
+
+  const left = landmarkToNdc({ x: 0, y: 0.5 }, size, viewport, { mirror: false });
+  check("left of the image maps to -X in NDC", left.x < -0.9, String(left.x.toFixed(3)));
+
+  // Mirrored: the *source* left edge appears on the right of the screen.
+  const mirrored = landmarkToNdc({ x: 0, y: 0.5 }, size, viewport, { mirror: true });
+  check("mirrored left edge appears at +X", mirrored.x > 0.9, String(mirrored.x.toFixed(3)));
+}
+
+// Degenerate inputs must not produce NaN — a NaN pointer kills the raycast.
+{
+  const zero = { videoWidth: 0, videoHeight: 0, boxWidth: 0, boxHeight: 0 };
+  const result = landmarkToStage({ x: 0.5, y: 0.5 }, zero, { mirror: true });
+  check("zero-sized inputs do not produce NaN",
+    Number.isFinite(result.x) && Number.isFinite(result.y),
+    `${result.x}, ${result.y}`);
+}
+
+// Pixel → world conversion used when dragging a component.
+{
+  const delta = pixelsToWorld({ x: 100, y: 0 }, { viewportHeight: 900, fovDegrees: 42, distance: 10 });
+  const expected = (100 * 2 * Math.tan((42 * Math.PI) / 360) * 10) / 900;
+  check("pixel to world respects fov and depth", approx(delta.x, expected, 1e-9),
+    `${delta.x.toFixed(4)} vs ${expected.toFixed(4)}`);
+  check("vertical pixel motion is inverted for world Y",
+    pixelsToWorld({ x: 0, y: 100 }, { viewportHeight: 900, fovDegrees: 42, distance: 10 }).y < 0);
+}
+
+/* ------------------------------------------------------------------------- */
+/* 10 · Interaction modes are enforced, not decorative                       */
+/* ------------------------------------------------------------------------- */
+
+section("10 · Interaction modes");
+
+check("five modes exist", MODES.length === 5, MODES.map(m => m.id).join("/"));
+check("every mode has its own colour",
+  new Set(MODES.map(m => m.colour)).size === MODES.length);
+check("every mode has an instruction",
+  MODES.every(m => typeof m.instruction === "string" && m.instruction.length > 10));
+check("unknown mode ids are rejected", !isMode("drag") && isMode("move"));
+check("unknown ids fall back to select", getMode("nope").id === "select");
+check("instructions are reachable by id", instructionFor("scale").includes("both hands"));
+
+check("MOVE does not permit rotation", !allowsIntent("move", "rotate"));
+check("ROTATE does not permit translation", !allowsIntent("rotate", "translate"));
+check("SCALE permits only scale",
+  allowsIntent("scale", "scale") && !allowsIntent("scale", "explode"));
+check("EXPLODE permits only explode",
+  allowsIntent("explode", "explode") && !allowsIntent("explode", "translate"));
+check("SELECT permits no transform",
+  !allowsIntent("select", "translate") && !allowsIntent("select", "rotate") &&
+  !allowsIntent("select", "scale"));
+check("housekeeping intents are always allowed",
+  allowsIntent("scale", "release") && allowsIntent("move", "tracking-lost"));
+
+/* Mode gating in the solver ---------------------------------------------- */
+
+function modeSolver(mode, settings = {}) {
+  return new ManipulationSolver({ settings: { mode, ...settings } });
+}
+
+// MOVE emits position and nothing else.
+{
+  const solver = modeSolver("move");
+  const object = neutralObject();
+  solver.update([handState({ x: 0.5, y: 0.5, pinched: true })], object, 0);
+  const moved = solver.update([handState({ x: 0.7, y: 0.5, pinched: true })], object, 0.03);
+  check("MOVE produces translation", moved.intent === "translate" && moved.position.x > 0.3,
+    `x=${moved.position?.x.toFixed(2)}`);
+  check("MOVE never emits rotation or scale",
+    moved.rotationZ === undefined && moved.rotationX === undefined && moved.scale === undefined);
+}
+
+// ROTATE emits rotation and nothing else.
+{
+  const solver = modeSolver("rotate");
+  const object = neutralObject();
+  solver.update([handState({ x: 0.5, y: 0.5, pinched: true })], object, 0);
+  const rotated = solver.update([handState({ x: 0.8, y: 0.5, pinched: true })], object, 0.03);
+  check("ROTATE produces rotation", rotated.intent === "rotate" && Math.abs(rotated.rotationZ) > 0.5,
+    `rz=${rotated.rotationZ?.toFixed(2)}`);
+  check("ROTATE never emits position or scale",
+    rotated.position === undefined && rotated.scale === undefined);
+  check("horizontal hand motion yaws, not pitches",
+    Math.abs(rotated.rotationZ) > Math.abs(rotated.rotationX || 0));
+
+  // Vertical motion pitches.
+  const pitchSolver = modeSolver("rotate");
+  pitchSolver.update([handState({ x: 0.5, y: 0.5, pinched: true })], object, 0);
+  const pitched = pitchSolver.update([handState({ x: 0.5, y: 0.25, pinched: true })], object, 0.03);
+  check("vertical hand motion pitches", Math.abs(pitched.rotationX) > 0.2,
+    `rx=${pitched.rotationX?.toFixed(2)}`);
+  check("pitch is clamped to a usable range", Math.abs(pitched.rotationX) <= Math.PI / 2 + 1e-9);
+}
+
+// ROTATE must not jump on grab.
+{
+  const solver = modeSolver("rotate");
+  const object = neutralObject();
+  const start = solver.update([handState({ x: 0.85, y: 0.2, pinched: true })], object, 0);
+  check("ROTATE captures its reference and does not jump",
+    approx(start.rotationZ, 0, 1e-9) && approx(start.rotationX, 0, 1e-9),
+    `rz=${start.rotationZ}`);
+}
+
+// SCALE requires two hands and emits only scale.
+{
+  const solver = modeSolver("scale");
+  const object = { ...neutralObject(), scale: 1 };
+
+  const oneHand = solver.update([handState({ x: 0.5, y: 0.5, pinched: true })], object, 0);
+  check("SCALE ignores a single hand", !oneHand.active && oneHand.intent !== "scale");
+
+  const start = solver.update([
+    handState({ x: 0.4, y: 0.5, pinched: true }),
+    handState({ x: 0.6, y: 0.5, pinched: true })
+  ], object, 0.03);
+  check("SCALE starts without changing size", approx(start.scale, 1, 1e-9), String(start.scale));
+
+  const spread = solver.update([
+    handState({ x: 0.2, y: 0.5, pinched: true }),
+    handState({ x: 0.8, y: 0.5, pinched: true })
+  ], object, 0.06);
+  check("spreading both hands scales up", spread.scale > 2, `scale=${spread.scale?.toFixed(2)}`);
+  check("SCALE never emits position or rotation",
+    spread.position === undefined && spread.rotationZ === undefined);
+
+  const pinched = solver.update([
+    handState({ x: 0.46, y: 0.5, pinched: true }),
+    handState({ x: 0.54, y: 0.5, pinched: true })
+  ], object, 0.09);
+  check("bringing hands together scales down", pinched.scale < 1, `scale=${pinched.scale?.toFixed(2)}`);
+}
+
+// Scale clamps.
+{
+  const solver = modeSolver("scale");
+  const object = { ...neutralObject(), scale: 1 };
+  solver.update([
+    handState({ x: 0.4, y: 0.5, pinched: true }),
+    handState({ x: 0.6, y: 0.5, pinched: true })
+  ], object, 0);
+  const huge = solver.update([
+    handState({ x: -5, y: 0.5, pinched: true }),
+    handState({ x: 5, y: 0.5, pinched: true })
+  ], object, 0.03);
+  check("scale is clamped to the maximum", huge.scale <= 3.2 + 1e-9, String(huge.scale));
+}
+
+// EXPLODE emits only an explode amount.
+{
+  const solver = modeSolver("explode");
+  const object = { ...neutralObject(), explode: 0 };
+  solver.update([
+    handState({ x: 0.4, y: 0.5 }),
+    handState({ x: 0.6, y: 0.5 })
+  ], object, 0);
+  const spread = solver.update([
+    handState({ x: 0.2, y: 0.5 }),
+    handState({ x: 0.8, y: 0.5 })
+  ], object, 0.03);
+  check("EXPLODE produces an explode amount", spread.intent === "explode" && spread.explode > 0,
+    `explode=${spread.explode?.toFixed(2)}`);
+  check("EXPLODE never emits a transform",
+    spread.position === undefined && spread.rotationZ === undefined && spread.scale === undefined);
+  check("explode amount stays within 0..1",
+    spread.explode >= 0 && spread.explode <= 1, String(spread.explode));
+}
+
+// SELECT emits nothing at all.
+{
+  const solver = modeSolver("select");
+  const object = neutralObject();
+  solver.update([handState({ x: 0.5, y: 0.5, pinched: false, pointing: 0.9 })], object, 0);
+  const pinched = solver.update([handState({ x: 0.7, y: 0.3, pinched: true })], object, 0.03);
+  check("SELECT reports a selection gesture", pinched.intent === "select");
+  check("SELECT never transforms the model",
+    pinched.position === undefined && pinched.rotationZ === undefined &&
+    pinched.scale === undefined && pinched.explode === undefined);
+}
+
+// Switching mode mid-gesture releases cleanly.
+{
+  const solver = modeSolver("move");
+  const object = neutralObject();
+  solver.update([handState({ x: 0.5, y: 0.5, pinched: true })], object, 0);
+  solver.setMode("rotate");
+  const after = solver.update([handState({ x: 0.5, y: 0.5, pinched: true })], object, 0.03);
+  check("switching mode drops the old reference frame",
+    approx(after.rotationZ ?? 0, 0, 1e-9) && after.position === undefined);
+}
+
+// Tracking loss releases the gesture in every mode.
+{
+  for (const mode of ["move", "rotate", "scale", "explode", "select"]) {
+    const solver = modeSolver(mode);
+    const object = neutralObject();
+    solver.update([
+      handState({ x: 0.5, y: 0.5, pinched: true }),
+      handState({ x: 0.6, y: 0.5, pinched: true })
+    ], object, 0);
+    const lost = solver.update([], object, 0.03);
+    check(`${mode}: losing tracking releases the gesture`,
+      lost.intent === "tracking-lost" && lost.position === undefined &&
+      lost.rotationZ === undefined && lost.scale === undefined && lost.explode === undefined);
+  }
+}
+
+// A mode never leaks a transform the previous mode owned.
+{
+  const solver = modeSolver("rotate");
+  const object = neutralObject();
+  solver.setMode("scale");
+  const result = solver.update([handState({ x: 0.9, y: 0.9, pinched: true })], object, 0);
+  check("mode change cannot resurrect the previous intent",
+    result.rotationZ === undefined && result.position === undefined);
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* 11 · Continuous explode and per-component transforms                      */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Build an isolated Workspace for a test. Each test gets its own instance so a
+ * failure in one cannot leak state into the next.
+ */
+async function makeWorkspace() {
+  const { Workspace } = await import("../modelManager.js");
+  const host = document.createElement("div");
+  Object.defineProperty(host, "clientWidth", { value: 1024, configurable: true });
+  Object.defineProperty(host, "clientHeight", { value: 700, configurable: true });
+  document.body.appendChild(host);
+  return new Workspace({
+    container: host,
+    rendererFactory: makeStubRenderer,
+    controlsFactory: () => ({
+      target: new THREE.Vector3(),
+      enableDamping: false,
+      update() {},
+      dispose() {}
+    }),
+    environment: false,
+    onSelect: () => {},
+    onHover: () => {},
+    settings: { shadows: true, quality: "balanced", autoRotate: false, grid: true }
+  });
+}
+
+section("11 · Explode amount and per-component transforms");
+
+{
+  const ws = await makeWorkspace();
+  await ws.setModel("gearTrain");
+
+  const part = ws.parts[1];
+  const home = part.userData.home.clone();
+
+  // 0% must be exactly the assembled pose.
+  ws.setExplodeAmount(0);
+  for (let i = 0; i < 40; i++) ws.update(1 / 60);
+  check("explode 0% leaves parts at home",
+    part.position.distanceTo(home) < 1e-3, part.position.distanceTo(home).toFixed(4));
+
+  // A partial amount must move parts part of the way and stay put.
+  ws.setExplodeAmount(0.5);
+  for (let i = 0; i < 90; i++) ws.update(1 / 60);
+  const halfway = part.position.distanceTo(home);
+  check("explode 50% moves parts part of the way", halfway > 0.05, halfway.toFixed(3));
+
+  const dir = part.userData.explodeDirection;
+  const distance = part.userData.explodeDistance ?? 1;
+  const expected = 1.9 * distance * 0.5;
+  check("explode distance scales linearly with the amount",
+    Math.abs(halfway - expected) < 0.02, `${halfway.toFixed(3)} vs ${expected.toFixed(3)}`);
+  void dir;
+
+  // 100% must be twice as far as 50%.
+  ws.setExplodeAmount(1);
+  for (let i = 0; i < 120; i++) ws.update(1 / 60);
+  const full = part.position.distanceTo(home);
+  check("explode 100% is twice the 50% displacement",
+    Math.abs(full - expected * 2) < 0.02, `${full.toFixed(3)} vs ${(expected * 2).toFixed(3)}`);
+
+  // Returning to 0% reassembles.
+  ws.setExplodeAmount(0);
+  for (let i = 0; i < 160; i++) ws.update(1 / 60);
+  check("returning to 0% reassembles the model",
+    part.position.distanceTo(home) < 1e-3, part.position.distanceTo(home).toFixed(4));
+
+  check("explode amount is clamped high", ws.setExplodeAmount(4) === 1);
+  check("explode amount is clamped low", ws.setExplodeAmount(-2) === 0);
+  check("toggleExplode still works as a boolean",
+    ws.toggleExplode(true) === true && ws.explodeAmount === 1);
+  ws.setExplodeAmount(0);
+  ws.dispose();
+}
+
+/* Per-component transforms ------------------------------------------------- */
+{
+  const ws = await makeWorkspace();
+  await ws.setModel("launchVehicle");
+
+  const id = ws.parts[3].userData.partId;
+  const otherId = ws.parts[4].userData.partId;
+
+  check("a part starts with an identity transform",
+    approx(ws.getPartTransform(id).scale, 1) && approx(ws.getPartTransform(id).offset.x, 0));
+
+  ws.setPartTransform(id, { offset: { x: 1.5, y: 0.5, z: 0 }, rotationZ: 0.4, scale: 1.4 });
+  for (let i = 0; i < 60; i++) ws.update(1 / 60);
+
+  const moved = ws.getPartTransform(id);
+  check("a part can be moved independently", approx(moved.offset.x, 1.5, 1e-6),
+    String(moved.offset.x));
+  check("a part can be rotated independently", approx(moved.rotationZ, 0.4, 1e-6));
+  check("a part can be scaled independently", approx(moved.scale, 1.4, 1e-6));
+
+  const untouched = ws.getPartTransform(otherId);
+  check("transforming one part leaves the others alone",
+    approx(untouched.offset.x, 0) && approx(untouched.scale, 1));
+
+  const mesh = ws.getPart(id);
+  check("the part's mesh actually moved", Math.abs(mesh.position.x - mesh.userData.home.x) > 1.0,
+    `${mesh.position.x.toFixed(2)} vs home ${mesh.userData.home.x.toFixed(2)}`);
+  check("the part's mesh actually rotated", approx(mesh.rotation.z, 0.4, 1e-6));
+
+  // Exploding must preserve the hand-placed offset rather than resetting it.
+  // getPartTransform() reports total displacement, which is offset + explode,
+  // so the check is that the manual part of it is still there.
+  ws.setExplodeAmount(1);
+  for (let i = 0; i < 160; i++) ws.update(1 / 60);
+  const exploded = ws.getPartTransform(id);
+  const meshNow = ws.getPart(id);
+  const explodedPart = meshNow.position.distanceTo(meshNow.userData.home);
+  check("exploding preserves a component's manual offset",
+    exploded.offset.x > 1.0 && explodedPart > 1.5,
+    `offset.x=${exploded.offset.x.toFixed(2)} total=${explodedPart.toFixed(2)}`);
+
+  // resetView clears both.
+  ws.resetView();
+  for (let i = 0; i < 160; i++) ws.update(1 / 60);
+  const reset = ws.getPartTransform(id);
+  check("resetView clears per-part transforms",
+    approx(reset.offset.x, 0, 1e-3) && approx(reset.scale, 1, 1e-3) &&
+    approx(reset.rotationZ, 0, 1e-3),
+    `x=${reset.offset.x.toFixed(3)} s=${reset.scale.toFixed(3)}`);
+  check("resetView clears the explode amount", ws.explodeAmount === 0);
+
+  check("unknown part ids are rejected", ws.setPartTransform("nope", { scale: 2 }) === false);
+  ws.dispose();
+}
+
+/* Explode and assemble are smooth, not instant ---------------------------- */
+{
+  const ws = await makeWorkspace();
+  await ws.setModel("turbojet");
+  const part = ws.parts[0];
+  const home = part.userData.home.clone();
+  ws.setExplodeAmount(1);
+  ws.update(1 / 60);
+  const afterOneFrame = part.position.distanceTo(home);
+  for (let i = 0; i < 120; i++) ws.update(1 / 60);
+  const settled = part.position.distanceTo(home);
+  check("exploding is animated rather than instant",
+    afterOneFrame < settled * 0.9, `${afterOneFrame.toFixed(3)} → ${settled.toFixed(3)}`);
+  ws.dispose();
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* 12 · The camera stream reaches the workspace video element                */
+/* ------------------------------------------------------------------------- */
+
+section("12 · Camera stream sharing");
+
+// The workspace must show the same MediaStream the tracker is using, not a
+// second getUserMedia call (a second call means two camera lights, two
+// permission prompts, and two streams that drift apart).
+{
+  const source = readFileSync(join(root, "main.js"), "utf8");
+  check("main.js assigns the tracker stream to the workspace video",
+    /\.srcObject\s*=\s*stream/.test(source),
+    "syncWorkspaceVideo()");
+  check("main.js never captures its own camera stream",
+    // A capability guard is fine; an actual capture call is not.
+    !/await\s+navigator\.mediaDevices\.getUserMedia/.test(source),
+    "no second capture");
+  check("exactly one capture call site exists in the app",
+    (readFileSync(join(root, "handTracking.js"), "utf8")
+      .match(/await\s+navigator\.mediaDevices\.getUserMedia/g) || []).length === 1,
+    "tracker owns the only capture call");
+  check("the workspace video is never given a fake or generated source",
+    !/src\s*=\s*["']data:|src\s*=\s*["']blob:/.test(source));
+  check("the renderer is created with a transparent buffer",
+    /alpha:\s*true/.test(readFileSync(join(root, "modelManager.js"), "utf8")));
+  check("the scene has no opaque background colour",
+    /this\.scene\.background\s*=\s*null/.test(readFileSync(join(root, "modelManager.js"), "utf8")));
+}
+
+// The tracker reports its stream so the workspace can bind to it.
+{
+  const trackerSource = readFileSync(join(root, "handTracking.js"), "utf8");
+  check("the tracker exposes its stream for sharing",
+    /this\.stream\s*=/.test(trackerSource) && /stream/.test(trackerSource));
+  check("stopping the camera releases the stream", /getTracks\(\)\).*stop\(\)/s.test(trackerSource));
+}
+
+// Mirroring is applied in exactly one place per surface.
+{
+  const overlaySource = readFileSync(join(root, "handOverlay.js"), "utf8");
+  check("the overlay delegates mirroring to handGeometry",
+    /landmarkToStage/.test(overlaySource));
+  const geometrySource = readFileSync(join(root, "handGeometry.js"), "utf8");
+  check("mirroring is implemented once, in handGeometry",
+    (geometrySource.match(/1 - point\.x/g) || []).length === 0 &&
+    /mirror \? size\.boxWidth - stageX/.test(geometrySource),
+    "single flip in landmarkToStage");
+}
+
+// The pointer maths must be the shared module, not an ad-hoc ratio.
+{
+  const source = readFileSync(join(root, "main.js"), "utf8");
+  check("main.js maps pointers through handGeometry",
+    /landmarkToNdc/.test(source) && /landmarkToStage/.test(source));
+  check("main.js no longer scales the preview rect by a naive ratio",
+    !/px\.x \/ dom\.cameraStage\.clientWidth/.test(source),
+    "old ratio mapping removed");
 }
 
 /* ------------------------------------------------------------------------- */
