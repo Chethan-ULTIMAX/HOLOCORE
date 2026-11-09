@@ -410,6 +410,7 @@ const cards = results.map(({ model, parts, trianglesDrawn }) => `
     <figcaption>
       <strong>${model.name}</strong>
       <span>${model.category} · ${parts.length} parts · ${trianglesDrawn.toLocaleString()} triangles</span>
+      <a href="${model.id}-parts.png">part-id colouring</a>
     </figcaption>
   </figure>`).join("\n");
 
@@ -426,12 +427,15 @@ writeFileSync(join(outDir, "index.html"), `<!DOCTYPE html>
   figcaption { padding:10px 12px; display:flex; flex-direction:column; gap:3px; }
   figcaption strong { font-size:12.5px; font-weight:600; }
   figcaption span { font-size:10px; color:#7d93a6; letter-spacing:.04em; }
+  figcaption a { font-size:10px; color:#3fd0ff; text-decoration:none; letter-spacing:.04em; }
+  figcaption a:hover { text-decoration:underline; }
 </style></head>
 <body>
   <h1>HOLOCORE · PROCEDURAL MODEL PREVIEWS</h1>
   <p class="note">Software-rasterised from the real scene graph in modelFactory.js using the same camera
-  the application uses. No GPU or browser was available while building, so these renders are the
-  visual verification that each assembly is real geometry rather than a placeholder.</p>
+  the application uses. No GPU was available in the authoring environment, so these renders are the
+  visual verification that each assembly is real geometry rather than a placeholder.
+  The <a href="../index.html">live application</a> needs WebGL and a browser.</p>
   <div class="grid">${cards}</div>
 </body></html>
 `);

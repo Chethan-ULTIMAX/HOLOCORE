@@ -11,18 +11,22 @@
   figcaption { padding:10px 12px; display:flex; flex-direction:column; gap:3px; }
   figcaption strong { font-size:12.5px; font-weight:600; }
   figcaption span { font-size:10px; color:#7d93a6; letter-spacing:.04em; }
+  figcaption a { font-size:10px; color:#3fd0ff; text-decoration:none; letter-spacing:.04em; }
+  figcaption a:hover { text-decoration:underline; }
 </style></head>
 <body>
   <h1>HOLOCORE · PROCEDURAL MODEL PREVIEWS</h1>
   <p class="note">Software-rasterised from the real scene graph in modelFactory.js using the same camera
-  the application uses. No GPU or browser was available while building, so these renders are the
-  visual verification that each assembly is real geometry rather than a placeholder.</p>
+  the application uses. No GPU was available in the authoring environment, so these renders are the
+  visual verification that each assembly is real geometry rather than a placeholder.
+  The <a href="../index.html">live application</a> needs WebGL and a browser.</p>
   <div class="grid">
   <figure>
     <img src="launchVehicle.png" alt="Astra-9 Launch Vehicle">
     <figcaption>
       <strong>Astra-9 Launch Vehicle</strong>
       <span>Aerospace · 13 parts · 17,293 triangles</span>
+      <a href="launchVehicle-parts.png">part-id colouring</a>
     </figcaption>
   </figure>
 
@@ -31,6 +35,7 @@
     <figcaption>
       <strong>Single-Spool Turbojet</strong>
       <span>Aerospace · 11 parts · 11,926 triangles</span>
+      <a href="turbojet-parts.png">part-id colouring</a>
     </figcaption>
   </figure>
 
@@ -39,6 +44,7 @@
     <figcaption>
       <strong>Inline-4 Automotive Engine</strong>
       <span>Automotive · 13 parts · 18,544 triangles</span>
+      <a href="inlineEngine-parts.png">part-id colouring</a>
     </figcaption>
   </figure>
 
@@ -47,6 +53,7 @@
     <figcaption>
       <strong>Spur Gear Train</strong>
       <span>Mechanical · 8 parts · 14,735 triangles</span>
+      <a href="gearTrain-parts.png">part-id colouring</a>
     </figcaption>
   </figure>
 
@@ -55,6 +62,7 @@
     <figcaption>
       <strong>6-Axis Industrial Robot</strong>
       <span>Robotics · 9 parts · 7,944 triangles</span>
+      <a href="robotArm-parts.png">part-id colouring</a>
     </figcaption>
   </figure>
 
@@ -63,6 +71,7 @@
     <figcaption>
       <strong>Control Board (PCB)</strong>
       <span>Electronics · 9 parts · 3,874 triangles</span>
+      <a href="controlPCB-parts.png">part-id colouring</a>
     </figcaption>
   </figure>
 
@@ -71,6 +80,7 @@
     <figcaption>
       <strong>CPU Package</strong>
       <span>Computing · 7 parts · 4,952 triangles</span>
+      <a href="cpuPackage-parts.png">part-id colouring</a>
     </figcaption>
   </figure>
 
@@ -79,6 +89,7 @@
     <figcaption>
       <strong>Utility Wind Turbine</strong>
       <span>Industrial · 10 parts · 10,406 triangles</span>
+      <a href="windTurbine-parts.png">part-id colouring</a>
     </figcaption>
   </figure></div>
 </body></html>
