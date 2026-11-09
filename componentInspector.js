@@ -1,483 +1,297 @@
+/**
+ * HOLOCORE — componentInspector.js
+ * -----------------------------------------------------------------------------
+ * Turns the selected 3D part into a structured engineering brief.
+ *
+ * The panel is driven entirely by engineeringData.js, so what appears on screen
+ * always corresponds to the part that is highlighted in the scene.
+ */
 
-export function createComponentInspector({
-    THREE,
-    scene,
-    camera,
-    controls,
-    assembly,
-    renderer
-}) {
-    const list = document.getElementById("component-list");
-    const inspector = document.getElementById("inspector-content");
-    const count = document.getElementById("component-count");
-    const status = document.getElementById("model-status");
+import {
+  getComponentData,
+  resolveRelationName,
+  DATA_PROVENANCE
+} from "./engineeringData.js";
 
-    const explodeButton = document.getElementById("explode-btn");
-    const focusButton = document.getElementById("focus-btn");
-    const isolateButton = document.getElementById("isolate-btn");
-    const resetButton = document.getElementById("reset-btn");
+export class ComponentInspector {
+  constructor({ root, onFocus, onIsolate, onShowRelated, onAsk, onClear, getWorkspace }) {
+    this.root = root;
+    this.onFocus = onFocus || (() => {});
+    this.onIsolate = onIsolate || (() => {});
+    this.onShowRelated = onShowRelated || (() => {});
+    this.onAsk = onAsk || (() => {});
+    this.onClear = onClear || (() => {});
+    this.getWorkspace = getWorkspace || (() => null);
 
-    const parts = [];
+    this.modelId = null;
+    this.partId = null;
+    this.tab = "overview";
+    this._render();
+  }
 
-    assembly.traverse(object => {
-        if (object.isMesh) parts.push(object);
+  setModel(modelId) {
+    this.modelId = modelId;
+    this.partId = null;
+    this._render();
+  }
+
+  select(partId) {
+    this.partId = partId || null;
+    this.tab = "overview";
+    this._render();
+  }
+
+  /**
+   * Imported geometry has no engineering data. Clearing the model id makes the
+   * inspector show an explicit "no knowledge entry" state instead of inventing
+   * a description.
+   */
+  clearSelection() {
+    this.partId = null;
+    this._render();
+  }
+
+  /** Called after isolation toggles so buttons stay in sync. */
+  setState({ isolated = false } = {}) {
+    this._isolated = isolated;
+    this._syncButtons();
+  }
+
+  /* --------------------------------------------------------------------- */
+
+  _data() {
+    if (!this.partId || !this.modelId) return null;
+    return getComponentData(this.modelId, this.partId);
+  }
+
+  _el(tag, className, text) {
+    const el = document.createElement(tag);
+    if (className) el.className = className;
+    if (text !== undefined) el.textContent = text;
+    return el;
+  }
+
+  _render() {
+    if (!this.root) return;
+    this.root.replaceChildren();
+    const data = this._data();
+
+    if (!data) {
+      this._renderEmpty();
+      return;
+    }
+
+    this._renderHeader(data);
+    this._renderTabs();
+    const body = this._el("div", "inspector-body");
+    this.root.appendChild(body);
+
+    if (this.tab === "overview") this._renderOverview(body, data);
+    else if (this.tab === "system") this._renderSystem(body, data);
+    else if (this.tab === "learn") this._renderLearn(body, data);
+
+    this._renderActions(data);
+    this._syncButtons();
+  }
+
+  _renderEmpty() {
+    const empty = this._el("div", "inspector-empty");
+    empty.appendChild(this._el("div", "inspector-empty-glyph", "◇"));
+    empty.appendChild(this._el("strong", "", "No component selected"));
+
+    const partCount = this.getWorkspace()?.parts?.length || 0;
+    const workspace = this.getWorkspace();
+
+    if (workspace?.imported) {
+      empty.appendChild(
+        this._el(
+          "p",
+          "",
+          "Imported geometry has no engineering knowledge entry. Select a mesh to see its " +
+            "name, materials and measured geometry. Pick a model from the library to return " +
+            "to documented components."
+        )
+      );
+    } else {
+      empty.appendChild(
+        this._el(
+          "p",
+          "",
+          partCount
+            ? `Point at a component with your index finger, or click one of the ${partCount} ` +
+              "parts in the viewport or the parts list."
+            : "Load an assembly to begin inspection."
+        )
+      );
+    }
+
+    const hint = this._el("div", "inspector-hint");
+    hint.innerHTML =
+      "<span>POINT</span> hover &amp; highlight · <span>PINCH</span> grab the whole assembly";
+    empty.appendChild(hint);
+
+    this.root.appendChild(empty);
+  }
+
+  _renderHeader(data) {
+    const header = this._el("div", "inspector-head");
+
+    const meta = this._el("div", "inspector-meta");
+    meta.appendChild(this._el("span", "tag-accent", data.category || "Component"));
+    meta.appendChild(this._el("span", "tag-muted", this.partId));
+    header.appendChild(meta);
+
+    header.appendChild(this._el("h2", "inspector-title", data.name));
+    header.appendChild(this._el("p", "inspector-subtitle", data.short || ""));
+
+    this.root.appendChild(header);
+  }
+
+  _renderTabs() {
+    const tabs = [
+      ["overview", "Overview"],
+      ["system", "System"],
+      ["learn", "Learn"]
+    ];
+    const bar = this._el("div", "inspector-tabs");
+    for (const [id, label] of tabs) {
+      const button = this._el("button", "inspector-tab", label);
+      button.type = "button";
+      if (this.tab === id) button.classList.add("active");
+      button.addEventListener("click", () => {
+        this.tab = id;
+        this._render();
+      });
+      bar.appendChild(button);
+    }
+    this.root.appendChild(bar);
+  }
+
+  _section(parent, title, className = "") {
+    const section = this._el("section", `inspector-section ${className}`.trim());
+    section.appendChild(this._el("h3", "section-title", title));
+    parent.appendChild(section);
+    return section;
+  }
+
+  _renderOverview(body, data) {
+    const fn = this._section(body, "Function");
+    fn.appendChild(this._el("p", "prose", data.function));
+
+    const spec = this._section(body, "Technical specification");
+    const table = this._el("dl", "spec-grid");
+    for (const row of data.specs || []) {
+      table.appendChild(this._el("dt", "", row.label));
+      table.appendChild(this._el("dd", "", row.value));
+    }
+    spec.appendChild(table);
+    spec.appendChild(this._el("p", "provenance", DATA_PROVENANCE.note));
+
+    const work = this._section(body, "Working principle");
+    work.appendChild(this._el("p", "prose", data.principle));
+
+    if (data.materials?.length) {
+      const mat = this._section(body, "Materials");
+      const chips = this._el("div", "chip-row");
+      for (const material of data.materials) {
+        chips.appendChild(this._el("span", "chip", material));
+      }
+      mat.appendChild(chips);
+    }
+
+    if (data.facts?.length) {
+      const facts = this._section(body, "Engineering notes");
+      const list = this._el("ul", "bullet-list");
+      for (const fact of data.facts) list.appendChild(this._el("li", "", fact));
+      facts.appendChild(list);
+    }
+  }
+
+  _renderSystem(body, data) {
+    const role = this._section(body, "Role in the assembly");
+    role.appendChild(this._el("p", "prose", data.role));
+
+    const rel = this._section(body, "Connected components");
+    if (!data.relations?.length) {
+      rel.appendChild(this._el("p", "prose muted", "This component has no recorded interfaces."));
+    } else {
+      const list = this._el("div", "relation-list");
+      for (const relation of data.relations) {
+        const button = this._el("button", "relation-item");
+        button.type = "button";
+        button.appendChild(
+          this._el("span", "relation-name", resolveRelationName(this.modelId, relation.target))
+        );
+        button.appendChild(this._el("span", "relation-desc", relation.label));
+        button.appendChild(this._el("span", "relation-arrow", "›"));
+        button.addEventListener("click", () => this.onShowRelated(relation.target));
+        list.appendChild(button);
+      }
+      rel.appendChild(list);
+    }
+
+    if (data.failureMode) {
+      const fail = this._section(body, "Failure behaviour", "section-warning");
+      fail.appendChild(this._el("p", "prose", data.failureMode));
+    }
+  }
+
+  _renderLearn(body, data) {
+    const edu = this._section(body, "Explain it simply");
+    edu.appendChild(this._el("p", "prose lead", data.education));
+
+    const summary = this._section(body, "In the wider system");
+    summary.appendChild(this._el("p", "prose", data.role));
+
+    const questions = this._section(body, "Ask the assistant");
+    const chips = this._el("div", "chip-row wrap");
+    const prompts = [
+      `How does the ${data.name} work?`,
+      `What happens if the ${data.name} fails?`,
+      `What is the ${data.name} connected to?`
+    ];
+    for (const prompt of prompts) {
+      const button = this._el("button", "chip chip-action", prompt);
+      button.type = "button";
+      button.addEventListener("click", () => this.onAsk(prompt));
+      chips.appendChild(button);
+    }
+    questions.appendChild(chips);
+  }
+
+  _renderActions(data) {
+    const actions = this._el("div", "inspector-actions");
+
+    const focus = this._el("button", "btn btn-primary", "Focus component");
+    focus.type = "button";
+    focus.addEventListener("click", () => this.onFocus());
+    actions.appendChild(focus);
+
+    const isolate = this._el("button", "btn", "Isolate");
+    isolate.type = "button";
+    isolate.dataset.role = "isolate";
+    isolate.addEventListener("click", () => this.onIsolate());
+    actions.appendChild(isolate);
+
+    const related = this._el("button", "btn", "Show connections");
+    related.type = "button";
+    if (!data.relations?.length) related.disabled = true;
+    related.addEventListener("click", () => {
+      const target = data.relations?.[0]?.target;
+      if (target) this.onShowRelated(target);
     });
-
-    if (!list || !inspector || parts.length === 0) {
-        throw new Error("Component Inspector initialization failed.");
-    }
-
-    const homes = new Map();
-    const explodedPositions = new Map();
-
-    const raycaster = new THREE.Raycaster();
-    const pointer = new THREE.Vector2();
-
-    let selected = null;
-    let highlightBox = null;
-
-    let exploded = false;
-    let isolated = false;
-    let previousVisibility = null;
-
-    let cameraGoal = null;
-    let targetGoal = null;
-
-    const homeCamera = camera.position.clone();
-    const homeTarget = controls.target.clone();
-
-    const assemblyBounds = new THREE.Box3().setFromObject(assembly);
-    const assemblyCenter = assemblyBounds.getCenter(
-        new THREE.Vector3()
-    );
-
-    // Store original positions and calculate exploded positions.
-    parts.forEach((part, index) => {
-        homes.set(part, part.position.clone());
-
-        const bounds = new THREE.Box3().setFromObject(part);
-        const partCenter = bounds.getCenter(new THREE.Vector3());
-
-        const direction = partCenter.sub(assemblyCenter);
-
-        if (direction.lengthSq() < 0.0001) {
-            direction.set(0, 1, 0);
-        }
-
-        direction.normalize();
-
-        const size = bounds.getSize(new THREE.Vector3()).length();
-        const distance = 0.7 + Math.min(size * 0.15, 0.5);
-
-        const destination = part.position.clone().add(
-            direction.multiplyScalar(distance)
-        );
-
-        explodedPositions.set(part, destination);
-    });
-
-    count.textContent = `${parts.length} COMPONENTS`;
-
-    function setStatus(message) {
-        status.textContent = message;
-    }
-
-    function makeElement(tag, className, text) {
-        const element = document.createElement(tag);
-
-        if (className) element.className = className;
-        if (text !== undefined) element.textContent = text;
-
-        return element;
-    }
-
-    function addProperty(parent, label, value) {
-        const row = makeElement("div", "property-row");
-
-        row.appendChild(makeElement("span", "", label));
-        row.appendChild(makeElement("strong", "", String(value)));
-
-        parent.appendChild(row);
-    }
-
-    function removeHighlight() {
-        if (!highlightBox) return;
-
-        scene.remove(highlightBox);
-        highlightBox.geometry.dispose();
-        highlightBox.material.dispose();
-
-        highlightBox = null;
-    }
-
-    function renderList() {
-        list.replaceChildren();
-
-        parts.forEach((part, index) => {
-            const button = makeElement("button", "component-item");
-
-            if (part === selected) {
-                button.classList.add("active");
-            }
-
-            button.appendChild(
-                makeElement(
-                    "span",
-                    "component-index",
-                    String(index + 1).padStart(2, "0")
-                )
-            );
-
-            button.appendChild(
-                makeElement("span", "", part.name || `Part ${index + 1}`)
-            );
-
-            button.addEventListener("click", () => {
-                selectPart(part);
-            });
-
-            list.appendChild(button);
-        });
-    }
-
-    function renderInspector() {
-        inspector.replaceChildren();
-
-        if (!selected) {
-            const empty = makeElement("div", "empty-inspector");
-
-            empty.appendChild(makeElement("div", "empty-icon", "◇"));
-            empty.appendChild(
-                makeElement("strong", "", "No component selected")
-            );
-
-            empty.appendChild(
-                makeElement(
-                    "p",
-                    "",
-                    "Select a part from the explorer or 3D viewport to inspect it."
-                )
-            );
-
-            inspector.appendChild(empty);
-
-            focusButton.disabled = true;
-            isolateButton.disabled = true;
-
-            return;
-        }
-
-        focusButton.disabled = false;
-        isolateButton.disabled = false;
-
-        const metadata = selected.userData.component || {};
-
-        const heading = makeElement("div", "selected-heading");
-
-        heading.appendChild(
-            makeElement("small", "", "SELECTED COMPONENT")
-        );
-
-        heading.appendChild(
-            makeElement("strong", "", selected.name)
-        );
-
-        inspector.appendChild(heading);
-
-        const identity = makeElement("div", "property-title", "IDENTITY");
-        inspector.appendChild(identity);
-
-        addProperty(inspector, "Component ID", metadata.id || "Not assigned");
-        addProperty(inspector, "Component type", metadata.type || "Mesh");
-        addProperty(
-            inspector,
-            "Description",
-            metadata.description || "Not provided"
-        );
-
-        const bounds = new THREE.Box3().setFromObject(selected);
-        const dimensions = bounds.getSize(new THREE.Vector3());
-        const position = selected.getWorldPosition(
-            new THREE.Vector3()
-        );
-
-        const geometry = selected.geometry;
-        const vertexCount = geometry.attributes.position
-            ? geometry.attributes.position.count
-            : 0;
-
-        const faceCount = geometry.index
-            ? geometry.index.count / 3
-            : vertexCount / 3;
-
-        inspector.appendChild(
-            makeElement("div", "property-title", "GEOMETRY")
-        );
-
-        addProperty(
-            inspector,
-            "Bounding dimensions (scene units)",
-            `${dimensions.x.toFixed(2)} × ${dimensions.y.toFixed(2)} × ${dimensions.z.toFixed(2)}`
-        );
-
-        addProperty(
-            inspector,
-            "World position",
-            `${position.x.toFixed(2)}, ${position.y.toFixed(2)}, ${position.z.toFixed(2)}`
-        );
-
-        addProperty(
-            inspector,
-            "Vertices",
-            vertexCount.toLocaleString()
-        );
-
-        addProperty(
-            inspector,
-            "Triangles",
-            Math.round(faceCount).toLocaleString()
-        );
-
-        inspector.appendChild(
-            makeElement("div", "property-title", "ENGINEERING DATA")
-        );
-
-        addProperty(
-            inspector,
-            "Material",
-            metadata.material || "Not supplied"
-        );
-
-        addProperty(
-            inspector,
-            "Data source",
-            metadata.source || "Demo geometry"
-        );
-
-        const clearButton = makeElement(
-            "button",
-            "clear-selection",
-            "Clear selection"
-        );
-
-        clearButton.addEventListener("click", () => {
-            selectPart(null);
-        });
-
-        inspector.appendChild(clearButton);
-    }
-
-    function selectPart(part) {
-        selected = part;
-
-        removeHighlight();
-
-        if (selected) {
-            highlightBox = new THREE.BoxHelper(selected, 0x35baff);
-            highlightBox.material.transparent = true;
-            highlightBox.material.opacity = 0.95;
-            highlightBox.material.depthTest = false;
-
-            highlightBox.renderOrder = 10;
-
-            scene.add(highlightBox);
-
-            if (isolated) {
-                parts.forEach(item => {
-                    item.visible = item === selected;
-                });
-            }
-
-            setStatus(`SELECTED: ${selected.name.toUpperCase()}`);
-        } else {
-            setStatus(`${parts.length} COMPONENTS READY`);
-        }
-
-        renderList();
-        renderInspector();
-    }
-
-    function toggleExplode() {
-        exploded = !exploded;
-
-        explodeButton.textContent = exploded
-            ? "Reassemble"
-            : "Explode";
-
-        setStatus(
-            exploded ? "EXPLODED VIEW" : "ASSEMBLY RESTORED"
-        );
-    }
-
-    function toggleIsolate() {
-        if (!selected) return;
-
-        if (!isolated) {
-            previousVisibility = new Map(
-                parts.map(part => [part, part.visible])
-            );
-
-            parts.forEach(part => {
-                part.visible = part === selected;
-            });
-
-            isolated = true;
-            isolateButton.textContent = "Show All";
-
-            setStatus(`ISOLATED: ${selected.name.toUpperCase()}`);
-        } else {
-            restoreVisibility();
-            setStatus("ALL COMPONENTS VISIBLE");
-        }
-
-        renderList();
-    }
-
-    function restoreVisibility() {
-        if (previousVisibility) {
-            parts.forEach(part => {
-                part.visible = previousVisibility.get(part) ?? true;
-            });
-        }
-
-        previousVisibility = null;
-        isolated = false;
-        isolateButton.textContent = "Isolate";
-    }
-
-    function focusSelected() {
-        if (!selected) return;
-
-        const bounds = new THREE.Box3().setFromObject(selected);
-        const center = bounds.getCenter(new THREE.Vector3());
-        const size = bounds.getSize(new THREE.Vector3());
-
-        let direction = camera.position.clone().sub(controls.target);
-
-        if (direction.lengthSq() < 0.0001) {
-            direction.set(0.4, 0.3, 1);
-        }
-
-        direction.normalize();
-
-        const distance = Math.max(size.length() * 2.2, 3);
-
-        cameraGoal = center.clone().addScaledVector(
-            direction,
-            distance
-        );
-
-        targetGoal = center;
-    }
-
-    function resetView() {
-        if (isolated) restoreVisibility();
-
-        exploded = false;
-        explodeButton.textContent = "Explode";
-
-        selectPart(null);
-
-        cameraGoal = homeCamera.clone();
-        targetGoal = homeTarget.clone();
-
-        setStatus("VIEW RESET");
-    }
-
-    // Select parts through mouse or pointer interaction.
-    let pointerStart = null;
-
-    renderer.domElement.addEventListener("pointerdown", event => {
-        pointerStart = {
-            x: event.clientX,
-            y: event.clientY
-        };
-    });
-
-    renderer.domElement.addEventListener("pointerup", event => {
-        if (!pointerStart) return;
-
-        const dx = event.clientX - pointerStart.x;
-        const dy = event.clientY - pointerStart.y;
-
-        pointerStart = null;
-
-        // Ignore drags used by OrbitControls.
-        if (Math.hypot(dx, dy) > 6) return;
-
-        const rect = renderer.domElement.getBoundingClientRect();
-
-        pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-        pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
-        raycaster.setFromCamera(pointer, camera);
-
-        const visibleParts = parts.filter(part => part.visible);
-
-        const hits = raycaster.intersectObjects(visibleParts, true);
-
-        if (hits.length > 0) {
-            selectPart(hits[0].object);
-        }
-    });
-
-    renderer.domElement.addEventListener("pointerleave", () => {
-        pointerStart = null;
-    });
-
-    explodeButton.addEventListener("click", toggleExplode);
-    focusButton.addEventListener("click", focusSelected);
-    isolateButton.addEventListener("click", toggleIsolate);
-    resetButton.addEventListener("click", resetView);
-
-    // Animate component positions and camera transitions.
-    function update(delta) {
-        const alpha = 1 - Math.exp(-8 * delta);
-
-        for (const part of parts) {
-            const destination = exploded
-                ? explodedPositions.get(part)
-                : homes.get(part);
-
-            part.position.lerp(destination, alpha);
-
-            if (part.position.distanceToSquared(destination) < 0.00001) {
-                part.position.copy(destination);
-            }
-        }
-
-        if (highlightBox) {
-            highlightBox.update();
-        }
-
-        if (cameraGoal && targetGoal) {
-            const cameraAlpha = 1 - Math.exp(-4 * delta);
-
-            camera.position.lerp(cameraGoal, cameraAlpha);
-            controls.target.lerp(targetGoal, cameraAlpha);
-
-            if (
-                camera.position.distanceToSquared(cameraGoal) < 0.0001 &&
-                controls.target.distanceToSquared(targetGoal) < 0.0001
-            ) {
-                camera.position.copy(cameraGoal);
-                controls.target.copy(targetGoal);
-
-                cameraGoal = null;
-                targetGoal = null;
-            }
-        }
-    }
-
-    renderList();
-    renderInspector();
-
-    setStatus(`${parts.length} COMPONENTS READY`);
-
-    return {
-        update,
-        selectPart,
-        getSelected: () => selected,
-        getParts: () => [...parts]
-    };
+    actions.appendChild(related);
+
+    const clear = this._el("button", "btn btn-ghost", "Clear selection");
+    clear.type = "button";
+    clear.addEventListener("click", () => this.onClear());
+    actions.appendChild(clear);
+
+    this.root.appendChild(actions);
+  }
+
+  _syncButtons() {
+    const button = this.root.querySelector('[data-role="isolate"]');
+    if (button) button.textContent = this._isolated ? "Show all" : "Isolate";
+  }
 }
