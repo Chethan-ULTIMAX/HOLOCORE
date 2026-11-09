@@ -1,0 +1,404 @@
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    height: 100vh;
+    overflow: hidden;
+    background: #050910;
+    color: #d8e8f5;
+    font-family: "Segoe UI", sans-serif;
+}
+
+.topbar {
+    height: 58px;
+    padding: 0 22px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid #183044;
+    background: #080f19;
+    position: relative;
+    z-index: 5;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+
+.brand-mark {
+    width: 30px;
+    height: 30px;
+    display: grid;
+    place-items: center;
+    border: 1px solid #28b9ff;
+    color: #28b9ff;
+    border-radius: 6px;
+}
+
+.workspace-name {
+    color: #71899e;
+    font-size: 10px;
+    letter-spacing: 2px;
+}
+
+.system-status {
+    font-size: 10px;
+    color: #76dcb0;
+    letter-spacing: 1px;
+}
+
+.status-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    margin-right: 7px;
+    border-radius: 50%;
+    background: #54e6a4;
+}
+
+.workspace {
+    height: calc(100vh - 58px);
+    display: grid;
+    grid-template-columns: 235px minmax(0, 1fr) 275px;
+}
+
+.panel {
+    min-width: 0;
+    background: #080f18;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.explorer-panel {
+    border-right: 1px solid #183044;
+}
+
+.inspector-panel {
+    border-left: 1px solid #183044;
+}
+
+.panel-heading {
+    height: 48px;
+    padding: 0 15px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid #162b3d;
+    color: #84a4bb;
+    font-size: 10px;
+    letter-spacing: 1.4px;
+    font-weight: 700;
+}
+
+.panel-icon {
+    color: #31baff;
+    font-size: 17px;
+}
+
+.assembly-info {
+    padding: 17px 13px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border-bottom: 1px solid #162b3d;
+}
+
+.assembly-symbol {
+    width: 36px;
+    height: 36px;
+    display: grid;
+    place-items: center;
+    border: 1px solid #22618a;
+    background: #0b2031;
+    color: #36baff;
+    font-size: 20px;
+    border-radius: 6px;
+}
+
+.assembly-info strong {
+    display: block;
+    font-size: 12px;
+}
+
+.assembly-info small {
+    display: block;
+    margin-top: 5px;
+    color: #68849a;
+    font-size: 10px;
+}
+
+.section-label {
+    padding: 17px 15px 10px;
+    font-size: 9px;
+    color: #607b91;
+    letter-spacing: 1.5px;
+}
+
+.component-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 9px 12px;
+}
+
+.component-item {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 9px;
+    margin: 2px 0;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    background: transparent;
+    color: #a7bfd0;
+    cursor: pointer;
+    text-align: left;
+    font-size: 11px;
+    transition: 0.18s ease;
+}
+
+.component-item:hover {
+    background: #102436;
+    color: #ffffff;
+}
+
+.component-item.active {
+    background: #102c42;
+    border-color: #21658d;
+    color: #43c3ff;
+}
+
+.component-index {
+    color: #496b84;
+    font-size: 9px;
+    min-width: 19px;
+}
+
+.component-item.active .component-index {
+    color: #35baff;
+}
+
+.component-footer {
+    padding: 10px;
+}
+
+.panel-footer {
+    padding: 13px;
+    border-top: 1px solid #162b3d;
+    color: #405c72;
+    letter-spacing: 1px;
+    font-size: 8px;
+}
+
+#viewport {
+    min-width: 0;
+    position: relative;
+    overflow: hidden;
+    background: #050910;
+}
+
+#viewport canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+.scene-info {
+    position: absolute;
+    top: 20px;
+    left: 20px;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    pointer-events: none;
+    color: #7d9cb4;
+    font-size: 9px;
+    letter-spacing: 1.5px;
+}
+
+#model-status {
+    color: #35baff;
+}
+
+.viewport-toolbar {
+    position: absolute;
+    top: 18px;
+    right: 18px;
+    z-index: 3;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+}
+
+.tool-button {
+    padding: 9px 12px;
+    background: rgba(10, 26, 41, 0.92);
+    border: 1px solid #21435d;
+    border-radius: 5px;
+    color: #a9c6d9;
+    font-size: 10px;
+    cursor: pointer;
+    transition: 0.2s;
+}
+
+.tool-button:hover:not(:disabled) {
+    color: #ffffff;
+    border-color: #35baff;
+    background: #10314a;
+}
+
+.tool-button:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
+.controls-info {
+    position: absolute;
+    bottom: 15px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 2;
+    color: #607e96;
+    font-size: 9px;
+    letter-spacing: 1.4px;
+    white-space: nowrap;
+    pointer-events: none;
+}
+
+.inspector-content {
+    padding: 15px;
+    overflow-y: auto;
+    flex: 1;
+}
+
+.empty-inspector {
+    height: 100%;
+    min-height: 180px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 12px;
+}
+
+.empty-icon {
+    color: #248ac0;
+    font-size: 35px;
+    margin-bottom: 14px;
+}
+
+.empty-inspector strong {
+    font-size: 12px;
+    color: #b8d0e0;
+}
+
+.empty-inspector p {
+    max-width: 205px;
+    margin-top: 10px;
+    color: #647f94;
+    font-size: 10px;
+    line-height: 1.7;
+}
+
+.selected-heading {
+    padding-bottom: 15px;
+    border-bottom: 1px solid #1a3449;
+    margin-bottom: 15px;
+}
+
+.selected-heading small {
+    display: block;
+    margin-bottom: 8px;
+    color: #48bfff;
+    font-size: 9px;
+    letter-spacing: 1.4px;
+}
+
+.selected-heading strong {
+    display: block;
+    font-size: 17px;
+    color: #e1f2ff;
+    overflow-wrap: anywhere;
+}
+
+.property-title {
+    margin: 19px 0 9px;
+    color: #63839b;
+    font-size: 9px;
+    letter-spacing: 1.5px;
+}
+
+.property-row {
+    padding: 10px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    border-bottom: 1px solid #152a3b;
+}
+
+.property-row span {
+    font-size: 9px;
+    color: #668399;
+}
+
+.property-row strong {
+    font-size: 11px;
+    color: #b9d1e1;
+    font-weight: 500;
+    overflow-wrap: anywhere;
+}
+
+.clear-selection {
+    width: 100%;
+    margin-top: 18px;
+    padding: 10px;
+    background: #102033;
+    color: #a9c6d9;
+    border: 1px solid #23435d;
+    border-radius: 5px;
+    cursor: pointer;
+}
+
+.clear-selection:hover {
+    border-color: #35baff;
+    color: white;
+}
+
+@media (max-width: 1050px) {
+    .workspace {
+        grid-template-columns: 195px minmax(0, 1fr) 235px;
+    }
+
+    .workspace-name {
+        display: none;
+    }
+}
+
+@media (max-width: 760px) {
+    .workspace {
+        grid-template-columns: 155px minmax(0, 1fr);
+    }
+
+    .inspector-panel {
+        display: none;
+    }
+
+    .viewport-toolbar {
+        top: 65px;
+    }
+}

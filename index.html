@@ -1,0 +1,117 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HOLOCORE — Spatial Engineering</title>
+
+    <link rel="stylesheet" href="styles.css">
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <span class="brand-mark">H</span>
+            <span>HOLOCORE</span>
+        </div>
+
+        <div class="workspace-name">SPATIAL ENGINEERING WORKSPACE</div>
+
+        <div class="system-status">
+            <span class="status-dot"></span>
+            SYSTEM ONLINE
+        </div>
+    </header>
+
+    <main class="workspace">
+
+        <aside class="panel explorer-panel">
+            <div class="panel-heading">
+                <span>ASSEMBLY EXPLORER</span>
+                <span class="panel-icon">◈</span>
+            </div>
+
+            <div class="assembly-info">
+                <div class="assembly-symbol">⬡</div>
+                <div>
+                    <strong>Demo Rocket</strong>
+                    <small id="component-count">Loading components...</small>
+                </div>
+            </div>
+
+            <div class="section-label">COMPONENTS</div>
+
+            <div id="component-list" class="component-list"></div>
+
+            <div class="panel-footer">
+                HOLOCORE ENGINEERING
+            </div>
+        </aside>
+
+        <section id="viewport">
+
+            <div class="scene-info">
+                <span>3D VIEWPORT</span>
+                <span id="model-status">INITIALIZING...</span>
+            </div>
+
+            <div class="viewport-toolbar">
+                <button id="explode-btn" class="tool-button">
+                    Explode
+                </button>
+
+                <button id="focus-btn" class="tool-button" disabled>
+                    Focus
+                </button>
+
+                <button id="isolate-btn" class="tool-button" disabled>
+                    Isolate
+                </button>
+
+                <button id="reset-btn" class="tool-button">
+                    Reset
+                </button>
+            </div>
+
+            <div class="controls-info">
+                DRAG TO ROTATE · SCROLL TO ZOOM · CLICK TO SELECT
+            </div>
+
+        </section>
+
+        <aside class="panel inspector-panel">
+
+            <div class="panel-heading">
+                <span>COMPONENT INSPECTOR</span>
+                <span class="panel-icon">⌘</span>
+            </div>
+
+            <div id="inspector-content" class="inspector-content">
+                <div class="empty-inspector">
+                    <div class="empty-icon">◇</div>
+                    <strong>No component selected</strong>
+                    <p>Select a component from the explorer or directly from the 3D viewport.</p>
+                </div>
+            </div>
+
+            <div class="panel-footer">
+                GEOMETRY · ENGINEERING DATA
+            </div>
+
+        </aside>
+
+    </main>
+
+    <script type="module" src="main.js"></script>
+</body>
+</html>
