@@ -20,7 +20,7 @@
  */
 
 import { JSDOM } from "jsdom";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as THREE from "three";
@@ -127,6 +127,40 @@ await new Promise(resolve => setTimeout(resolve, 400));
 console.error = originalError;
 
 const doc = window.document;
+
+section("0 · Every asset the page loads exists");
+
+// The page is served statically, so a missing vendor file is a silent 404 that
+// only shows up when the feature is used (the hand tracker, for instance).
+{
+  const { existsSync } = await import("node:fs");
+  const { join: joinPath } = await import("node:path");
+  const assets = [
+    "index.html", "styles.css", "main.js",
+    "vendor/three/three.module.js",
+    "vendor/three/three.core.js",
+    "vendor/mediapipe/vision_bundle.mjs",
+    "vendor/mediapipe/wasm/vision_wasm_internal.js",
+    "vendor/mediapipe/wasm/vision_wasm_internal.wasm",
+    "vendor/mediapipe/hand_landmarker.task",
+    "vendor/fonts/inter-latin-wght-normal.woff2",
+    "vendor/fonts/jetbrains-mono-latin-wght-normal.woff2"
+  ];
+  const absent = assets.filter(rel => !existsSync(joinPath(root, rel)));
+  check("all page assets are present", absent.length === 0, absent.join(", "));
+
+  const missingImports = [];
+  for (const file of readdirSync(root)) {
+    if (!file.endsWith(".js")) continue;
+    const source = readFileSync(joinPath(root, file), "utf8");
+    for (const match of source.matchAll(/from\s+["'](\.[^"']+)["']/g)) {
+      const resolved = joinPath(root, match[1]);
+      if (!existsSync(resolved)) missingImports.push(`${file} -> ${match[1]}`);
+    }
+  }
+  check("every local module import resolves", missingImports.length === 0,
+    missingImports.join(", "));
+}
 
 section("1 · The full 3D boot path");
 
