@@ -63,6 +63,7 @@ const dom = {
   primitiveGrid: $("#primitive-grid"),
   primitiveCount: $("#primitive-count"),
   libraryImport: $("#library-import"),
+  playgroundClear: $("#playground-clear"),
   partList: $("#part-list"),
   partCount: $("#part-count"),
   libraryFootModel: $("#library-foot-model"),
@@ -778,6 +779,17 @@ function setupSceneTools() {
 
   dom.toolImport.addEventListener("click", () => dom.fileInput.click());
   dom.libraryImport?.addEventListener("click", () => dom.fileInput.click());
+  dom.playgroundClear?.addEventListener("click", () => {
+    const count = playground?.props.length || 0;
+    if (!count) {
+      toast("No objects to clear", "warn", 1500);
+      return;
+    }
+    playground.clear();
+    refreshSceneOutliner();
+    updateObjectHud();
+    toast(`Cleared ${count} object${count === 1 ? "" : "s"}`, "", 1800);
+  });
   dom.fileInput.addEventListener("change", async event => {
     const file = event.target.files?.[0];
     if (!file) return;

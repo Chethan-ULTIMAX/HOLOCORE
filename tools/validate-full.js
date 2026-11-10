@@ -983,6 +983,32 @@ check("the colour voice command recolours the selection",
 inspPg.clear();
 api._internals.refreshInspector?.();
 
+section("5k · Clear-all and object creation");
+
+const cp = api.getPlayground();
+cp.clear();
+for (const kind of ["cube", "sphere", "torus"]) cp.addPrimitive(kind);
+api.refreshSceneOutliner();
+check("objects were created", cp.props.length === 3, `${cp.props.length}`);
+
+const clearBtn = doc.getElementById("playground-clear");
+check("a clear-all control exists", Boolean(clearBtn));
+clearBtn?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+check("clear-all empties the playground", cp.props.length === 0, `${cp.props.length}`);
+check("the object counter follows", doc.getElementById("hud-objects")?.textContent === "0");
+// The outliner always lists the engineering model alongside props, so the
+// meaningful assertion is that the spawned rows are gone.
+check("the outliner no longer lists the cleared objects",
+  doc.querySelectorAll("#scene-outliner .outliner-row").length === 1,
+  `${doc.querySelectorAll("#scene-outliner .outliner-row").length} row(s)`);
+
+// Every primitive the library offers must be creatable.
+for (const primitive of ["cube", "sphere", "cylinder", "cone", "torus", "torusKnot", "icosahedron"]) {
+  const made = cp.addPrimitive(primitive);
+  check(`primitive "${primitive}" can be spawned`, Boolean(made) && cp.props.length > 0);
+}
+cp.clear();
+
 section("6 · Modes still gate gestures");
 
 const modes = ["select", "move", "rotate", "scale", "explode"];
