@@ -485,6 +485,8 @@ section("5c · Camera mode must not break hand tracking");
 section("5d · Defaults for a first visit");
 
 {
+  // A dynamic import() must be given a specifier, not a bare absolute path:
+  // Node treats an absolute path here as a URL and fails to resolve it.
   const { DEFAULT_SETTINGS } = await import("../store.js");
   check("the camera does not take over the workspace by default",
     DEFAULT_SETTINGS.camera.workspaceView === false,

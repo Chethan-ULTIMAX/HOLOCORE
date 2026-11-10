@@ -20,8 +20,12 @@ import {
   LM
 } from "./gestures.js";
 import { HandOverlay } from "./handOverlay.js";
+import { HandSkeleton3D } from "./handSkeleton3d.js";
+import { Playground, PRIMITIVES } from "./playground.js";
+import { chimes } from "./chimes.js";
+import { VoiceControl, VOICE_STATUS, COLOR_PALETTE, parseCommand } from "./voiceControl.js";
 import { MODES, getMode, isMode, instructionFor } from "./interactionModes.js";
-import { landmarkToNdc, landmarkToStage } from "./handGeometry.js";
+import { landmarkToNdc, landmarkToStage, coverFit } from "./handGeometry.js";
 import { ComponentInspector } from "./componentInspector.js";
 import { createAssistant } from "./assistant.js";
 import { SettingsStore } from "./store.js";
@@ -33,7 +37,6 @@ import {
   getModelDefinition,
   getComponentData
 } from "./engineeringData.js";
-import { VoiceController, VOICE_STATUS } from "./voiceControl.js";
 
 /* ------------------------------------------------------------------------- */
 /* DOM HELPERS                                                               */
@@ -50,28 +53,20 @@ const dom = {
   cameraToggle: $("#camera-toggle"),
   cameraToggleLabel: $("#camera-toggle-label"),
   cameraDot: $("#camera-dot"),
-  voiceToggle: $("#voice-toggle"),
-  voiceToggleLabel: $("#voice-toggle-label"),
-  voiceDot: $("#voice-dot"),
 
   pillCamera: $("#pill-camera"),
-  pillVoice: $("#pill-voice"),
   pillHands: $("#pill-hands"),
   pillGesture: $("#pill-gesture"),
 
   categoryRow: $("#category-row"),
   modelList: $("#model-list"),
+  primitiveGrid: $("#primitive-grid"),
+  primitiveCount: $("#primitive-count"),
+  libraryImport: $("#library-import"),
+  playgroundClear: $("#playground-clear"),
   partList: $("#part-list"),
   partCount: $("#part-count"),
-  playgroundCount: $("#playground-count"),
   libraryFootModel: $("#library-foot-model"),
-
-  pgAddCube: $("#pg-add-cube"),
-  pgAddSphere: $("#pg-add-sphere"),
-  pgAddCylinder: $("#pg-add-cylinder"),
-  pgAddTorus: $("#pg-add-torus"),
-  pgAddCone: $("#pg-add-cone"),
-  pgClear: $("#pg-clear"),
 
   toolExplode: $("#tool-explode"),
   toolIsolate: $("#tool-isolate"),
@@ -89,6 +84,23 @@ const dom = {
   hudFps: $("#hud-fps"),
   hudTris: $("#hud-tris"),
   hudHands: $("#hud-hands"),
+  panelLeft: $("#panel-left"),
+  panelRight: $("#panel-right"),
+  drawerToggleLeft: $("#drawer-toggle-left"),
+  drawerToggleRight: $("#drawer-toggle-right"),
+  stageToolbar: $("#stage-toolbar"),
+  stageAddObject: $("#stage-add-object"),
+  stageDuplicate: $("#stage-duplicate"),
+  stageDelete: $("#stage-delete"),
+  stageVoice: $("#stage-voice"),
+  stageReset: $("#stage-reset"),
+  stageKeys: $("#stage-keys"),
+  hudObjects: $("#hud-objects"),
+  hudObjectName: $("#hud-object-name"),
+  voiceChip: $("#voice-chip"),
+  voiceState: $("#voice-state"),
+  voicePhrase: $("#voice-phrase"),
+  sceneOutliner: $("#scene-outliner"),
   diagnostics: $("#diagnostics"),
   diagToggle: $("#diag-toggle"),
   diagGrid: $("#diag-grid"),
@@ -105,10 +117,6 @@ const dom = {
 
   reticle: $("#reticle"),
   reticleLabel: $("#reticle-label"),
-  voiceHud: $("#voice-hud"),
-  voiceHudMic: $("#voice-hud-mic"),
-  voiceHudText: $("#voice-hud-text"),
-  voiceHudBadge: $("#voice-hud-badge"),
   viewportHint: $("#viewport-hint"),
   readoutPos: $("#readout-pos"),
   readoutRot: $("#readout-rot"),
@@ -126,6 +134,7 @@ const dom = {
   modeDot: $("#mode-dot"),
   modeInstructionText: $("#mode-instruction-text"),
   modeInstructionTarget: $("#mode-instruction-target"),
+  hudGesture: $("#hud-gesture"),
 
   explodeSlider: $("#explode-slider"),
   explodeValue: $("#explode-value"),
@@ -159,16 +168,12 @@ const dom = {
   chatInput: $("#chat-input"),
 
   statusCamera: $("#status-camera"),
-  statusVoice: $("#status-voice"),
   statusHands: $("#status-hands"),
   statusGesture: $("#status-gesture"),
   statusTracking: $("#status-tracking"),
   statusSelected: $("#status-selected"),
   statusMode: $("#status-mode"),
   statusApp: $("#status-app"),
-
-  setVoiceEnabled: $("#set-voice-enabled"),
-  setSoundEffects: $("#set-sound-effects"),
 
   settingsDrawer: $("#settings-drawer"),
   drawerBackdrop: $("#drawer-backdrop"),
@@ -188,6 +193,12 @@ const dom = {
 
 const store = new SettingsStore();
 let settings = store.get();
+
+/**
+ * How far a grabbed playground object may be dragged. Shared with the gesture
+ * solver so the clamp is applied once, at the same limit, in both places.
+ */
+const STAGE_BOUNDS = Object.freeze({ x: 4.2, y: 3.2, z: 3.6 });
 
 const state = {
   modelId: MODEL_LIBRARY[0].id,
@@ -267,7 +278,12 @@ let tracker;
 let overlay;
 let inspector;
 let assistant;
-let voice;
+/** Scene-space hand skeletons (the glowing 3D hands). */
+let skeleton3d = null;
+/** Multi-object playground: primitives, imports, animation. */
+let playground = null;
+/** Web Speech command layer. */
+let voice = null;
 
 /**
  * Boot is split in two so that a missing GPU degrades the experience instead of
@@ -277,9 +293,9 @@ let voice;
 function setupChrome() {
   setupSceneTools();
   setupCameraControls();
-  setupVoiceControls();
   setupAssistantChrome();
   setupDrawer();
+  buildPrimitiveLibrary();
   buildCategoryRow();
   buildModelLibrary();
   checkSecureContext();
@@ -288,6 +304,7 @@ function setupChrome() {
   inspector = new ComponentInspector({
     root: dom.inspectorRoot,
     getWorkspace: () => workspace,
+    getPlayground: () => playground,
     onFocus: () => {
       workspace?.focusSelected();
       if (workspace) toast("Camera focused on the selected component", "accent", 2000);
@@ -339,6 +356,10 @@ function applyNonSceneSettings() {
   dom.viewport?.style.setProperty("--scrim-strength", String(settings.camera.scrim ?? 0));
   const workspaceViewInput = document.getElementById("set-workspace-view");
   if (workspaceViewInput) workspaceViewInput.checked = settings.camera.workspaceView !== false;
+  const voiceEnabledInputSync = document.getElementById("set-voice-enabled");
+  if (voiceEnabledInputSync) voiceEnabledInputSync.checked = settings.voice?.enabled !== false;
+  const soundEffectsInputSync = document.getElementById("set-sound-effects");
+  if (soundEffectsInputSync) soundEffectsInputSync.checked = settings.voice?.soundEffects !== false;
   syncWorkspaceVideo();
   setRightTab(settings.ui.rightTab || "inspector");
   setPanelState({ left: settings.ui.leftOpen, right: settings.ui.rightOpen }, { persist: false });
@@ -362,6 +383,9 @@ function boot() {
   setupChrome();
 
   const hasWebGL = (() => {
+    // A harness may supply its own renderer (tests, WebGPU back ends). When it
+    // does, the WebGL probe is irrelevant.
+    if (typeof window !== "undefined" && window.__HOLOCORE_RENDERER_FACTORY__) return true;
     try {
       const canvas = document.createElement("canvas");
       return Boolean(
@@ -395,6 +419,9 @@ function boot() {
   try {
     workspace = new Workspace({
       container: dom.viewport,
+      rendererFactory: window.__HOLOCORE_RENDERER_FACTORY__ || undefined,
+      controlsFactory: window.__HOLOCORE_CONTROLS_FACTORY__ || undefined,
+      environment: !window.__HOLOCORE_RENDERER_FACTORY__,
       settings: {
         shadows: settings.view.shadows,
         autoRotate: settings.view.autoRotate,
@@ -422,6 +449,17 @@ function boot() {
 
   installGlErrorWatch(workspace);
 
+  // Scene-space hand skeletons: real geometry so hands can be occluded by the
+  // model and share its lighting, which a 2D overlay can never do.
+  skeleton3d = new HandSkeleton3D({
+    scene: workspace.scene,
+    camera: workspace.camera,
+    mirror: settings.camera.mirror !== false
+  });
+  // Register the rigs for the late composite pass, so a model can never hide
+  // the hands and bloom never smears them.
+  workspace.setLateLayer?.(skeleton3d.root);
+
   setBoot(55, "Loading assembly…");
 
   workspace
@@ -433,6 +471,8 @@ function boot() {
       setBoot(80, "Starting interaction engine…");
       setupAssistant();
       setupOverlay();
+      setupPlayground();
+      setupVoice();
       applySettings({ section: "all" });
       initInteraction();
       startLoop();
@@ -453,6 +493,38 @@ function boot() {
 /* ------------------------------------------------------------------------- */
 /* MODEL LIBRARY UI                                                          */
 /* ------------------------------------------------------------------------- */
+
+/**
+ * Primitive palette. Every tile adds a real object to the playground, so the
+ * library is the primary way to populate the scene.
+ */
+function buildPrimitiveLibrary() {
+  if (!dom.primitiveGrid) return;
+  dom.primitiveGrid.replaceChildren();
+  for (const primitive of PRIMITIVES) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "primitive-tile";
+    button.dataset.primitive = primitive.id;
+    button.title = `Add a ${primitive.label.toLowerCase()} to the scene`;
+    button.setAttribute("aria-label", `Add ${primitive.label}`);
+
+    const glyph = document.createElement("span");
+    glyph.className = "primitive-glyph";
+    glyph.textContent = primitive.icon;
+    const name = document.createElement("span");
+    name.className = "primitive-name";
+    name.textContent = primitive.label;
+    button.append(glyph, name);
+
+    button.addEventListener("click", () => {
+      const added = addPlaygroundPrimitive(primitive.id);
+      if (added) toast(`${primitive.label} added`, "", 1200);
+    });
+    dom.primitiveGrid.appendChild(button);
+  }
+  if (dom.primitiveCount) dom.primitiveCount.textContent = String(PRIMITIVES.length);
+}
 
 function buildCategoryRow() {
   const categories = ["All", ...new Set(MODEL_LIBRARY.map(model => model.category))];
@@ -616,6 +688,24 @@ function handleSelect(partId, source) {
   updateModeTargetLabel();
 }
 
+/**
+ * Select a playground object the same way the outliner does: the object is
+ * highlighted, the assembly selection is cleared, and the HUD follows.
+ */
+function selectProp(id, source = "hand") {
+  if (!playground) return null;
+  const prop = id ? playground.byId.get(id) : null;
+  playground.select(prop ? prop.id : null);
+  if (prop) {
+    workspace?.clearSelection?.();
+    handleSelect(null, source);
+    toast(`Selected ${prop.name}`, "accent", 1400);
+  }
+  refreshSceneOutliner();
+  updateObjectHud();
+  return prop;
+}
+
 function updatePartListSelection() {
   for (const item of dom.partList.querySelectorAll(".part-item")) {
     item.classList.toggle("active", item.dataset.partId === state.partId);
@@ -652,13 +742,6 @@ function updateStatusSelection(partId) {
 /* ------------------------------------------------------------------------- */
 
 function setupSceneTools() {
-  dom.pgAddCube?.addEventListener("click", () => addPlaygroundShape("cube"));
-  dom.pgAddSphere?.addEventListener("click", () => addPlaygroundShape("sphere"));
-  dom.pgAddCylinder?.addEventListener("click", () => addPlaygroundShape("cylinder"));
-  dom.pgAddTorus?.addEventListener("click", () => addPlaygroundShape("torus"));
-  dom.pgAddCone?.addEventListener("click", () => addPlaygroundShape("cone"));
-  dom.pgClear?.addEventListener("click", () => clearPlaygroundShapes());
-
   dom.toolExplode.addEventListener("click", () => {
     if (!workspace) return;
     const next = (workspace.explodeAmount ?? 0) > 0.001 ? 0 : 100;
@@ -699,6 +782,18 @@ function setupSceneTools() {
   });
 
   dom.toolImport.addEventListener("click", () => dom.fileInput.click());
+  dom.libraryImport?.addEventListener("click", () => dom.fileInput.click());
+  dom.playgroundClear?.addEventListener("click", () => {
+    const count = playground?.props.length || 0;
+    if (!count) {
+      toast("No objects to clear", "warn", 1500);
+      return;
+    }
+    playground.clear();
+    refreshSceneOutliner();
+    updateObjectHud();
+    toast(`Cleared ${count} object${count === 1 ? "" : "s"}`, "", 1800);
+  });
   dom.fileInput.addEventListener("change", async event => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -709,6 +804,29 @@ function setupSceneTools() {
     }
 
     dom.importNote.textContent = `Loading ${file.name}…`;
+
+    // Preferred path: import into the playground as an additional object, with
+    // animation clips where the file has them. The assembly stays loaded, so a
+    // user can compare an import against an engineering model side by side.
+    if (playground) {
+      try {
+        const prop = await playground.importFile(file);
+        refreshSceneOutliner();
+        updateObjectHud();
+        const clipNote = prop.clipNames.length
+          ? ` · ${prop.clipNames.length} animation${prop.clipNames.length > 1 ? "s" : ""}`
+          : "";
+        dom.importNote.textContent =
+          `Added ${prop.name} to the scene${clipNote}. Pick it from SCENE to animate it.`;
+        toast(`Added ${prop.name}${clipNote}`, "accent", 4200);
+        return;
+      } catch (error) {
+        console.warn("[HOLOCORE] Playground import failed, trying assembly import:", error.message);
+        // Fall through to the assembly path so a file that only works as a
+        // standalone assembly is still usable.
+      }
+    }
+
     try {
       const result = await workspace.loadFile(file);
 
@@ -858,220 +976,6 @@ function setupCameraControls() {
   dom.workspaceCamEnable?.addEventListener("click", toggleCamera);
 }
 
-/* ------------------------------------------------------------------------- */
-/* 3D PLAYGROUND OBJECT HELPERS                                              */
-/* ------------------------------------------------------------------------- */
-
-function addPlaygroundShape(type) {
-  if (!workspace) {
-    toast("3D renderer unavailable", "warn", 3000);
-    return;
-  }
-  const mesh = workspace.addPlaygroundObject(type);
-  if (voice) voice.playChime("spawn");
-  updatePlaygroundCount();
-  renderPartList();
-  handleSelect(mesh.userData.partId, "playground");
-  toast(`Spawned 3D ${type.toUpperCase()}`, "accent", 2400);
-}
-
-function clearPlaygroundShapes() {
-  if (!workspace) return;
-  const count = workspace.playgroundObjects?.length || 0;
-  workspace.clearPlaygroundObjects();
-  updatePlaygroundCount();
-  renderPartList();
-  handleSelect(null, "ui");
-  toast(`Cleared ${count} playground object(s)`, "", 2000);
-}
-
-function updatePlaygroundCount() {
-  const count = workspace?.playgroundObjects?.length || 0;
-  if (dom.playgroundCount) dom.playgroundCount.textContent = String(count);
-}
-
-/* ------------------------------------------------------------------------- */
-/* VOICE COMMANDS                                                            */
-/* ------------------------------------------------------------------------- */
-
-function setupVoiceControls() {
-  voice = new VoiceController({
-    soundEnabled: settings.voice?.soundEffects !== false,
-    onStatus: (status, error) => {
-      syncVoiceUI(status, error);
-    },
-    onHeard: (transcript, isFinal) => {
-      if (dom.voiceHud) {
-        dom.voiceHud.hidden = false;
-        if (dom.voiceHudText) dom.voiceHudText.textContent = transcript;
-        if (dom.voiceHudBadge) dom.voiceHudBadge.textContent = isFinal ? "PROCESSED" : "HEARING…";
-      }
-    },
-    onCommand: cmd => {
-      handleVoiceCommand(cmd);
-    },
-    onError: err => {
-      toast(`Voice: ${err.message}`, "warn", 3500);
-    }
-  });
-
-  dom.voiceToggle?.addEventListener("click", () => {
-    toggleVoice();
-  });
-}
-
-function toggleVoice() {
-  if (!voice) return;
-  if (!voice.isSupported) {
-    toast("Speech recognition is not supported in this browser environment.", "warn", 5000);
-    return;
-  }
-  const listening = voice.toggle();
-  if (listening) {
-    toast("Voice commands active. Say 'move', 'rotate', 'add cube', 'wireframe', 'reset'…", "accent", 3500);
-  } else {
-    toast("Voice commands paused", "", 1800);
-  }
-}
-
-function syncVoiceUI(status, error) {
-  const isLive = status === VOICE_STATUS.LISTENING;
-  if (dom.voiceDot) {
-    dom.voiceDot.className = `dot ${isLive ? "dot-on dot-pulse" : "dot-off"}`;
-  }
-  if (dom.voiceToggleLabel) {
-    dom.voiceToggleLabel.textContent = isLive ? "Listening…" : "Voice control";
-  }
-  if (dom.pillVoice) {
-    dom.pillVoice.classList.toggle("pill-live", isLive);
-    const span = dom.pillVoice.querySelector("span");
-    if (span) span.textContent = isLive ? "VOICE ON" : "VOICE OFF";
-  }
-  if (dom.statusVoice) {
-    dom.statusVoice.textContent = isLive ? "Listening" : error ? "Error" : "Inactive";
-    dom.statusVoice.className = `status-val ${isLive ? "status-ok" : ""}`;
-  }
-  if (dom.voiceHud) {
-    dom.voiceHud.hidden = !isLive;
-    if (isLive && dom.voiceHudText) {
-      dom.voiceHudText.textContent = "Listening for commands…";
-      if (dom.voiceHudBadge) dom.voiceHudBadge.textContent = "SAY A COMMAND";
-    }
-  }
-}
-
-function handleVoiceCommand(cmd) {
-  if (!cmd) return;
-  if (dom.voiceHudBadge) dom.voiceHudBadge.textContent = `✓ ${cmd.label.toUpperCase()}`;
-  if (dom.voiceHudText) dom.voiceHudText.textContent = `"${cmd.raw}"`;
-
-  switch (cmd.type) {
-    case "mode":
-      setMode(cmd.mode);
-      toast(`Voice: Switched to ${cmd.mode.toUpperCase()} mode`, "accent", 2500);
-      break;
-
-    case "explode-amount":
-      setExplodeAmount(cmd.amount * 100);
-      toast(`Voice: Explode set to ${Math.round(cmd.amount * 100)}%`, "accent", 2500);
-      break;
-
-    case "add-object":
-      addPlaygroundShape(cmd.shape);
-      break;
-
-    case "color":
-      if (workspace) {
-        const targetPart = state.partId || workspace.selected?.userData?.partId;
-        if (targetPart) {
-          workspace.setPartMaterial(targetPart, { color: cmd.color });
-          toast(`Voice: Recaptured ${targetPart} color to ${cmd.name.toUpperCase()}`, "accent", 2500);
-        } else {
-          workspace.parts.forEach(p => {
-            workspace.setPartMaterial(p.userData.partId, { color: cmd.color });
-          });
-          toast(`Voice: Recaptured assembly color to ${cmd.name.toUpperCase()}`, "accent", 2500);
-        }
-      }
-      break;
-
-    case "model":
-      switchModel(cmd.modelId);
-      break;
-
-    case "action":
-      switch (cmd.action) {
-        case "reset":
-          workspace?.resetView();
-          setExplodeAmount(0);
-          workspace?.clearSelection();
-          handleSelect(null, "ui");
-          toast("Voice: Reset view & transforms", "accent", 2200);
-          break;
-        case "toggle-camera":
-          toggleCamera();
-          break;
-        case "toggle-camera-view":
-          toggleCameraView();
-          break;
-        case "toggle-grid":
-          store.update("view", { grid: !settings.view.grid });
-          toast(`Voice: Grid ${!settings.view.grid ? "enabled" : "disabled"}`, "", 1800);
-          break;
-        case "toggle-shadows":
-          store.update("view", { shadows: !settings.view.shadows });
-          toast(`Voice: Shadows ${!settings.view.shadows ? "enabled" : "disabled"}`, "", 1800);
-          break;
-        case "toggle-orbit":
-          store.update("view", { autoRotate: !settings.view.autoRotate });
-          toast(`Voice: Auto-orbit ${!settings.view.autoRotate ? "active" : "stopped"}`, "", 1800);
-          break;
-        case "toggle-wireframe":
-          if (workspace) {
-            const isWire = workspace.toggleWireframe(state.partId);
-            toast(`Voice: Wireframe ${isWire ? "ON" : "OFF"}`, "accent", 2000);
-          }
-          break;
-        case "solid":
-          if (workspace) {
-            workspace.parts.forEach(p => workspace.setPartMaterial(p.userData.partId, { wireframe: false }));
-            toast("Voice: Shaded solid surface", "accent", 2000);
-          }
-          break;
-        case "isolate":
-          toggleIsolate();
-          break;
-        case "focus":
-          workspace?.focusSelected();
-          toast("Voice: Focused selected component", "accent", 2000);
-          break;
-        case "clear-selection":
-          workspace?.clearSelection();
-          handleSelect(null, "ui");
-          toast("Voice: Cleared selection", "", 1800);
-          break;
-        case "toggle-panels":
-          setPanelState({ left: !settings.ui.leftOpen, right: !settings.ui.rightOpen });
-          break;
-        case "toggle-fullscreen":
-          toggleFullscreen();
-          break;
-        case "clear-objects":
-          clearPlaygroundShapes();
-          break;
-        case "delete-selected":
-          if (state.partId && workspace?.getPart(state.partId)?.userData?.isPlaygroundObject) {
-            workspace.removePlaygroundObject(state.partId);
-            updatePlaygroundCount();
-            renderPartList();
-            toast("Voice: Deleted 3D object", "", 2000);
-          }
-          break;
-      }
-      break;
-  }
-}
-
 
 /* ------------------------------------------------------------------------- */
 /* INTERACTION MODES                                                         */
@@ -1181,6 +1085,9 @@ function syncWorkspaceVideo() {
   if (dom.workspaceScrim) {
     dom.workspaceScrim.classList.toggle("is-live", live);
   }
+  // Fade the ground grid while the camera fills the stage: a 40-unit wireframe
+  // over a live feed buries the person and the model in clutter.
+  workspace?.setGridEmphasis?.(live && state.cameraView === "workspace" ? 0.22 : 1);
   if (dom.workspaceCamNote) {
     dom.workspaceCamNote.hidden = live || state.cameraView !== "workspace";
   }
@@ -1392,11 +1299,21 @@ function startLoop() {
     const now = performance.now();
     const dt = Math.min((now - state.lastFrameTime) / 1000, 0.05);
     state.lastFrameTime = now;
+    state.frameDelta = dt;
 
     animator.update(dt);
+    // Playground animation (glTF clips and the idle spin) runs on the same
+    // clock as everything else.
+    playground?.update(dt);
+    // Fade the keyboard hints once the user is actually interacting, so the
+    // stage is clean during a session but discoverable at rest.
+    const interacting = Boolean(state.gestureTarget) || state.cameraLive;
+    if (interacting !== document.body.classList.contains("is-interacting")) {
+      document.body.classList.toggle("is-interacting", interacting);
+      if (dom.stageKeys) dom.stageKeys.style.opacity = interacting ? "0" : "";
+    }
     processHands(now / 1000);
     updateHud(dt);
-    inspector?.updateProperties?.();
 
     requestAnimationFrame(loop);
   };
@@ -1409,7 +1326,10 @@ const solver = new ManipulationSolver({
     moveSensitivity: settings.object.moveSensitivity,
     rotateSensitivity: settings.object.rotateSensitivity,
     scaleSensitivity: settings.object.scaleSensitivity,
-    zSensitivity: settings.object.depthSensitivity
+    zSensitivity: settings.object.depthSensitivity,
+    // Match the stage bounds used when the result is written to the object, so
+    // a drag stops at the visible edge instead of saturating early.
+    limits: STAGE_BOUNDS
   },
   onModeChange: mode => {
     state.gestureMode = mode;
@@ -1508,52 +1428,77 @@ function processHands(now) {
     hand.pinched ? projectedTarget(hand) : null
   );
 
-  overlay?.draw(hands, handedness, { pinched: overlayPinched, activity, targets });
+  // ---- scene-space skeletons ------------------------------------------------
+  // The 3D hands are the primary representation; the 2D overlay is kept for the
+  // corner preview card and as a fallback when WebGL is unavailable.
+  if (skeleton3d) {
+    // The video is object-fit: cover, so hand the rigs the same crop rectangle
+    // the 2D overlay uses; otherwise the scene skeletons drift off the real
+    // hands whenever the stage aspect ratio differs from the camera's.
+    const video = videoSize();
+    const box = cameraDisplayBox();
+    const fit = video.videoWidth && box.width
+      ? {
+          ...coverFit(video.videoWidth, video.videoHeight, box.width, box.height),
+          videoWidth: video.videoWidth,
+          videoHeight: video.videoHeight,
+          boxWidth: box.width,
+          boxHeight: box.height
+        }
+      : null;
+
+    skeleton3d.update(
+      hands,
+      tracker.worldLandmarks || [],
+      handedness,
+      { pinched: overlayPinched, activity, fit, dt: state.frameDelta ?? 1 / 60 }
+    );
+  }
+
+  // Depth cues for the 2D overlay, so both layers agree about which hand is
+  // nearer the camera.
+  const depths = hands.map(landmarks => {
+    if (!landmarks?.length) return null;
+    const z = landmarks.reduce((sum, point) => sum + (point.z || 0), 0) / landmarks.length;
+    return Math.max(0, Math.min(1, 0.5 - z * 4));
+  });
+
+  overlay?.draw(hands, handedness, {
+    pinched: overlayPinched, activity, targets, depths
+  });
   drawWorkspaceOverlay(hands, handedness, activeStates, activity, targets, tethers);
 
-  const anyPinched = activeStates.some(hand => hand?.pinched);
-  if (anyPinched && !state.wasPinched) {
-    voice?.playChime("grab");
-  } else if (!anyPinched && state.wasPinched) {
-    voice?.playChime("release");
-  }
-  state.wasPinched = anyPinched;
-
   // ---- run the solver -------------------------------------------------------
-  // A pinch in MOVE/ROTATE grabs what you are pointing at. Promote the hovered
-  // component to the selection on gesture start so the gesture has a target.
-  if ((state.mode === "move" || state.mode === "rotate") && state.pointerTarget &&
-      state.pointerTarget !== state.partId && activeStates.some(hand => hand?.pinched) &&
-      !state.gestureTarget) {
-    workspace.select(state.pointerTarget);
-    handleSelect(state.pointerTarget, "hand");
-    state.gestureTarget = state.pointerTarget;
-  }
-  if (!activeStates.some(hand => hand?.pinched)) state.gestureTarget = null;
+  // A pinch in MOVE/ROTATE grabs what you are pointing at. Promote whatever the
+  // reticle resolves to the selection on gesture start so the gesture has a
+  // target. Playground objects and engineering components take different
+  // selection paths: without the prop branch, a pinch over a spawned cube did
+  // nothing at all and the gesture fell through to the assembly.
+  const pinching = activeStates.some(hand => hand?.pinched);
 
-  const objectState = {
-    position: { x: 0, y: 0, z: 0 },
-    rotationZ: 0,
-    rotationX: 0,
-    scale: 1,
-    explode: workspace.explodeAmount ?? 0
-  };
+  // A short latch on grab and a soft lift on release. This is the audio half of
+  // the gesture feedback, ported from main, and it is what makes a pinch feel
+  // like it landed rather than merely registering.
+  if (pinching && !state.wasPinching) chimes().play("grab");
+  else if (!pinching && state.wasPinching) chimes().play("release");
+  state.wasPinching = pinching;
+  if ((state.mode === "move" || state.mode === "rotate") && state.pointerTarget && pinching) {
+    if (state.pointerKind === "prop") {
+      if (playground?.selectedId !== state.pointerTarget) {
+        selectProp(state.pointerTarget, "hand");
+      }
+    } else if (state.pointerTarget !== state.partId && !state.gestureTarget) {
+      workspace.select(state.pointerTarget);
+      handleSelect(state.pointerTarget, "hand");
+      state.gestureTarget = state.pointerTarget;
+    }
+  }
+  if (!pinching) state.gestureTarget = null;
 
   // In a real mode the transform applies to the selected component when there
   // is one; EXPLODE and SCALE always act on the assembly.
   const part = getGesturePart();
-  if (part && state.mode !== "explode") {
-    objectState.position = { ...part.offset };
-    objectState.rotationZ = part.rotationZ;
-    objectState.rotationX = part.rotationX;
-    objectState.scale = part.scale;
-  } else {
-    const t = workspace.transform;
-    objectState.position = { x: t.position.x, y: t.position.y, z: t.position.z };
-    objectState.rotationZ = t.rotationZ;
-    objectState.rotationX = t.rotationX;
-    objectState.scale = t.scale;
-  }
+  const objectState = gestureObjectState(part);
 
   const result = solver.update(activeStates, objectState, now);
   state.gestureMode = result.mode;
@@ -1568,12 +1513,159 @@ function processHands(now) {
   updateGestureLabels(activeStates, result);
 }
 
+/**
+ * Settings handed to each per-hand analyzer.
+ *
+ * Referenced by the tracking loop and the settings panel but never defined, so
+ * the first frame with a hand threw and took the whole pipeline with it.
+ */
+function analyzerSettings() {
+  return {
+    pinchThreshold: settings.gesture.pinchThreshold,
+    pinchRelease: settings.gesture.pinchRelease,
+    smoothing: settings.gesture.smoothing
+  };
+}
+
+/**
+ * Choose which hand drives the reticle and manipulation.
+ *
+ * Both hands used to be reduced to `states[0]` implicitly, which is whatever
+ * order MediaPipe happened to return. Prefer a pinching hand (you are actively
+ * manipulating), then a fully visible one, then the first tracked hand.
+ */
+function pickPointer(states) {
+  if (!Array.isArray(states) || !states.length) return null;
+
+  let best = null;
+  let bestScore = -Infinity;
+  for (const hand of states) {
+    if (!hand) continue;
+    let score = 0;
+    if (hand.pinched) score += 10;
+    // A hand with a complete landmark set is likelier to be in frame.
+    const points = hand.landmarks?.length || 0;
+    score += Math.min(points, 21) / 21;
+    if (hand.present === false) score -= 5;
+    if (score > bestScore) {
+      bestScore = score;
+      best = hand;
+    }
+  }
+
+  if (!best) return null;
+  const tip = best.landmarks?.[8] || best.indexTip || best.pinch || null;
+  return {
+    hand: { ...best, indexTip: tip, pinched: Boolean(best.pinched) },
+    state: best
+  };
+}
+
+/**
+ * Report which engineering component the hand is hovering.
+ *
+ * Called from updatePointer() but never defined. Hover is a purely visual
+ * affordance, so this stays cheap and never touches selection.
+ */
+function hoverFromHand(hand, partId) {
+  if (!workspace || !partId) return;
+  if (state.hoverId === partId) return;
+  state.hoverId = partId;
+  workspace.setHover?.(partId);
+}
+
+/**
+ * Report the live gesture for each tracked hand.
+ *
+ * This is called from the tracking loop and from the solver's mode-change
+ * callback. It used to be referenced but never defined, which threw
+ * `ReferenceError: updateGestureLabels is not defined` on the first tracked
+ * frame and killed the rest of processHands() — including depth cues and the
+ * solver — so the stage looked frozen the moment a hand appeared.
+ */
+function updateGestureLabels(states, result) {
+  const hands = Array.isArray(states) ? states.filter(Boolean) : [];
+  const primary = hands[0] || null;
+  state.activePinches = hands.map(hand => Boolean(hand.pinched));
+
+  const gesture = !hands.length
+    ? null
+    : primary.pinched
+      ? (result?.intent && result.intent !== "none" ? result.intent : "grab")
+      : primary.gesture || primary.pose || "tracking";
+
+  state.gestureName = gesture;
+
+  if (dom.hudGesture) {
+    const label = gesture ? String(gesture).toUpperCase() : "—";
+    if (dom.hudGesture.textContent !== label) dom.hudGesture.textContent = label;
+  }
+
+  // The instruction strip keeps the mode's guidance, but the target chip also
+  // reports an active grab so the user can see the pinch was recognised.
+  if (dom.modeInstructionTarget && gesture === "translate") {
+    dom.modeInstructionTarget.textContent = "GRABBED";
+  }
+
+  if (dom.viewport) {
+    dom.viewport.classList.toggle("is-gesturing", Boolean(gesture));
+    dom.viewport.classList.toggle("is-pinching", hands.some(hand => hand.pinched));
+  }
+}
+
 /** The component a gesture should transform, or null for the whole assembly. */
 function getGesturePart() {
   if (!state.partId || !workspace) return null;
   const transform = workspace.getPartTransform(state.partId);
   if (!transform) return null;
   return { partId: state.partId, ...transform };
+}
+
+/**
+ * The transform the solver should treat as "current" for this frame.
+ *
+ * The solver captures its reference frame from this state, so it must describe
+ * the thing actually being grabbed. Seeding it from the assembly while a
+ * playground object is selected made the object jump by the assembly's offset
+ * the instant the pinch closed — this is the fix for that.
+ */
+function gestureObjectState(part) {
+  const objectState = {
+    position: { x: 0, y: 0, z: 0 },
+    rotationZ: 0,
+    rotationX: 0,
+    scale: 1,
+    explode: workspace?.explodeAmount ?? 0
+  };
+
+  const selected = playground?.get?.();
+  const grabbed = selected ? playground.getTransform(selected.id) : null;
+
+  if (grabbed) {
+    objectState.position = { ...grabbed.position };
+    // The playground yaws around Y; the solver reports yaw in rotationZ.
+    objectState.rotationZ = grabbed.rotationY;
+    objectState.rotationX = grabbed.rotationX;
+    objectState.scale = grabbed.scale;
+    return objectState;
+  }
+
+  if (part && state.mode !== "explode") {
+    objectState.position = { ...part.offset };
+    objectState.rotationZ = part.rotationZ;
+    objectState.rotationX = part.rotationX;
+    objectState.scale = part.scale;
+    return objectState;
+  }
+
+  const t = workspace?.transform;
+  if (t) {
+    objectState.position = { x: t.position.x, y: t.position.y, z: t.position.z };
+    objectState.rotationZ = t.rotationZ;
+    objectState.rotationX = t.rotationX;
+    objectState.scale = t.scale;
+  }
+  return objectState;
 }
 
 /**
@@ -1585,6 +1677,14 @@ function getGesturePart() {
  */
 function applyGestureResult(result, part) {
   if (!result?.active) return;
+
+  // A grabbed playground object owns the gesture. The solver produces the same
+  // intents either way, so the only difference is where the transform lands.
+  const prop = playground?.get?.();
+  if (prop && (result.intent === "translate" || result.intent === "rotate" || result.intent === "scale")) {
+    applyGestureToProp(result, prop);
+    return;
+  }
 
   switch (result.intent) {
     case "translate": {
@@ -1634,9 +1734,55 @@ function applyGestureResult(result, part) {
   }
 }
 
-/** Confirm the component under the pointer as the selection. */
+/**
+ * Apply a solver result to a playground object.
+ *
+ * The solver already captured a reference frame, so `position`, `rotationZ` and
+ * `scale` are absolute values derived from where the grab started — the object
+ * never jumps to the fingertip.
+ */
+function applyGestureToProp(result, prop) {
+  if (result.intent === "translate" && result.position) {
+    playground.setTransform(prop.id, {
+      position: {
+        x: clamp(result.position.x, -STAGE_BOUNDS.x, STAGE_BOUNDS.x),
+        y: clamp(result.position.y, -STAGE_BOUNDS.y, STAGE_BOUNDS.y),
+        z: clamp(result.position.z, -STAGE_BOUNDS.z, STAGE_BOUNDS.z)
+      }
+    });
+    playground.highlight(prop.id);
+    return;
+  }
+
+  if (result.intent === "rotate") {
+    // The solver reports yaw in rotationZ and pitch in rotationX for a flat
+    // target; for a 3D prop, yaw reads most naturally around Y.
+    playground.setTransform(prop.id, {
+      rotationY: result.rotationZ,
+      rotationX: result.rotationX
+    });
+    playground.highlight(prop.id);
+    return;
+  }
+
+  if (result.intent === "scale" && typeof result.scale === "number") {
+    playground.setTransform(prop.id, { scale: result.scale });
+    playground.highlight(prop.id);
+  }
+}
+
+/** Confirm whatever is under the pointer as the selection. */
 function handleHandSelect() {
   if (!state.pointerTarget) return;
+  if (state.pointerKind === "prop") {
+    if (playground?.selectedId === state.pointerTarget) {
+      flash(dom.inspectorRoot, "flash");
+      return;
+    }
+    selectProp(state.pointerTarget, "hand");
+    flash(dom.inspectorRoot, "flash");
+    return;
+  }
   if (state.partId === state.pointerTarget) {
     flash(dom.inspectorRoot, "flash");
     return;
@@ -1650,11 +1796,18 @@ function handleHandSelect() {
 /** Draw the landmark skeleton onto the full-workspace overlay. */
 function drawWorkspaceOverlay(hands, handedness, states, activity, targets, tethers) {
   if (!overlayWorkspace || state.cameraView !== "workspace") return;
+
+  // The scene-space rigs are the primary skeleton. When they are live, the 2D
+  // layer only adds the reticle, the pinch burst and the labels — otherwise
+  // both layers draw the same bones and hands look doubled and smeared.
+  const sceneSkeletons = Boolean(skeleton3d?.rigs?.size);
+
   overlayWorkspace.draw(hands, handedness, {
     pinched: states.map(hand => hand.pinched),
     activity,
     targets,
-    tethers
+    tethers,
+    sceneSkeletons
   });
 }
 
@@ -1704,23 +1857,35 @@ function updatePointer(pointer, states, result) {
   dom.reticle.style.top = `${clamp(pixels.y, 0, viewRect.height)}px`;
 
   const ndc = landmarkNdc(tip);
-  const hit = workspace.raycast({ x: ndc.x, y: ndc.y });
+
+  // Playground objects take priority over engineering components: if the user
+  // spawned or imported something, they expect to be able to grab it.
+  const propHit = playground
+    ? playground.pick({ x: ndc.x, y: ndc.y }, workspace.camera)
+    : null;
+
+  const hit = propHit || workspace.raycast({ x: ndc.x, y: ndc.y });
 
   // Hover highlight follows the pointer, but never while dragging.
   const dragging = result?.intent === "translate" || result?.intent === "rotate";
   if (!dragging) {
     if (hit !== state.pointerTarget) {
       state.pointerTarget = hit;
-      workspace.setHover(hit);
+      state.pointerKind = propHit ? "prop" : hit ? "part" : null;
+      if (!propHit) workspace.setHover(hit);
       if (hit) hoverFromHand(pointer.hand, hit);
+      playground?.highlight(propHit);
     }
   }
 
   // Always resolve the *hovered* part's own name — inspector.lastComponent
   // belongs to the current selection and would mislabel a different part.
-  const label = hit
-    ? (getComponentData(state.modelId, hit)?.name || hit)
-    : "";
+  const propName = propHit ? playground?.byId.get(propHit)?.name : null;
+  const label = propHit
+    ? propName || propHit
+    : hit
+      ? (getComponentData(state.modelId, hit)?.name || hit)
+      : "";
   dom.reticle.classList.toggle("is-over", Boolean(hit));
   dom.reticle.classList.toggle("is-active", Boolean(pointer.hand.pinched));
   if (dom.reticleLabel) {
@@ -1760,6 +1925,8 @@ function updateHud(dt) {
 
     updateDiagnostics();
 
+    updateObjectHud();
+
     const tracking = tracker?.getState();
 
     // Hand count was looked up (dom.hudHands) but never written anywhere, so the
@@ -1776,6 +1943,405 @@ function updateHud(dt) {
         ? "ERROR"
         : "—";
   }
+}
+
+/* ------------------------------------------------------------------------- */
+/* PLAYGROUND (multi-object scene)                                           */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Add one primitive to the playground and refresh everything that reflects the
+ * object list. Shared by the library tiles, the toolbar and voice commands.
+ */
+function addPlaygroundPrimitive(kind) {
+  const scene3d = setupPlayground();
+  if (!scene3d) return null;
+  const prop = scene3d.addPrimitive(kind);
+  if (!prop) return null;
+  chimes().play("spawn");
+  refreshSceneOutliner();
+  updateObjectHud();
+  return prop;
+}
+
+/**
+ * The playground lives beside the engineering assemblies rather than replacing
+ * them: the selected model is still a first-class object, and anything spawned
+ * or imported here becomes an additional manipulable object in the same scene.
+ */
+function setupPlayground() {
+  if (playground || !workspace?.scene) return playground;
+
+  playground = new Playground({
+    scene: workspace.scene,
+    onSelect: id => {
+      state.playgroundId = id;
+      updateObjectHud();
+    },
+    onChange: () => {
+      updateObjectHud();
+      refreshSceneOutliner();
+    }
+  });
+
+  dom.stageAddObject?.addEventListener("click", () => {
+    const prop = playground.addPrimitive(nextPrimitive());
+    toast(`Added ${prop.name}`, "", 1600);
+  });
+  dom.stageDuplicate?.addEventListener("click", () => {
+    const prop = playground.duplicate();
+    toast(prop ? `Duplicated to ${prop.name}` : "Nothing selected to duplicate",
+      prop ? "" : "error", 1600);
+  });
+  dom.stageDelete?.addEventListener("click", () => {
+    const removed = playground.remove();
+    toast(removed ? "Object deleted" : "Nothing selected to delete",
+      removed ? "" : "error", 1600);
+  });
+  dom.stageReset?.addEventListener("click", resetEnvironment);
+
+  return playground;
+}
+
+/** Cycle through the primitive kinds so repeated clicks build a varied scene. */
+let primitiveCursor = 0;
+function nextPrimitive() {
+  const kind = PRIMITIVES[primitiveCursor % PRIMITIVES.length].id;
+  primitiveCursor++;
+  return kind;
+}
+
+/** "Reset the environment": clear props, reset the model, re-frame the camera. */
+function resetEnvironment() {
+  playground?.clear();
+  primitiveCursor = 0;
+  if (workspace) {
+    workspace.resetView();
+  }
+  setMode("select");
+  refreshSceneOutliner();
+  updateObjectHud();
+  toast("Environment reset", "", 1800);
+}
+
+function updateObjectHud() {
+  const count = playground?.props.length || 0;
+  if (dom.hudObjects) dom.hudObjects.textContent = String(count);
+  const selected = playground?.get();
+  if (dom.hudObjectName) {
+    dom.hudObjectName.textContent = selected ? selected.name.toUpperCase() : "—";
+  }
+}
+
+/** Rebuild the right-drawer object list. */
+function refreshSceneOutliner() {
+  const list = document.getElementById("scene-outliner");
+  if (!list || !playground) return;
+  list.replaceChildren();
+
+  const items = [];
+  if (workspace?.assembly) {
+    items.push({ id: "__model__", name: workspace.modelId, kind: "model" });
+  }
+  for (const prop of playground.props) {
+    items.push({ id: prop.id, name: prop.name, kind: prop.kind, clips: prop.clipNames });
+  }
+
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "outliner-empty";
+    empty.textContent = "No objects yet. Add a primitive or import a model.";
+    list.appendChild(empty);
+    return;
+  }
+
+  for (const item of items) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "outliner-row";
+    row.dataset.id = item.id;
+    const isSelected =
+      item.id === "__model__"
+        ? !playground.selectedId
+        : item.id === playground.selectedId;
+    if (isSelected) row.classList.add("is-selected");
+
+    const label = document.createElement("span");
+    label.className = "outliner-name";
+    label.textContent = item.name;
+    row.appendChild(label);
+
+    const meta = document.createElement("span");
+    meta.className = "outliner-meta";
+    meta.textContent = item.kind === "model" ? "MODEL" : item.kind.toUpperCase();
+    row.appendChild(meta);
+
+    row.addEventListener("click", () => {
+      if (item.id === "__model__") {
+        playground.select(null);
+        workspace.select(state.partId);
+      } else {
+        playground.select(item.id);
+        workspace.clearSelection();
+      }
+      refreshSceneOutliner();
+    });
+    list.appendChild(row);
+
+    // Animation clip picker for imported GLTF models.
+    if (item.clips?.length > 1) {
+      const clips = document.createElement("div");
+      clips.className = "outliner-clips";
+      item.clips.forEach((name, index) => {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "chip";
+        chip.textContent = name;
+        chip.addEventListener("click", event => {
+          event.stopPropagation();
+          playground.setClip(item.id, index);
+        });
+        clips.appendChild(chip);
+      });
+      list.appendChild(clips);
+    }
+  }
+}
+
+/* ------------------------------------------------------------------------- */
+/* VOICE                                                                     */
+/* ------------------------------------------------------------------------- */
+
+function setupVoice() {
+  if (voice) return voice;
+  voice = new VoiceControl({
+    onCommand: (intent, phrase) => {
+      handleVoiceIntent(intent, phrase);
+    },
+    onState: voxState => {
+      updateVoiceUi(voxState);
+    }
+  });
+
+  dom.stageVoice?.addEventListener("click", () => {
+    if (!voice.supported) {
+      toast("This browser has no speech engine. Try Chrome or Edge.", "error", 6000);
+      return;
+    }
+    voice.toggle();
+  });
+
+  updateVoiceUi({
+    status: voice.status,
+    supported: voice.supported,
+    listening: false,
+    error: voice.error
+  });
+  return voice;
+}
+
+function updateVoiceUi(voxState) {
+  const button = dom.stageVoice;
+  if (button) {
+    button.classList.toggle("is-on", voxState.status === VOICE_STATUS.LISTENING);
+    button.setAttribute("aria-pressed", String(voxState.status === VOICE_STATUS.LISTENING));
+    button.title = voxState.error
+      ? voxState.error
+      : voxState.status === VOICE_STATUS.LISTENING
+        ? "Listening — click to stop"
+        : "Voice commands (or press V)";
+  }
+  if (dom.voiceState) {
+    dom.voiceState.textContent =
+      voxState.status === VOICE_STATUS.LISTENING ? "LISTENING"
+      : voxState.status === VOICE_STATUS.HEARD ? `“${voxState.phrase || ""}”`
+      : voxState.status === VOICE_STATUS.UNSUPPORTED ? "UNAVAILABLE"
+      : voxState.status === VOICE_STATUS.ERROR ? "ERROR"
+      : "OFF";
+  }
+  if (dom.voicePhrase && voxState.phrase) {
+    dom.voicePhrase.textContent = voxState.phrase;
+  }
+  dom.voiceChip?.classList.toggle("is-listening", voxState.status === VOICE_STATUS.LISTENING);
+}
+
+/** Map a parsed intent onto an action. Voice and hands share the same state. */
+function handleVoiceIntent(intent, phrase) {
+  const [group, value] = String(intent).split(":");
+
+  switch (group) {
+    case "mode":
+      if (isMode(value)) { setMode(value); toast(`Mode: ${value.toUpperCase()}`, "", 1400); }
+      return;
+
+    case "add": {
+      const prop = playground?.addPrimitive(value);
+      if (prop) { toast(`Added ${prop.name}`, "", 1600); refreshSceneOutliner(); }
+      return;
+    }
+
+    case "select": {
+      const props = playground?.props || [];
+      const match = props.find(prop => prop.primitive === value);
+      if (match) {
+        selectProp(match.id, "voice");
+        toast(`Selected ${match.name}`, "accent", 1400);
+      } else {
+        toast(`No ${value} in the scene — say "add ${value}" first`, "warn", 2400);
+      }
+      return;
+    }
+
+    case "object":
+      if (value === "duplicate") { playground?.duplicate(); refreshSceneOutliner(); }
+      if (value === "delete") { playground?.remove(); refreshSceneOutliner(); }
+      if (value === "clear") { playground?.clear(); refreshSceneOutliner(); }
+      if (value === "next" || value === "prev") cyclePropSelection(value === "next" ? 1 : -1);
+      return;
+
+    case "transform":
+      if (value === "assemble") setExplodeAmount(0);
+      applyVoiceTransform(value);
+      return;
+
+    case "anim": {
+      const prop = playground?.get();
+      if (!prop?.actions?.length) { toast("No animation on the selected object", "error", 2000); return; }
+      if (value === "play") {
+        const action = prop.actions[prop.activeClip];
+        if (action) action.paused = false;
+      }
+      if (value === "pause") {
+        const action = prop.actions[prop.activeClip];
+        if (action) action.paused = true;
+      }
+      if (value === "next") playground.setClip(prop.id, (prop.activeClip + 1) % prop.actions.length);
+      return;
+    }
+
+    case "model":
+      switchModel(value);
+      return;
+
+    case "color": {
+      const hex = COLOR_PALETTE[value];
+      if (!hex) return;
+      const prop = playground?.get?.();
+      const partId = state.partId;
+      if (prop) {
+        playground.setColor(prop.id, hex);
+      } else if (partId) {
+        workspace?.setPartMaterial?.(partId, { color: hex });
+      } else if (workspace) {
+        // Nothing selected: recolour the whole assembly, as `main` did.
+        for (const part of workspace.parts) {
+          workspace.setPartMaterial?.(part.partId ?? part.userData?.partId, { color: hex });
+        }
+      }
+      inspector?.updateProperties?.();
+      toast(`Colour: ${value.toUpperCase()}`, "accent", 1600);
+      return;
+    }
+
+    case "material": {
+      const prop = playground?.get?.();
+      if (value === "wireframe" || value === "solid") {
+        const target = value === "wireframe";
+        const next = workspace?.toggleWireframe?.(state.partId || null);
+        if (prop) playground.setWireframe(prop.id, target);
+        toast(`Wireframe ${(next ?? target) ? "ON" : "OFF"}`, "accent", 1600);
+      }
+      if (value === "rough" || value === "metal") {
+        const options = value === "rough"
+          ? { roughness: 0.95, metalness: 0.05 }
+          : { roughness: 0.15, metalness: 0.95 };
+        if (prop) playground.setMaterial(prop.id, options);
+        else if (state.partId) workspace?.setPartMaterial?.(state.partId, options);
+        toast(value === "rough" ? "Matte finish" : "Metallic finish", "accent", 1600);
+      }
+      inspector?.updateProperties?.();
+      return;
+    }
+
+    case "view":
+      if (value === "grid") store.update("view", { grid: !settings.view.grid });
+      if (value === "shadows") store.update("view", { shadows: !settings.view.shadows });
+      if (value === "orbit") store.update("view", { autoRotate: !settings.view.autoRotate });
+      if (value === "isolate") toggleIsolate();
+      if (value === "focus") workspace?.focusSelected();
+      if (value === "deselect") { playground?.select(null); workspace?.clearSelection(); }
+      if (value === "panels") {
+        setPanelState({ left: !settings.ui.leftOpen, right: !settings.ui.rightOpen });
+      }
+      if (value === "fullscreen") toggleFullscreen();
+      return;
+
+    case "explode": {
+      const amount = Number(String(phrase).match(/(\d{1,3})\s*(?:percent|%)?/)?.[1] ?? 0);
+      setExplodeAmount(amount);
+      toast(`Explode ${amount}%`, "accent", 1600);
+      return;
+    }
+
+    case "env":
+      if (value === "reset") resetEnvironment();
+      if (value === "help") showVoiceHelp();
+      if (value === "cameraOn" && tracker && !isTrackerLive()) toggleCamera();
+      if (value === "cameraOff" && isTrackerLive()) toggleCamera();
+      return;
+
+    default:
+      void phrase;
+  }
+}
+
+/** Step the playground selection, so voice and keyboard can both cycle. */
+function cyclePropSelection(direction) {
+  const props = playground?.props || [];
+  if (!props.length) {
+    toast("Nothing to select yet", "warn", 1600);
+    return null;
+  }
+  const current = props.findIndex(prop => prop.id === playground.selectedId);
+  const next = ((current < 0 ? 0 : current + direction) + props.length) % props.length;
+  const prop = props[next];
+  selectProp(prop.id, "voice");
+  toast(`Selected ${prop.name}`, "accent", 1200);
+  return prop;
+}
+
+function applyVoiceTransform(direction) {
+  const prop = playground?.get();
+  if (!prop) {
+    // No playground object selected: nudge the engineering assembly instead.
+    if (!workspace) return;
+    if (direction === "scaleUp") workspace.nudge("scaleUp");
+    if (direction === "scaleDown") workspace.nudge("scaleDown");
+    if (direction === "reset") workspace.resetView();
+    return;
+  }
+  const t = playground.getTransform(prop.id);
+  const step = 0.4;
+  const next = { position: { ...t.position } };
+  if (direction === "up") next.position.y += step;
+  if (direction === "down") next.position.y -= step;
+  if (direction === "left") next.position.x -= step;
+  if (direction === "right") next.position.x += step;
+  if (direction === "forward") next.position.z -= step;
+  if (direction === "back") next.position.z += step;
+  if (direction === "scaleUp") next.scale = Math.min(4, t.scale * 1.25);
+  if (direction === "scaleDown") next.scale = Math.max(0.25, t.scale / 1.25);
+  if (direction === "reset") {
+    next.position = { x: 0, y: 0.2, z: 0 };
+    next.scale = 1;
+    next.rotationY = 0;
+  }
+  playground.setTransform(prop.id, next);
+}
+
+function showVoiceHelp() {
+  const examples = ["add cube", "move mode", "duplicate", "bigger", "reset everything", "help"];
+  toast(`Try: ${examples.join(" · ")}`, "", 7000);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2109,9 +2675,7 @@ const BINDINGS = [
   ["set-shadows", "view", "shadows", "checkbox"],
   ["set-autorotate", "view", "autoRotate", "checkbox"],
   ["set-bloom", "view", "bloom", "checkbox"],
-  ["set-quality", "view", "quality", "select"],
-  ["set-voice-enabled", "voice", "enabled", "checkbox"],
-  ["set-sound-effects", "voice", "soundEffects", "checkbox"]
+  ["set-quality", "view", "quality", "select"]
 ];
 
 function setupSettingsUI() {
@@ -2155,6 +2719,28 @@ function setupSettingsUI() {
     workspaceViewInput.checked = settings.camera.workspaceView !== false;
     workspaceViewInput.addEventListener("change", () => {
       setCameraView(workspaceViewInput.checked ? "workspace" : "preview");
+    });
+  }
+
+  // Voice and audio preferences, ported from main's settings panel.
+  const voiceEnabledInput = document.getElementById("set-voice-enabled");
+  if (voiceEnabledInput) {
+    voiceEnabledInput.checked = settings.voice?.enabled !== false;
+    voiceEnabledInput.addEventListener("change", () => {
+      store.update("voice", { enabled: voiceEnabledInput.checked });
+      if (!voiceEnabledInput.checked && voice?.isListening) voice.stop();
+      toast(`Voice commands ${voiceEnabledInput.checked ? "enabled" : "disabled"}`, "", 1800);
+    });
+  }
+
+  const soundEffectsInput = document.getElementById("set-sound-effects");
+  if (soundEffectsInput) {
+    soundEffectsInput.checked = settings.voice?.soundEffects !== false;
+    soundEffectsInput.addEventListener("change", () => {
+      store.update("voice", { soundEffects: soundEffectsInput.checked });
+      chimes().enabled = soundEffectsInput.checked;
+      if (soundEffectsInput.checked) chimes().play("command");
+      toast(`Audio cues ${soundEffectsInput.checked ? "enabled" : "muted"}`, "", 1800);
     });
   }
 
@@ -2233,6 +2819,13 @@ function applySettings({ section, keys } = {}) {
 
   if (!workspace) return;
 
+  // ---- Voice & audio cues ----
+  // Ported from main: both are user-controllable and persisted.
+  if (all || section === "voice") {
+    chimes().enabled = settings.voice?.soundEffects !== false;
+    if (settings.voice?.enabled === false && voice?.isListening) voice.stop();
+  }
+
   // ---- View ----
   if (all || section === "view" || section === "all") {
     workspace.updateSettings({
@@ -2304,16 +2897,6 @@ function applySettings({ section, keys } = {}) {
       scaleSensitivity: settings.object.scaleSensitivity,
       zSensitivity: settings.object.depthSensitivity
     });
-  }
-
-  // ---- Voice ----
-  if (all || section === "voice") {
-    if (voice) {
-      voice.soundEnabled = settings.voice?.soundEffects !== false;
-      if (settings.voice?.enabled === false && voice.isListening) {
-        voice.stop();
-      }
-    }
   }
 
   if (!settingsAppliedOnce && all) {
@@ -2417,6 +3000,9 @@ function setupDrawer() {
 
   $("#fullscreen-toggle")?.addEventListener("click", toggleFullscreen);
 
+  dom.drawerToggleLeft?.addEventListener("click", () => setPanelState({ left: true }));
+  dom.drawerToggleRight?.addEventListener("click", () => setPanelState({ right: true }));
+
   for (const button of $$("[data-collapse]")) {
     button.addEventListener("click", () => {
       const side = button.dataset.collapse;
@@ -2476,6 +3062,20 @@ function setPanelState({ left, right }, { persist = true } = {}) {
   dom.workspace.classList.toggle("hide-left", !nextLeft);
   dom.workspace.classList.toggle("hide-right", !nextRight);
 
+  // A drawer that has slid off-screen must not stay in the tab order: focus
+  // would land on controls nobody can see. `inert` is set purely as an
+  // attribute so it behaves identically in every environment.
+  for (const [panel, open] of [[dom.panelLeft, nextLeft], [dom.panelRight, nextRight]]) {
+    if (!panel) continue;
+    if (open) panel.removeAttribute("inert");
+    else panel.setAttribute("inert", "");
+  }
+
+  // Keep the corner toggles in sync so they are always independently
+  // reopenable and correctly labelled for assistive tech.
+  dom.drawerToggleLeft?.setAttribute("aria-expanded", String(nextLeft));
+  dom.drawerToggleRight?.setAttribute("aria-expanded", String(nextRight));
+
   // On narrow layouts the panels are drawers; collapsing closes the drawer.
   if (window.innerWidth <= 820) {
     dom.workspace.classList.remove("mobile-left", "mobile-right");
@@ -2533,16 +3133,37 @@ function setupShortcuts() {
         toggleCameraView();
         break;
       case "m":
+        // Voice: M for microphone, leaving V for the camera view.
         event.preventDefault();
-        toggleVoice();
+        dom.stageVoice?.click();
+        break;
+      case "n":
+        event.preventDefault();
+        dom.stageAddObject?.click();
+        break;
+      case "d":
+        event.preventDefault();
+        dom.stageDuplicate?.click();
+        break;
+      case "backspace":
+      case "delete":
+        if (playground?.selectedId) {
+          event.preventDefault();
+          dom.stageDelete?.click();
+        }
         break;
       case "c":
         event.preventDefault();
         toggleCamera();
         break;
       case "l":
+        // Toggle the library drawer, independently of the properties drawer.
         event.preventDefault();
-        togglePanels();
+        setPanelState({ left: !dom.workspace.classList.contains("hide-left") ? false : true });
+        break;
+      case "p":
+        event.preventDefault();
+        setPanelState({ right: !dom.workspace.classList.contains("hide-right") ? false : true });
         break;
       case "f":
         event.preventDefault();
@@ -2642,6 +3263,37 @@ window.HOLOCORE = {
   get settings() {
     return settings;
   },
+  /** The scene-space hand skeletons, or null before boot completes. */
+  getHandSkeleton() {
+    return skeleton3d;
+  },
+  /** The multi-object playground, or null before boot completes. */
+  getPlayground() {
+    return playground;
+  },
+  /** The voice command layer, or null before boot completes. */
+  getVoice() {
+    return voice;
+  },
+  /** The current interaction mode id. */
+  getMode() {
+    return state.mode;
+  },
+  getWorkspace() {
+    return workspace;
+  },
+  /** Persisted settings, including the ported voice preferences. */
+  getSettings() {
+    return store.get();
+  },
+  /** The shared chime synth, so tests and the console can inspect it. */
+  getChimes() {
+    return chimes();
+  },
+  /** Exposed for the full-stack harness; also handy in the console. */
+  handleVoiceIntentForTest: (intent, phrase) => handleVoiceIntent(intent, phrase),
+  resetEnvironment,
+  refreshSceneOutliner,
   switchModel,
   calibrate,
   toast,
@@ -2650,5 +3302,29 @@ window.HOLOCORE = {
   setCameraView,
   syncWorkspaceVideo,
   // Deliberately exposed for automated verification (see tools/).
-  _internals: { store, animator, analyzers, LM }
+  _internals: {
+    store, animator, analyzers, LM,
+    gestureObjectState,
+    applyGestureResult,
+    // Resolve what the reticle is pointing at, so selection can be exercised
+    // without a camera.
+    pointerTargets: () => ({ target: state.pointerTarget, kind: state.pointerKind }),
+    selectProp,
+    updateGestureLabels,
+    inspector,
+    parseCommand,
+    COLOR_PALETTE,
+    updateVoiceUi,
+
+    // Re-render the inspector so material controls match the current selection.
+    // The playground reports its own selection, so re-selecting the same part
+    // id is enough; the inspector prefers a selected prop over the part.
+    refreshInspector: () => {
+      inspector?.setModel?.(state.modelId);
+      inspector?.select?.(state.partId);
+    },
+    // Drives the real per-frame hand pipeline with supplied landmarks, so the
+    // tracking loop can be exercised without a camera.
+    processHands
+  }
 };

@@ -412,6 +412,12 @@ const DEFAULTS = {
   /** Scale clamps for SCALE mode. */
   minScale: 0.3,
   maxScale: 3.2,
+  /**
+   * How far a grab may travel, in world units. The playground widens these to
+   * its own stage bounds so a drag does not saturate before the object reaches
+   * the visible edge.
+   */
+  limits: { x: 4.5, y: 3.5, z: 3.5 },
   /** Rotate: radians of yaw per unit of normalised horizontal hand travel. */
   rotateGain: Math.PI * 1.6,
   /** Rotate: radians of pitch per unit of normalised vertical hand travel. */
@@ -439,6 +445,7 @@ export class ManipulationSolver {
       ...DEFAULTS,
       ...(options.settings || {})
     };
+    this._syncLimits();
     this.mode = "idle";       // idle | grab | frame
     this.grab = null;          // { handStart, objectStart }      MOVE
     this.frame = null;         // { distance, angle, mid, ... }    two-hand (auto)
@@ -452,6 +459,12 @@ export class ManipulationSolver {
 
   updateSettings(settings = {}) {
     Object.assign(this.settings, settings);
+    this._syncLimits();
+  }
+
+  /** `limits` is nested, so a partial override must not drop the other axes. */
+  _syncLimits() {
+    this.limits = { ...DEFAULTS.limits, ...(this.settings.limits || {}) };
   }
 
   reset() {
@@ -739,10 +752,23 @@ export class ManipulationSolver {
     }
 
     const [a, b] = hands;
-    const distance = Math.max(
-      0.001,
-      Math.hypot(a.palm.x - b.palm.x, a.palm.y - b.palm.y)
-    );
+    // Fall back to the pinch/index points when a palm centre is missing: a
+    // hand state built from partial landmarks has neither, and dereferencing it
+    // threw on every frame.
+    const pointOf = hand => hand.palm || hand.pinch || hand.indexTip || null;
+    const pa = pointOf(a);
+    const pb = pointOf(b);
+    if (!pa || !pb) {
+      this.explodeFrame = null;
+      this._setMode("idle");
+      return {
+        mode: "idle",
+        active: false,
+        intent: "none",
+        pointer: hands[0]?.indexTip || hands[0]?.pinch
+      };
+    }
+    const distance = Math.max(0.001, Math.hypot(pa.x - pb.x, pa.y - pb.y));
 
     if (this.mode !== "frame" || !this.explodeFrame) {
       this.explodeFrame = { distance, start: current };
@@ -788,9 +814,9 @@ export class ManipulationSolver {
       const dz = -(hand.pinch.z - this.grab.handStart.z) * sensitivity * 6 * this.settings.zSensitivity;
 
       const target = {
-        x: clamp(this.grab.objectStart.position.x + dx, -4.5, 4.5),
-        y: clamp(this.grab.objectStart.position.y + dy, -3.5, 3.5),
-        z: clamp(this.grab.objectStart.position.z + dz, -3.5, 3.5)
+        x: clamp(this.grab.objectStart.position.x + dx, -this.limits.x, this.limits.x),
+        y: clamp(this.grab.objectStart.position.y + dy, -this.limits.y, this.limits.y),
+        z: clamp(this.grab.objectStart.position.z + dz, -this.limits.z, this.limits.z)
       };
 
       // Track velocity for release inertia (units per second).
@@ -877,8 +903,8 @@ export class ManipulationSolver {
     // Translation from the midpoint, scaled to the viewport.
     const sensitivity = 6.2 * this.settings.moveSensitivity;
     const position = {
-      x: clamp(ref.objectStart.position.x + (mid.x - ref.mid.x) * sensitivity, -4.5, 4.5),
-      y: clamp(ref.objectStart.position.y - (mid.y - ref.mid.y) * sensitivity, -3.5, 3.5),
+      x: clamp(ref.objectStart.position.x + (mid.x - ref.mid.x) * sensitivity, -this.limits.x, this.limits.x),
+      y: clamp(ref.objectStart.position.y - (mid.y - ref.mid.y) * sensitivity, -this.limits.y, this.limits.y),
       z: ref.objectStart.position.z
     };
 

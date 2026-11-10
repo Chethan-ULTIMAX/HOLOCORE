@@ -13,8 +13,15 @@ import {
   DATA_PROVENANCE
 } from "./engineeringData.js";
 
+import { COLOR_PALETTE } from "./voiceControl.js";
+
+const deg = radians => (radians * 180) / Math.PI;
+
+const formatVec = v =>
+  `${(v?.x ?? 0).toFixed(2)}, ${(v?.y ?? 0).toFixed(2)}, ${(v?.z ?? 0).toFixed(2)}`;
+
 export class ComponentInspector {
-  constructor({ root, onFocus, onIsolate, onShowRelated, onAsk, onClear, getWorkspace }) {
+  constructor({ root, onFocus, onIsolate, onShowRelated, onAsk, onClear, getWorkspace, getPlayground }) {
     this.root = root;
     this.onFocus = onFocus || (() => {});
     this.onIsolate = onIsolate || (() => {});
@@ -22,6 +29,9 @@ export class ComponentInspector {
     this.onAsk = onAsk || (() => {});
     this.onClear = onClear || (() => {});
     this.getWorkspace = getWorkspace || (() => null);
+    // The playground is optional: the inspector works without it, it just has
+    // no prop materials to edit.
+    this.getPlayground = getPlayground || (() => null);
 
     this.modelId = null;
     this.partId = null;
@@ -51,6 +61,44 @@ export class ComponentInspector {
     this._render();
   }
 
+  /**
+   * Refresh live values after the scene changed underneath us.
+   *
+   * A full re-render would steal focus from a slider mid-drag, so this only
+   * updates the readouts. Called when a hand gesture moves the object.
+   */
+  updateProperties() {
+    if (!this.root) return;
+
+    // Transform rows come first in the overview tab, then the material
+    // sliders, so the readouts are addressed by section rather than by index.
+    const tf = this._currentTransform();
+    const sections = this.root.querySelectorAll(".inspector-section");
+    for (const section of sections) {
+      const title = section.querySelector(".section-title")?.textContent;
+      const values = section.querySelectorAll(".prop-group .prop-val");
+      if (!values.length) continue;
+
+      if (title === "Transform" && tf) {
+        if (values[0]) values[0].textContent = formatVec(tf.position);
+        if (values[1]) {
+          values[1].textContent =
+            `${Math.round(deg(tf.rotationZ))}°, ${Math.round(deg(tf.rotationX))}°, ${Math.round(deg(tf.rotationY))}°`;
+        }
+        if (values[2]) values[2].textContent = `${tf.scale.toFixed(2)}×`;
+      }
+
+      if (title === "Material") {
+        // The slider readouts live in .prop-slider-item rows.
+        const sliderValues = section.querySelectorAll(".prop-slider-item .prop-val");
+        const material = this._currentMaterial();
+        if (!material) continue;
+        if (sliderValues[0]) sliderValues[0].textContent = Number(material.roughness).toFixed(2);
+        if (sliderValues[1]) sliderValues[1].textContent = Number(material.metalness).toFixed(2);
+      }
+    }
+  }
+
   /** Called after isolation toggles so buttons stay in sync. */
   setState({ isolated = false } = {}) {
     this._isolated = isolated;
@@ -60,36 +108,58 @@ export class ComponentInspector {
   /* --------------------------------------------------------------------- */
 
   _data() {
-    if (!this.partId) return null;
-    const ws = this.getWorkspace?.();
-    const part = typeof ws?.getPart === "function" ? ws.getPart(this.partId) : null;
-    if (part?.userData?.isPlaygroundObject) {
-      return {
-        id: this.partId,
-        name: part.userData.name || part.name || "Playground Object",
-        category: "3D Playground",
-        short: `Interactive 3D ${part.userData.playgroundType || "object"} in the workspace`,
-        function: "An interactive 3D model that responds in real-time to hand gestures and voice commands. Grab, drag, rotate, scale and recolor it.",
-        principle: "Parametric polygonal geometry shaded with physically based materials (PBR) and real-time shadows.",
-        role: "Playground entity for testing spatial hand tracking and physical manipulation.",
-        specs: [
-          { label: "Type", value: (part.userData.playgroundType || "mesh").toUpperCase() },
-          { label: "Geometry", value: `${part.geometry?.attributes?.position?.count || 0} vertices` },
-          { label: "Physics", value: "Real-time kinematic" },
-          { label: "Material", value: "PBR Standard" }
-        ],
-        materials: ["PBR Standard Material", "Soft Shadow Caster"],
-        facts: [
-          "Pinch with thumb and index to grab and translate in 3D space.",
-          "Use voice command 'color [red/blue/green/gold/cyan/purple]' to change its material.",
-          "Say 'wireframe' to inspect the polygonal wireframe."
-        ],
-        relations: [],
-        education: "Interactive shape created in your 3D workspace. You can control it freely using your hands or voice."
-      };
-    }
-    if (!this.modelId) return null;
+    if (!this.partId || !this.modelId) return null;
     return getComponentData(this.modelId, this.partId);
+  }
+
+  /** The playground object behind the current selection, if any. */
+  _selectedObject() {
+    const playground = this.getPlayground?.();
+    const propId = playground?.selectedId;
+    if (propId) return playground.byId?.get(propId) || null;
+    // An imported or spawn id that is not a documented assembly part.
+    if (!this.partId) return null;
+    if (this.modelId && getComponentData(this.modelId, this.partId)) return null;
+    const material = this.getWorkspace()?.getPartMaterial?.(this.partId);
+    return material ? { id: this.partId, name: this.partId, material } : null;
+  }
+
+  /** Panel for a selected object that has no engineering knowledge entry. */
+  _renderObjectPanel() {
+    const object = this._selectedObject();
+    if (!object) {
+      this._renderEmpty();
+      return;
+    }
+
+    const name = object.name || object.id;
+    const header = this._el("div", "inspector-header");
+    header.appendChild(this._el("h2", "inspector-title", String(name).toUpperCase()));
+    const kind = object.primitive ? "PRIMITIVE" : "OBJECT";
+    header.appendChild(this._el("span", "inspector-kind", kind));
+    this.root.appendChild(header);
+
+    const body = this._el("div", "inspector-body");
+    this.root.appendChild(body);
+
+    const geometry = this._el("section", "inspector-section");
+    geometry.appendChild(this._el("h3", "section-title", "Object"));
+    const grid = this._el("dl", "spec-grid");
+    grid.appendChild(this._el("dt", "", "Id"));
+    grid.appendChild(this._el("dd", "", object.id));
+    if (object.primitive) {
+      grid.appendChild(this._el("dt", "", "Type"));
+      grid.appendChild(this._el("dd", "", object.primitive));
+    }
+    geometry.appendChild(grid);
+    geometry.appendChild(
+      this._el("p", "provenance",
+        "Spawned object — no engineering knowledge entry. Material changes apply immediately.")
+    );
+    body.appendChild(geometry);
+
+    this._renderTransform(body);
+    this._renderMaterials(body);
   }
 
   _el(tag, className, text) {
@@ -104,7 +174,15 @@ export class ComponentInspector {
     this.root.replaceChildren();
     const data = this._data();
 
+    // A selected object with no engineering entry (a playground prop, or an
+    // imported mesh) still gets a real panel: name, measured geometry and the
+    // material controls. Previously the inspector bailed out to the empty state,
+    // which is why the material section never appeared.
     if (!data) {
+      if (this._selectedObject()) {
+        this._renderObjectPanel();
+        return;
+      }
       this._renderEmpty();
       return;
     }
@@ -114,7 +192,11 @@ export class ComponentInspector {
     const body = this._el("div", "inspector-body");
     this.root.appendChild(body);
 
-    if (this.tab === "overview") this._renderOverview(body, data);
+    if (this.tab === "overview") {
+      this._renderOverview(body, data);
+      this._renderTransform(body);
+      this._renderMaterials(body);
+    }
     else if (this.tab === "system") this._renderSystem(body, data);
     else if (this.tab === "learn") this._renderLearn(body, data);
 
@@ -233,151 +315,167 @@ export class ComponentInspector {
       for (const fact of data.facts) list.appendChild(this._el("li", "", fact));
       facts.appendChild(list);
     }
-
-    this._renderProperties(body, data);
   }
 
-  _renderProperties(body, data) {
-    const ws = this.getWorkspace?.();
-    if (!ws || typeof ws.getPart !== "function") return;
-    const part = ws.getPart(this.partId);
-    if (!part) return;
-
-    const section = this._section(body, "Object Properties & Appearance", "section-properties");
-
-    // Transform readouts
-    const tf = (typeof ws.getPartTransform === "function" ? ws.getPartTransform(this.partId) : null) || {
-      offset: { x: 0, y: 0, z: 0 },
-      rotationX: 0,
-      rotationZ: 0,
-      scale: 1
-    };
-    const tfBox = this._el("div", "prop-group");
-    tfBox.innerHTML = `
-      <div class="prop-row">
-        <span class="prop-label">Position</span>
-        <span class="prop-val" id="prop-pos">${tf.offset.x.toFixed(2)}, ${tf.offset.y.toFixed(2)}, ${tf.offset.z.toFixed(2)}</span>
-      </div>
-      <div class="prop-row">
-        <span class="prop-label">Rotation</span>
-        <span class="prop-val" id="prop-rot">${Math.round((tf.rotationZ * 180) / Math.PI)}°, ${Math.round((tf.rotationX * 180) / Math.PI)}°</span>
-      </div>
-      <div class="prop-row">
-        <span class="prop-label">Scale</span>
-        <span class="prop-val" id="prop-scale">${tf.scale.toFixed(2)}×</span>
-      </div>
-    `;
-    section.appendChild(tfBox);
-
-    // Appearance / Material controls
-    const mat = ws.getPartMaterial?.(this.partId) || {
-      color: "#3fd0ff",
-      roughness: 0.4,
-      metalness: 0.4,
-      wireframe: false
-    };
-    const matBox = this._el("div", "prop-group");
-
-    // Wireframe switch
-    const wireLabel = this._el("label", "prop-switch-label");
-    const wireCheck = this._el("input", "prop-switch");
-    wireCheck.type = "checkbox";
-    wireCheck.checked = Boolean(mat.wireframe);
-    wireCheck.addEventListener("change", () => {
-      ws.setPartMaterial?.(this.partId, { wireframe: wireCheck.checked });
-    });
-    wireLabel.appendChild(wireCheck);
-    wireLabel.appendChild(this._el("span", "", " Wireframe rendering"));
-    matBox.appendChild(wireLabel);
-
-    // Color picker & Swatches
-    const colorLabel = this._el("div", "prop-label-sub", "Color & Material Tone");
-    matBox.appendChild(colorLabel);
-
-    const colorRow = this._el("div", "prop-color-row");
-    const colorInput = this._el("input", "prop-color-input");
-    colorInput.type = "color";
-    colorInput.value = mat.color.startsWith("#") ? mat.color : "#3fd0ff";
-    colorInput.title = "Custom color";
-    colorInput.addEventListener("input", () => {
-      ws.setPartMaterial?.(this.partId, { color: colorInput.value });
-    });
-
-    const swatchRow = this._el("div", "prop-swatches");
-    const swatches = [
-      "#3fd0ff", "#10b981", "#a855f7", "#f59e0b",
-      "#ef4444", "#3b82f6", "#f8fafc", "#1e293b"
-    ];
-    for (const hex of swatches) {
-      const sw = this._el("button", "prop-swatch");
-      sw.type = "button";
-      sw.style.backgroundColor = hex;
-      sw.title = hex;
-      sw.addEventListener("click", () => {
-        colorInput.value = hex;
-        ws.setPartMaterial?.(this.partId, { color: hex });
-      });
-      swatchRow.appendChild(sw);
-    }
-    colorRow.appendChild(colorInput);
-    colorRow.appendChild(swatchRow);
-    matBox.appendChild(colorRow);
-
-    // Sliders for Roughness and Metalness
-    const sliderRow = this._el("div", "prop-sliders");
-    sliderRow.innerHTML = `
-      <label class="prop-slider-item">
-        <span>Roughness <b id="prop-rough-val">${mat.roughness.toFixed(2)}</b></span>
-        <input type="range" class="prop-slider-input" id="prop-rough-input" min="0" max="1" step="0.05" value="${mat.roughness}">
-      </label>
-      <label class="prop-slider-item">
-        <span>Metalness <b id="prop-metal-val">${mat.metalness.toFixed(2)}</b></span>
-        <input type="range" class="prop-slider-input" id="prop-metal-input" min="0" max="1" step="0.05" value="${mat.metalness}">
-      </label>
-    `;
-    const roughInput = sliderRow.querySelector("#prop-rough-input");
-    const metalInput = sliderRow.querySelector("#prop-metal-input");
-    const roughVal = sliderRow.querySelector("#prop-rough-val");
-    const metalVal = sliderRow.querySelector("#prop-metal-val");
-
-    roughInput?.addEventListener("input", () => {
-      const val = parseFloat(roughInput.value);
-      if (roughVal) roughVal.textContent = val.toFixed(2);
-      ws.setPartMaterial?.(this.partId, { roughness: val });
-    });
-    metalInput?.addEventListener("input", () => {
-      const val = parseFloat(metalInput.value);
-      if (metalVal) metalVal.textContent = val.toFixed(2);
-      ws.setPartMaterial?.(this.partId, { metalness: val });
-    });
-    matBox.appendChild(sliderRow);
-
-    // Playground Object Specific Action
-    if (part.userData?.isPlaygroundObject) {
-      const pgActions = this._el("div", "prop-actions");
-      const delBtn = this._el("button", "btn btn-danger btn-sm", "Delete 3D Object");
-      delBtn.type = "button";
-      delBtn.addEventListener("click", () => {
-        ws.removePlaygroundObject?.(this.partId);
-      });
-      pgActions.appendChild(delBtn);
-      matBox.appendChild(pgActions);
-    }
-
-    section.appendChild(matBox);
-  }
-
-  updateProperties() {
-    if (!this.partId || this.tab !== "overview") return;
-    const ws = this.getWorkspace();
-    const tf = ws?.getPartTransform(this.partId);
+  /**
+   * Live transform readout for the selected part.
+   *
+   * Ported from main, which rendered position/rotation/scale above the
+   * material controls. Read-only on purpose: gestures and the keyboard own
+   * transforms, and duplicating that as text fields invites the two to
+   * disagree. The values are refreshed by updateProperties().
+   */
+  _renderTransform(body) {
+    const tf = this._currentTransform();
     if (!tf) return;
-    const posEl = this.root.querySelector("#prop-pos");
-    const rotEl = this.root.querySelector("#prop-rot");
-    const scaleEl = this.root.querySelector("#prop-scale");
-    if (posEl) posEl.textContent = `${tf.offset.x.toFixed(2)}, ${tf.offset.y.toFixed(2)}, ${tf.offset.z.toFixed(2)}`;
-    if (rotEl) rotEl.textContent = `${Math.round((tf.rotationZ * 180) / Math.PI)}°, ${Math.round((tf.rotationX * 180) / Math.PI)}°`;
-    if (scaleEl) scaleEl.textContent = `${tf.scale.toFixed(2)}×`;
+
+    const section = this._section(body, "Transform");
+    const grid = this._el("div", "prop-group");
+    const row = (label, value) => {
+      const line = this._el("div", "prop-row");
+      line.appendChild(this._el("span", "prop-label", label));
+      line.appendChild(this._el("span", "prop-val", value));
+      grid.appendChild(line);
+    };
+
+    row("Position", formatVec(tf.position));
+    row("Rotation", `${Math.round(deg(tf.rotationZ))}°, ${Math.round(deg(tf.rotationX))}°, ${Math.round(deg(tf.rotationY))}°`);
+    row("Scale", `${tf.scale.toFixed(2)}×`);
+    section.appendChild(grid);
+  }
+
+  /** Transform of whatever is selected, in a shape both sources share. */
+  _currentTransform() {
+    const playground = this.getPlayground?.();
+    const prop = playground?.selectedId ? playground.byId?.get(playground.selectedId) : null;
+    if (prop) {
+      return {
+        position: prop.group.position,
+        rotationX: prop.group.rotation.x,
+        rotationY: prop.group.rotation.y,
+        rotationZ: prop.group.rotation.z,
+        scale: prop.group.scale.x
+      };
+    }
+
+    const ws = this.getWorkspace?.();
+    if (!ws || !this.partId) return null;
+    const tf = ws.getPartTransform?.(this.partId);
+    if (!tf) return null;
+    return {
+      position: tf.offset,
+      rotationX: tf.rotationX || 0,
+      rotationY: tf.rotationY || 0,
+      rotationZ: tf.rotationZ || 0,
+      scale: tf.scale ?? 1
+    };
+  }
+
+  /**
+   * Live material controls for the selected object.
+   *
+   * Ported from the main branch: colour input, palette swatches, wireframe
+   * switch and roughness/metalness sliders. main applied these only to
+   * documented assembly parts; here the same panel drives a playground object
+   * when one is selected, because that is where users actually edit materials.
+   */
+  _renderMaterials(body) {
+    const ws = this.getWorkspace();
+    if (!ws) return;
+
+    const playground = this.getPlayground?.();
+    const propId = playground?.selectedId;
+    const material = propId
+      ? playground.getMaterial?.(propId)
+      : ws.getPartMaterial?.(this.partId);
+    if (!material) return;
+
+    const section = this._section(body, "Material");
+
+    // ---- colour ---------------------------------------------------------
+    const colourRow = this._el("div", "prop-color-row");
+    const colourInput = this._el("input", "prop-color-input");
+    colourInput.type = "color";
+    colourInput.value = material.color?.startsWith("#") ? material.color : "#3fd0ff";
+    colourInput.title = "Object colour";
+    colourInput.setAttribute("aria-label", "Object colour");
+    colourInput.addEventListener("input", () => {
+      this._applyMaterial({ color: colourInput.value });
+    });
+
+    const swatches = this._el("div", "prop-swatches");
+    for (const [name, hex] of Object.entries(COLOR_PALETTE)) {
+      const swatch = this._el("button", "prop-swatch");
+      swatch.type = "button";
+      swatch.style.background = hex;
+      swatch.title = name;
+      swatch.setAttribute("aria-label", `Colour: ${name}`);
+      swatch.addEventListener("click", () => {
+        colourInput.value = hex;
+        this._applyMaterial({ color: hex });
+      });
+      swatches.appendChild(swatch);
+    }
+    colourRow.append(colourInput, swatches);
+    section.appendChild(colourRow);
+
+    // ---- wireframe ------------------------------------------------------
+    const wireRow = this._el("label", "prop-row prop-switch-label");
+    wireRow.appendChild(this._el("span", "prop-label", "Wireframe"));
+    const wireInput = this._el("input", "");
+    wireInput.type = "checkbox";
+    wireInput.checked = Boolean(material.wireframe);
+    wireInput.addEventListener("change", () => {
+      this._applyMaterial({ wireframe: wireInput.checked });
+    });
+    wireRow.appendChild(wireInput);
+    section.appendChild(wireRow);
+
+    // ---- roughness / metalness ------------------------------------------
+    const sliders = this._el("div", "prop-sliders");
+    const addSlider = (label, key, value) => {
+      const item = this._el("div", "prop-slider-item");
+      const labelRow = this._el("div", "prop-row");
+      labelRow.appendChild(this._el("span", "prop-label", label));
+      const readout = this._el("span", "prop-val", Number(value).toFixed(2));
+      labelRow.appendChild(readout);
+
+      const input = this._el("input", "prop-slider-input");
+      input.type = "range";
+      input.min = "0";
+      input.max = "1";
+      input.step = "0.01";
+      input.value = String(value);
+      input.setAttribute("aria-label", label);
+      input.addEventListener("input", () => {
+        readout.textContent = Number(input.value).toFixed(2);
+        this._applyMaterial({ [key]: Number(input.value) });
+      });
+
+      item.append(labelRow, input);
+      sliders.appendChild(item);
+    };
+    addSlider("Roughness", "roughness", material.roughness);
+    addSlider("Metalness", "metalness", material.metalness);
+    section.appendChild(sliders);
+  }
+
+  /** The material of whatever is currently selected, or null. */
+  _currentMaterial() {
+    const playground = this.getPlayground?.();
+    const propId = playground?.selectedId;
+    if (propId) return playground.getMaterial?.(propId) || null;
+    if (!this.partId) return null;
+    return this.getWorkspace()?.getPartMaterial?.(this.partId) || null;
+  }
+
+  /** Route a material change to whichever thing is actually selected. */
+  _applyMaterial(options) {
+    const playground = this.getPlayground?.();
+    const propId = playground?.selectedId;
+    if (propId && playground.setMaterial?.(propId, options)) return true;
+    if (this.partId) return Boolean(this.getWorkspace()?.setPartMaterial?.(this.partId, options));
+    return false;
   }
 
   _renderSystem(body, data) {

@@ -1983,6 +1983,234 @@ if (typeof globalThis.ProgressEvent === "undefined") {
   ws.dispose();
 }
 
+section("16 · Playground: primitives, duplication, deletion, animation");
+
+{
+  const THREE = await import("three");
+  const { Playground, PRIMITIVES } = await import("../playground.js");
+
+  const scene = new THREE.Scene();
+  const pg = new Playground({ scene });
+
+  check("every advertised primitive can be spawned",
+    PRIMITIVES.every(p => { pg.addPrimitive(p.id); return true; }) && pg.props.length === PRIMITIVES.length,
+    `${pg.props.length} of ${PRIMITIVES.length}`);
+
+  // Each spawned object must be real geometry, not an empty group.
+  let meshes = 0;
+  let triangles = 0;
+  pg.group.traverse(o => {
+    if (!o.isMesh) return;
+    meshes++;
+    const g = o.geometry;
+    triangles += (g.index ? g.index.count : g.attributes.position.count) / 3;
+  });
+  check("spawned objects contain meshes", meshes === PRIMITIVES.length, `${meshes}`);
+  check("spawned objects contain real geometry", triangles > 1000, `${Math.round(triangles)} triangles`);
+  check("the playground group is attached to the scene", pg.group.parent === scene);
+
+  // Spawning selects the new object.
+  const last = pg.props[pg.props.length - 1];
+  check("the newest object becomes the selection", pg.selectedId === last.id, pg.selectedId);
+
+  // Duplication produces an independent object, offset so it is visible.
+  const source = pg.props[1];
+  pg.select(source.id);
+  const copy = pg.duplicate();
+  check("duplicate adds an object", pg.props.length === PRIMITIVES.length + 1);
+  check("the copy is a different object", copy.id !== source.id);
+  check("the copy is offset from the original",
+    copy.group.position.distanceTo(source.group.position) > 0.2,
+    copy.group.position.distanceTo(source.group.position).toFixed(2));
+  check("the copy has its own material",
+    copy.object.material !== source.object.material);
+
+  // Deletion removes it from the scene graph, not just the list.
+  const copyId = copy.id;
+  check("delete succeeds", pg.remove(copyId) === true);
+  check("the deleted object is gone from the list",
+    pg.props.length === PRIMITIVES.length);
+  check("the deleted object is gone from the scene graph",
+    !pg.group.children.some(c => c.userData.propId === copyId));
+  check("the deleted object cannot be resolved", pg.byId.get(copyId) === undefined);
+
+  // Transforms round-trip.
+  const target = pg.props[0];
+  pg.setTransform(target.id, { position: { x: 1, y: 2, z: 3 }, rotationY: 0.5, scale: 1.5 });
+  const t = pg.getTransform(target.id);
+  check("position round-trips", t.position.x === 1 && t.position.y === 2 && t.position.z === 3);
+  check("rotation round-trips", Math.abs(t.rotationY - 0.5) < 1e-6);
+  check("scale round-trips", t.scale === 1.5);
+  check("an unknown id is rejected", pg.setTransform("nope", { scale: 2 }) === false);
+
+  // Selection changes are reported, so the HUD and outliner stay in sync.
+  let selectedEvents = 0;
+  const pg2 = new Playground({ scene, onSelect: id => { if (id) selectedEvents++; } });
+  pg2.addPrimitive("cube");
+  pg2.addPrimitive("sphere");
+  check("selection changes are reported", selectedEvents === 2, `${selectedEvents}`);
+
+  // update() must not throw with or without mixers.
+  pg.update(0.016);
+  check("the playground ticks", true);
+
+  pg.dispose();
+  pg2.dispose();
+}
+
+section("17 · Playground objects are the gesture target");
+
+{
+  const THREE = await import("three");
+  const { Playground } = await import("../playground.js");
+  const scene = new THREE.Scene();
+  const pg = new Playground({ scene });
+  pg.addPrimitive("cube");
+
+  // A ray straight down -Z at the object should hit it.
+  const camera = new THREE.PerspectiveCamera(42, 1.6, 0.1, 200);
+  camera.position.set(0, 0, 6);
+  camera.lookAt(0, 0, 0);
+  camera.updateMatrixWorld(true);
+
+  const prop = pg.props[0];
+  prop.group.position.set(0, 0, 0);
+  prop.group.rotation.set(0, 0, 0);
+  prop.group.updateMatrixWorld(true);
+
+  const hit = pg.pick({ x: 0, y: 0 }, camera);
+  check("a centred ray hits the object", hit === prop.id, String(hit));
+
+  const miss = pg.pick({ x: 0.95, y: 0.95 }, camera);
+  check("a corner ray misses it", miss === null, String(miss));
+
+  // An empty playground must not throw when picked at.
+  const empty = new Playground({ scene });
+  check("picking an empty playground returns null",
+    empty.pick({ x: 0, y: 0 }, camera) === null);
+  empty.dispose();
+  pg.dispose();
+}
+
+section("18 · Voice command grammar");
+
+{
+  const { parseCommand, commandExamples, VoiceControl, VOICE_STATUS } =
+    await import("../voiceControl.js");
+
+  const cases = [
+    ["add a cube", "add:cube"],
+    ["spawn a sphere", "add:sphere"],
+    ["add another torus", "add:torus"],
+    ["move mode", "mode:move"],
+    ["let's rotate", "mode:rotate"],
+    ["scale mode", "mode:scale"],
+    ["explode mode", "mode:explode"],
+    ["select mode", "mode:select"],
+    ["duplicate that", "object:duplicate"],
+    ["delete this", "object:delete"],
+    ["make it bigger", "transform:scaleUp"],
+    ["make it smaller", "transform:scaleDown"],
+    ["move it up", "transform:up"],
+    ["select the cube", "select:cube"],
+    ["grab the sphere", "select:sphere"],
+    ["select mode", "mode:select"],
+    ["next object", "object:next"],
+    ["previous object", "object:prev"],
+    ["reset everything", "env:reset"],
+    ["reset", "transform:reset"],
+    ["play the animation", "anim:play"],
+    ["next animation", "anim:next"],
+    ["load the robot", "model:robotArm"],
+    ["show me the turbojet", "model:turbojet"],
+    ["help", "env:help"]
+  ];
+
+  for (const [phrase, expected] of cases) {
+    const got = parseCommand(phrase)?.intent ?? null;
+    check(`voice: "${phrase}"`, got === expected, `${got} (expected ${expected})`);
+  }
+
+  check("unrecognised speech produces no intent",
+    parseCommand("what a lovely afternoon") === null);
+  check("empty speech produces no intent", parseCommand("   ") === null);
+  check("punctuation does not break matching",
+    parseCommand("Add, a Cube!")?.intent === "add:cube");
+  check("the grammar advertises its commands", commandExamples().length > 20,
+    `${commandExamples().length} examples`);
+
+  // Without a speech engine the layer must be honest, not silently broken.
+  const silent = new VoiceControl({ onCommand() {}, onState() {} });
+  check("an unsupported browser is reported as unsupported",
+    silent.supported === false && silent.status === VOICE_STATUS.UNSUPPORTED);
+  check("an unsupported browser explains why",
+    /speech recognition/i.test(silent.error || ""), silent.error);
+  check("start() fails cleanly without an engine", silent.start() === false);
+
+  // submitText exercises the same parser the recogniser uses.
+  let fired = null;
+  const manual = new VoiceControl({
+    onCommand: (intent) => { fired = intent; },
+    onState() {}
+  });
+  manual.submitText("add a sphere");
+  check("text submission fires the same intent path", fired === "add:sphere", fired);
+}
+
+section("19 · Scene-space hand skeletons");
+
+{
+  const THREE = await import("three");
+  const { HandSkeleton3D, landmarkToWorld } = await import("../handSkeleton3d.js");
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(42, 16 / 9, 0.1, 200);
+  camera.position.set(0, 0, 0);
+  camera.updateMatrixWorld(true);
+
+  // Mirroring must flip x exactly once, or the 3D hands and the 2D pointer
+  // would disagree about which side of the screen a hand is on.
+  const mirrored = landmarkToWorld({ x: 0.25, y: 0.5 }, camera, { mirror: true });
+  const plain = landmarkToWorld({ x: 0.25, y: 0.5 }, camera, { mirror: false });
+  check("a mirrored landmark lands on the opposite side",
+    Math.sign(mirrored.x) === -Math.sign(plain.x), `${mirrored.x.toFixed(2)} vs ${plain.x.toFixed(2)}`);
+  check("the hand sits in front of the camera", mirrored.z < 0, mirrored.z.toFixed(2));
+
+  const skeleton = new HandSkeleton3D({ scene, camera, mirror: true });
+  check("the skeleton attaches to the scene", skeleton.root.parent === scene);
+
+  const normalised = Array.from({ length: 21 }, () => ({ x: 0.4, y: 0.6, z: 0 }));
+  const metric = Array.from({ length: 21 }, (_, i) => ({ x: i * 0.01, y: i * 0.02, z: 0 }));
+
+  skeleton.update([normalised], [metric], ["Right"], { pinched: [true], activity: [1] });
+  check("one hand produces one rig", skeleton.rigs.size === 1, `${skeleton.rigs.size}`);
+
+  const rig = [...skeleton.rigs.values()][0];
+  check("all 21 joints exist", rig.joints.length === 21);
+  check("all 21 bones exist", rig.bones.length === 21);
+  check("all joints are visible", rig.joints.filter(j => j.visible).length === 21);
+  check("all bones are visible", rig.bones.filter(b => b.visible).length === 21);
+  check("joints have real geometry", rig.joints[0].geometry.attributes.position.count > 0);
+
+  // Two hands produce two rigs, and they must not overlap.
+  skeleton.update([normalised, normalised], [metric, metric], ["Right", "Left"], {});
+  check("two hands produce two rigs", skeleton.rigs.size === 2, `${skeleton.rigs.size}`);
+
+  // A hand leaving the frame hides its rig rather than deleting it.
+  skeleton.update([normalised], [metric], ["Right"], {});
+  const visible = [...skeleton.rigs.values()].filter(r => r.visible).length;
+  check("a hand leaving the frame hides one rig", visible === 1, `${visible}`);
+  check("hidden rigs are kept so hands do not pop", skeleton.rigs.size === 2);
+
+  // Hiding the whole layer must actually hide it.
+  skeleton.setVisible(false);
+  check("the skeleton layer can be hidden", skeleton.root.visible === false);
+  skeleton.setVisible(true);
+
+  skeleton.dispose();
+  check("dispose detaches the layer", skeleton.root.parent === null);
+}
+
 /* ------------------------------------------------------------------------- */
 /* SUMMARY                                                                  */
 /* ------------------------------------------------------------------------- */

@@ -45,11 +45,6 @@
         <span class="dot dot-off" id="camera-dot"></span>
         <span id="camera-toggle-label">Enable camera</span>
       </button>
-      <button class="chip-btn" id="voice-toggle" data-role="voice-toggle" title="Toggle voice commands (M)" autocomplete="off">
-        <span class="dot dot-off" id="voice-dot"></span>
-        <svg class="mic-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1a2.5 2.5 0 0 0-2.5 2.5v5a2.5 2.5 0 0 0 5 0v-5A2.5 2.5 0 0 0 8 1z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3.5 6.5A4.5 4.5 0 0 0 8 11a4.5 4.5 0 0 0 4.5-4.5M8 11v3.5M5.5 14.5h5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-        <span id="voice-toggle-label">Voice control</span>
-      </button>
       <button class="chip-btn" id="layout-toggle" title="Toggle panels (L)">
         <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1" y="2.5" width="4" height="11" rx="1"/><rect x="6.5" y="2.5" width="8.5" height="11" rx="1" opacity="0.45"/></svg>
         Panels
@@ -59,7 +54,6 @@
     <div class="topbar-right">
       <div class="status-pills">
         <span class="pill" id="pill-camera"><i class="pill-dot"></i><span>CAMERA OFF</span></span>
-        <span class="pill" id="pill-voice"><i class="pill-dot"></i><span>VOICE OFF</span></span>
         <span class="pill" id="pill-hands"><i class="pill-dot"></i><span>0 HANDS</span></span>
         <span class="pill" id="pill-gesture"><i class="pill-dot"></i><span>IDLE</span></span>
       </div>
@@ -87,6 +81,18 @@
   <!-- ===================== WORKSPACE ===================== -->
   <main class="workspace" id="workspace">
 
+    <!-- Drawer toggles: always reachable, even with both drawers closed. -->
+    <button class="drawer-toggle drawer-toggle-left" id="drawer-toggle-left"
+            aria-label="Open model library" aria-expanded="false">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"/></svg>
+      LIBRARY
+    </button>
+    <button class="drawer-toggle drawer-toggle-right" id="drawer-toggle-right"
+            aria-label="Open properties" aria-expanded="false">
+      PROPERTIES
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"/></svg>
+    </button>
+
     <!-- ---------- LEFT: MODEL LIBRARY ---------- -->
     <aside class="panel panel-left" id="panel-left" aria-label="Model library">
       <div class="panel-head">
@@ -97,8 +103,31 @@
       </div>
 
       <div class="library-scroll">
-        <div class="category-row" id="category-row" role="tablist" aria-label="Model categories"></div>
-        <div class="model-list" id="model-list"></div>
+        <div class="panel-section panel-section-first">
+          <div class="panel-section-head">
+            <span>PRIMITIVES</span>
+            <span class="count-badge" id="primitive-count">7</span>
+          </div>
+          <div class="primitive-grid" id="primitive-grid" role="group" aria-label="Add a primitive"></div>
+          <button class="tool-btn wide-btn" id="library-import">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 11V3M5 6l3-3 3 3M3 12.5V13h10v-.5"/></svg>
+            Import GLB / GLTF
+          </button>
+          <!-- Clear-all, ported from main's playground grid. -->
+          <button class="tool-btn wide-btn" id="playground-clear"
+                  title="Remove every added object">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6 4.5V3h4v1.5M4.5 4.5v9h7v-9"/></svg>
+            Clear objects
+          </button>
+        </div>
+
+        <div class="panel-section">
+          <div class="panel-section-head">
+            <span>ENGINEERING MODELS</span>
+          </div>
+          <div class="category-row" id="category-row" role="tablist" aria-label="Model categories"></div>
+          <div class="model-list" id="model-list"></div>
+        </div>
 
         <div class="panel-section">
           <div class="panel-section-head">
@@ -106,39 +135,6 @@
             <span class="count-badge" id="part-count">—</span>
           </div>
           <div class="part-list" id="part-list"></div>
-        </div>
-
-        <div class="panel-section">
-          <div class="panel-section-head">
-            <span>ADD 3D OBJECTS</span>
-            <span class="count-badge" id="playground-count">0</span>
-          </div>
-          <div class="scene-controls playground-grid">
-            <button class="tool-btn" id="pg-add-cube" title="Spawn interactive 3D Cube">
-              <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="1.5"/></svg>
-              Cube
-            </button>
-            <button class="tool-btn" id="pg-add-sphere" title="Spawn interactive 3D Sphere">
-              <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/></svg>
-              Sphere
-            </button>
-            <button class="tool-btn" id="pg-add-cylinder" title="Spawn interactive 3D Cylinder">
-              <svg viewBox="0 0 16 16" aria-hidden="true"><ellipse cx="8" cy="4" rx="4.5" ry="2"/><path d="M3.5 4v8c0 1.1 2 2 4.5 2s4.5-.9 4.5-2V4"/></svg>
-              Cylinder
-            </button>
-            <button class="tool-btn" id="pg-add-torus" title="Spawn interactive 3D Torus">
-              <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/><circle cx="8" cy="8" r="2.2"/></svg>
-              Torus
-            </button>
-            <button class="tool-btn" id="pg-add-cone" title="Spawn interactive 3D Cone">
-              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5 3 13.5h10L8 2.5z"/></svg>
-              Cone
-            </button>
-            <button class="tool-btn" id="pg-clear" title="Clear all added objects">
-              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6 4.5V3h4v1.5M4.5 4.5v9h7v-9"/></svg>
-              Clear
-            </button>
-          </div>
         </div>
 
         <div class="panel-section">
@@ -225,6 +221,17 @@
           <div class="hud-stat"><span id="hud-fps">—</span><small>FPS</small></div>
           <div class="hud-stat"><span id="hud-tris">—</span><small>TRIS</small></div>
           <div class="hud-stat"><span id="hud-hands">0</span><small>HANDS</small></div>
+          <div class="hud-stat"><span id="hud-objects">0</span><small>OBJECTS</small></div>
+          <div class="hud-stat"><span id="hud-gesture">—</span><small>GESTURE</small></div>
+          <div class="hud-stat"><span id="hud-object-name">—</span><small>TARGET</small></div>
+        </div>
+
+        <!-- Voice status: what was heard, and whether we are listening. -->
+        <div class="voice-chip" id="voice-chip">
+          <span class="voice-dot"></span>
+          <span class="voice-label">VOICE</span>
+          <span class="voice-state" id="voice-state">OFF</span>
+          <span class="voice-phrase" id="voice-phrase"></span>
         </div>
 
         <!-- Aiming reticle projected from the index fingertip -->
@@ -232,13 +239,6 @@
           <span class="reticle-ring"></span>
           <span class="reticle-dot"></span>
           <span class="reticle-label" id="reticle-label"></span>
-        </div>
-
-        <!-- Voice Command Live HUD Banner -->
-        <div class="voice-hud" id="voice-hud" aria-live="polite" hidden>
-          <span class="voice-hud-mic" id="voice-hud-mic">🎤</span>
-          <span class="voice-hud-text" id="voice-hud-text">Voice ready</span>
-          <span class="voice-hud-badge" id="voice-hud-badge">SAY A COMMAND</span>
         </div>
 
         <!-- Click-to-select hint shown when nothing has been selected yet -->
@@ -268,6 +268,41 @@
             <dt>RENDER LOOP</dt><dd id="diag-loop">—</dd>
             <dt>WEBGL ERRORS</dt><dd id="diag-errors">—</dd>
           </dl>
+        </div>
+
+        <!-- Floating stage toolbar -->
+        <div class="stage-toolbar" id="stage-toolbar" role="toolbar" aria-label="Stage tools">
+          <button class="mini-btn" id="stage-add-object" title="Add a 3D primitive (or press A)"
+                  aria-label="Add object">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10"/></svg>
+          </button>
+          <button class="mini-btn" id="stage-duplicate" title="Duplicate selection"
+                  aria-label="Duplicate selection">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="2.5" width="8" height="8" rx="1.5"/><path d="M10.5 10.5v1a1.5 1.5 0 0 1-1.5 1.5H4a1.5 1.5 0 0 1-1.5-1.5V6A1.5 1.5 0 0 1 4 4.5h1"/></svg>
+          </button>
+          <button class="mini-btn" id="stage-delete" title="Delete selection"
+                  aria-label="Delete selection">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 4.5h9M6.5 4.5V3h3v1.5M5 4.5l.6 8h4.8l.6-8"/></svg>
+          </button>
+          <span class="tool-sep"></span>
+          <button class="mini-btn" id="stage-voice" title="Voice commands (or press V)"
+                  aria-label="Toggle voice commands" aria-pressed="false">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="6" y="2" width="4" height="7" rx="2"/><path d="M4 8a4 4 0 0 0 8 0M8 12v2"/></svg>
+          </button>
+          <span class="tool-sep"></span>
+          <button class="mini-btn" id="stage-reset" title="Reset the environment (or press R)"
+                  aria-label="Reset environment">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8a5 5 0 1 0 1.6-3.7"/><path d="M3 3v3h3"/></svg>
+          </button>
+        </div>
+
+        <!-- Keyboard hints, hidden while interacting -->
+        <div class="stage-keys" id="stage-keys" aria-hidden="true">
+          <span class="k"><span class="kbd">1-5</span> mode</span>
+          <span class="k"><span class="kbd">N</span> add</span>
+          <span class="k"><span class="kbd">M</span> voice</span>
+          <span class="k"><span class="kbd">L</span> library</span>
+          <span class="k"><span class="kbd">P</span> properties</span>
         </div>
 
         <!-- Interaction mode bar -->
@@ -357,6 +392,12 @@
       </div>
 
       <div class="right-pane" id="pane-inspector">
+        <!-- Scene outliner: every object in the playground, with animation
+             clip pickers for imported GLTF models. -->
+        <section class="outliner" aria-label="Scene objects">
+          <h3 class="outliner-title">SCENE</h3>
+          <div class="outliner-list" id="scene-outliner"></div>
+        </section>
         <div class="inspector-scroll" id="inspector-root"></div>
       </div>
 
@@ -386,10 +427,6 @@
     <div class="status-item">
       <span class="status-key">CAM</span>
       <span class="status-val" id="status-camera">Inactive</span>
-    </div>
-    <div class="status-item">
-      <span class="status-key">VOICE</span>
-      <span class="status-val" id="status-voice">Inactive</span>
     </div>
     <div class="status-item">
       <span class="status-key">HANDS</span>
@@ -459,6 +496,14 @@
         <label class="switch-field">
           <span>Camera fills workspace</span>
           <input type="checkbox" id="set-workspace-view">
+        </label>
+        <label class="switch-field">
+          <span>Voice commands</span>
+          <input type="checkbox" id="set-voice-enabled">
+        </label>
+        <label class="switch-field">
+          <span>Audio cues</span>
+          <input type="checkbox" id="set-sound-effects">
         </label>
         <label class="field">
           <span>Camera dimming <b id="val-scrim">0</b></span>
@@ -552,18 +597,6 @@
       </section>
 
       <section class="settings-group">
-        <h3>Voice & Audio</h3>
-        <label class="switch-field">
-          <span>Enable voice commands</span>
-          <input type="checkbox" id="set-voice-enabled">
-        </label>
-        <label class="switch-field">
-          <span>Audio feedback chimes</span>
-          <input type="checkbox" id="set-sound-effects">
-        </label>
-      </section>
-
-      <section class="settings-group">
         <h3>Calibration & reset</h3>
         <p class="settings-note">
           Calibration re-arms the gesture engine: it forgets any held grab, resets the
@@ -592,7 +625,6 @@
           <span><kbd>Q</kbd>/<kbd>W</kbd> depth</span>
           <span><kbd>1</kbd>–<kbd>5</kbd> mode</span>
           <span><kbd>V</kbd> camera view</span>
-          <span><kbd>M</kbd> voice</span>
           <span><kbd>Z</kbd>/<kbd>X</kbd> roll</span>
           <span><kbd>?</kbd> guide</span>
         </div>
@@ -647,14 +679,6 @@
              0–100%. Every component keeps its own highlight, so you can select
              individual parts mid-explosion and inspect its specification, connections
              and failure behaviour.</p>
-        </article>
-        <article>
-          <h3>5 · Speak to command</h3>
-          <p>Press <kbd>M</kbd> or click <em>Voice control</em>. You can say:
-             <b>"select"</b>, <b>"move"</b>, <b>"rotate"</b>, <b>"scale"</b>, <b>"explode"</b> to switch modes;
-             <b>"add cube"</b>, <b>"add sphere"</b>, <b>"add cylinder"</b>, <b>"add torus"</b>, <b>"add cone"</b> to spawn 3D objects;
-             <b>"color red"</b>, <b>"color cyan"</b>, <b>"wireframe"</b>, <b>"solid"</b> to style objects; and
-             <b>"reset"</b>, <b>"grid"</b>, <b>"shadows"</b>, <b>"orbit"</b> to control your environment.</p>
         </article>
       </div>
       <div class="help-tip">

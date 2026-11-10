@@ -134,24 +134,24 @@ The hand skeleton is drawn over the feed the whole time you are interacting: 21 
 joints per hand in cyan, with fingertips enlarged, a glowing index pointer and a pinch ring
 that closes as thumb and index meet.
 
-### Voice commands
+### Voice
 
-Press <kbd>M</kbd> or click **Voice control** in the top bar. Built on the browser's native
-Web Speech API (`SpeechRecognition`), HOLOCORE provides continuous hands-free voice control
-with synthesized audio feedback chimes via the Web Audio API:
+Press <kbd>M</kbd> or click the microphone in the stage toolbar. Built on the browser's native
+Web Speech API, with synthesised audio cues via the Web Audio API, so commands work alongside
+your hands rather than instead of them:
 
-- **Mode switching:** *"select"*, *"move"*, *"drag"*, *"rotate"*, *"spin"*, *"scale"*, *"explode"*, *"assemble"*
-- **3D Playground shapes:** *"add cube"*, *"add sphere"*, *"add cylinder"*, *"add torus"*, *"add cone"*, *"clear objects"*, *"delete"*
-- **Object styling:** *"wireframe"*, *"solid"*, *"color red"*, *"color blue"*, *"color cyan"*, *"color gold"*, *"color green"*, *"color white"*
-- **View & Environment:** *"reset view"*, *"camera"*, *"switch view"*, *"grid"*, *"shadows"*, *"orbit"*, *"focus"*, *"isolate"*
-- **Assemblies:** *"load rocket"*, *"load turbojet"*, *"load engine"*, *"load robot"*, *"load pcb"*, *"load cpu"*, *"load turbine"*
+- **Modes:** *"select"*, *"move"*, *"drag"*, *"rotate"*, *"scale"*, *"explode"*, *"assemble"*
+- **Objects:** *"add cube"*, *"add sphere"*, *"add cylinder"*, *"add torus"*, *"add cone"*,
+  *"duplicate"*, *"delete"*, *"clear objects"*
+- **Appearance:** *"wireframe"*, *"solid"*, *"make it matte"*, *"make it metallic"*,
+  *"color red"*, *"color cyan"*, *"color gold"*, *"color purple"*
+- **View:** *"grid"*, *"shadows"*, *"orbit"*, *"focus"*, *"isolate"*, *"deselect"*,
+  *"fullscreen"*, *"reset everything"*
+- **Assemblies:** *"load turbojet"*, *"load turbine"*, *"load the robot"*, and the rest
 
-### 3D Playground & Object properties
+Voice and audio can both be switched off in settings; the choices persist.
 
-The workspace supports both parametric engineering cutaways and an interactive **3D Playground**:
-- **Interactive shapes:** Spawn cubes, spheres, cylinders, tori and cones from the left panel or via voice.
-- **Drag-and-drop import:** Drop any `.glb` or `.gltf` model straight into the 3D viewport.
-- **Object properties:** The right inspector panel exposes live position, rotation and scale readouts, wireframe toggles, color pickers with swatches, and PBR roughness/metalness sliders. Changes made with your hands reflect in the inspector in real-time, and inspector sliders immediately manipulate the 3D object.
+Every command changes one thing. A pinch does exactly one thing, decided by the selected mode.
 
 ### Keyboard
 
@@ -187,8 +187,11 @@ modelManager.js     the 3D workspace: renderer, controls, parts, selection, expl
 modelFactory.js     procedural geometry for the eight assemblies
 engineeringData.js  the knowledge base (8 models, 80 parts)
 gestures.js         landmark analysis, filters, mode-gated manipulation solver
+voiceControl.js     Web Speech API recognition and the command grammar
+chimes.js           synthesised audio cues (Web Audio, no assets)
+playground.js       spawnable primitives, GLB import, selection
+handSkeleton3d.js   the scene-space 3D hand rig
 interactionModes.js the five modes: colour, gesture instruction, intent allow-list
-voiceControl.js     Web Speech API recognition + synthesized audio chimes
 handGeometry.js     cover-fit inverse mapping — landmarks to stage, NDC and pixels
 handTracking.js     camera lifecycle, MediaPipe wrapper
 componentInspector.js  the right-hand inspector

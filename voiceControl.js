@@ -1,458 +1,347 @@
 /**
  * HOLOCORE — voiceControl.js
  * -----------------------------------------------------------------------------
- * Real-time voice command engine powered by the Web Speech API (SpeechRecognition).
+ * Real voice commands via the Web Speech API (`SpeechRecognition` /
+ * `webkitSpeechRecognition`), with a written command grammar and a
+ * no-speech-engine fallback that is honest about being unavailable.
  *
- * Provides hands-free interaction with the 3D workspace while gesturing:
- *   - Mode switching: "select", "move", "rotate", "scale", "explode", "assemble"
- *   - 3D playground objects: "add cube", "add sphere", "add cylinder", "add torus", "add cone", "delete"
- *   - Object styling: "color [red/blue/green/gold/cyan/purple/white/dark]", "wireframe", "solid"
- *   - Environment: "reset view", "camera", "grid", "shadows", "auto rotate", "isolate", "focus"
- *   - Model loading: "load rocket", "load turbojet", "load engine", "load robot", etc.
+ * DESIGN NOTES
  *
- * Includes low-latency synthesized audio feedback via Web Audio API.
+ * - Speech recognition is *on-device in the browser* where supported (Chrome
+ *   uses Google's service; that is the browser's decision, not ours). No API
+ *   key, no paid service, no audio ever leaves the page through our code.
+ * - Recognition runs continuously with interim results, so "grab" can fire the
+ *   moment it is heard rather than waiting for the end of an utterance.
+ * - Commands map to *intents*, and the caller decides what an intent means. The
+ *   module therefore has no dependency on Three.js or the DOM.
+ * - Every failure path reports a specific reason, because "voice doesn't work"
+ *   is useless when the cause is an unsupported browser or a denied mic.
  */
+
+/**
+ * Named colours for the "color …" voice command and the inspector swatches.
+ * Ported from the main branch so voice, swatches and the colour input all agree.
+ */
+export const COLOR_PALETTE = {
+  red: "#ef4444",
+  orange: "#f97316",
+  gold: "#eab308",
+  green: "#22c55e",
+  cyan: "#06b6d4",
+  blue: "#3b82f6",
+  purple: "#a855f7",
+  pink: "#ec4899",
+  white: "#f8fafc",
+  dark: "#1e293b"
+};
+
+/** Command grammar: each entry is [patterns, intent, example]. */
+const COMMAND_TABLE = [
+  // ---- pick a specific object (before the mode verbs, so "select the cube"
+  // selects the cube instead of switching to SELECT mode) --------------------
+  [/\b(select|grab|pick|choose)\b.*\b(cube|box)\b/, "select:cube", "select the cube"],
+  [/\b(select|grab|pick|choose)\b.*\b(sphere|ball|orb)\b/, "select:sphere", "select the sphere"],
+  [/\b(select|grab|pick|choose)\b.*\b(cylinder|tube)\b/, "select:cylinder", "select the cylinder"],
+  [/\b(select|grab|pick|choose)\b.*\b(cone)\b/, "select:cone", "select the cone"],
+  [/\b(select|grab|pick|choose)\b.*\b(torus|donut|ring)\b/, "select:torus", "select the torus"],
+  [/\b(select|grab|pick|choose)\b.*\b(knot)\b/, "select:torusKnot", "select the knot"],
+  [/\b(select|grab|pick|choose)\b.*\b(crystal|gem|icosahedron)\b/, "select:icosahedron", "select the crystal"],
+
+
+  // A numeric amount and "assemble" must come before the mode verbs: the
+  // explode mode rule would otherwise swallow "explode 40 percent".
+  [/\b(explode|disassemble|separate)\b.*?\b(\d{1,3})\s*(percent|%)/, "explode", "explode 40 percent"],
+  [/\b(assemble|collapse|put together|reassemble)\b/, "transform:assemble", "assemble"],
+
+  // ---- modes -------------------------------------------------------------
+  // "select" only means SELECT mode when it is not naming an object to pick.
+  [/\b(select|selection|inspect)\b(?!\s+(?:the\s+|a\s+|an\s+|my\s+)?(?:cube|box|sphere|ball|orb|cylinder|tube|cone|torus|donut|ring|knot|crystal|gem|icosahedron)\b)/, "mode:select", "select mode"],
+  [/\b(move|translate|drag)\b(?!\s+(it|the object|this|that)?\s*(up|down|left|right|forward|back))\s*(mode)?\b/, "mode:move", "move mode"],
+  [/\b(rotate|rotation|spin|turn)\s*(mode)?\b/, "mode:rotate", "rotate mode"],
+  [/\b(scale|resize)\s*(mode)?\b(?!.*\b(bigger|smaller|up|down)\b)/, "mode:scale", "scale mode"],
+  [/\b(explode|explosion|separate)\s*(mode)?\b/, "mode:explode", "explode mode"],
+
+  // ---- objects -----------------------------------------------------------
+  [/\b(add|create|spawn|new)\b.*\b(cube|box)\b/, "add:cube", "add cube"],
+  [/\b(add|create|spawn|new)\b.*\b(sphere|ball|orb)\b/, "add:sphere", "add sphere"],
+  [/\b(add|create|spawn|new)\b.*\b(cylinder|tube)\b/, "add:cylinder", "add cylinder"],
+  [/\b(add|create|spawn|new)\b.*\b(cone)\b/, "add:cone", "add cone"],
+  [/\b(add|create|spawn|new)\b.*\b(torus|donut|ring)\b/, "add:torus", "add torus"],
+  [/\b(add|create|spawn|new)\b.*\b(knot)\b/, "add:torusKnot", "add knot"],
+  [/\b(add|create|spawn|new)\b.*\b(crystal|gem|icosahedron)\b/, "add:icosahedron", "add crystal"],
+
+  [/\b(next)\b.*\bobject\b/, "object:next", "next object"],
+  [/\b(previous|prev|last)\b.*\bobject\b/, "object:prev", "previous object"],
+
+  [/\b(duplicate|copy|clone)\b/, "object:duplicate", "duplicate"],
+  [/\b(delete|remove|destroy)\b/, "object:delete", "delete"],
+  [/\b(clear|empty)\b.*\b(scene|stage|objects)\b/, "object:clear", "clear the scene"],
+
+  // ---- environment (before the generic transform verbs, so "reset
+  // everything" is not swallowed by "reset") ------------------------------
+  [/\b(reset|clear)\b.*\b(everything|all|stage|scene|environment|view)\b/, "env:reset", "reset everything"],
+  [/\b(camera|webcam)\b.*\b(on|start|enable)\b/, "env:cameraOn", "camera on"],
+  [/\b(camera|webcam)\b.*\b(off|stop|disable)\b/, "env:cameraOff", "camera off"],
+  [/\b(help|commands|what can i say)\b/, "env:help", "help"],
+
+  // ---- transformations ---------------------------------------------------
+  [/\b(reset|recenter|centre|center)\b/, "transform:reset", "reset"],
+  [/\b(bigger|larger|grow|increase)\b/, "transform:scaleUp", "bigger"],
+  [/\b(smaller|shrink|decrease|reduce)\b/, "transform:scaleDown", "smaller"],
+  [/\b(up|raise|lift)\b/, "transform:up", "up"],
+  [/\b(down|lower)\b/, "transform:down", "down"],
+  [/\b(left)\b/, "transform:left", "left"],
+  [/\b(right)\b/, "transform:right", "right"],
+  [/\b(forward|closer|near)\b/, "transform:forward", "forward"],
+  [/\b(back|backward|further|away)\b/, "transform:back", "back"],
+  [/\b(reset|recenter|centre|center)\b/, "transform:reset", "reset"],
+
+  // ---- material / colour (ported from the main branch) -------------------
+  // A colour name only counts as a command when the user says what to do with
+  // it, so "make it red" is a colour but a stray "red" in other speech is not.
+  [/\b(color|colour|paint|make|turn)\b.*\b(red|crimson)\b/, "color:red", "color red"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(orange|amber)\b/, "color:orange", "color orange"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(gold|yellow)\b/, "color:gold", "color gold"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(green|emerald)\b/, "color:green", "color green"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(cyan|teal)\b/, "color:cyan", "color cyan"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(blue|azure)\b/, "color:blue", "color blue"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(purple|violet)\b/, "color:purple", "color purple"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(pink|rose)\b/, "color:pink", "color pink"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(white|silver)\b/, "color:white", "color white"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(dark|graphite|black)\b/, "color:dark", "color dark"],
+  [/\b(wireframe|wire frame)\b/, "material:wireframe", "wireframe"],
+  [/\b(solid|shaded)\b/, "material:solid", "solid"],
+  [/\b(rough|matt|matte)\b/, "material:rough", "make it matte"],
+  [/\b(shine|shiny|metal|metallic|glossy)\b/, "material:metal", "make it metallic"],
+
+  // ---- view / environment (ported from the main branch) ------------------
+  [/\b(grid)\b/, "view:grid", "grid"],
+  [/\b(shadow|shadows)\b/, "view:shadows", "shadows"],
+  [/\b(auto rotate|auto-rotate|orbit|stop orbit)\b/, "view:orbit", "orbit"],
+  [/\b(isolate|solo)\b/, "view:isolate", "isolate"],
+  [/\b(focus|center on|centre on)\b/, "view:focus", "focus"],
+  [/\b(clear selection|deselect)\b/, "view:deselect", "deselect"],
+  [/\b(panels|sidebars|toggle panels)\b/, "view:panels", "panels"],
+  [/\b(fullscreen|full screen)\b/, "view:fullscreen", "fullscreen"],
+
+
+  // ---- models / animation -----------------------------------------------
+  [/\b(play|start|resume)\b.*\b(animation|clip)\b/, "anim:play", "play animation"],
+  [/\b(pause|stop)\b.*\b(animation|clip)\b/, "anim:pause", "pause animation"],
+  [/\b(next|another)\b.*\b(animation|clip)\b/, "anim:next", "next animation"],
+  [/\b(load|switch|show|open)\b.*\b(robot|arm)\b/, "model:robotArm", "load the robot"],
+  [/\b(load|switch|show|open)\b.*\b(turbojet|jet|engine)\b/, "model:turbojet", "load the turbojet"],
+  [/\b(load|switch|show|open)\b.*\b(gear)\b/, "model:gearTrain", "load the gear train"],
+  [/\b(load|switch|show|open)\b.*\b(rocket|launch|vehicle)\b/, "model:launchVehicle", "load the rocket"],
+  [/\b(load|switch|show|open)\b.*\b(pcb|circuit|board)\b/, "model:controlPCB", "load the PCB"],
+  [/\b(load|switch|show|open)\b.*\b(cpu|processor|chip)\b/, "model:cpuPackage", "load the CPU"],
+  [/\b(load|switch|show|open)\b.*\b(turbine)\b/, "model:windTurbine", "load the turbine"],
+  [/\b(load|switch|show|open)\b.*\b(inline|four|4 cylinder)\b/, "model:inlineEngine", "load the inline engine"],
+
+];
+
+/** Strip filler and normalise so matching is stable. */
+function normalise(text) {
+  return String(text || "")
+    .toLowerCase()
+    // Turn "40%" into "40 percent" before stripping punctuation, otherwise the
+    // percentage form of the explode command loses its unit and stops matching.
+    .replace(/(\d)\s*%/g, "$1 percent")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Parse a phrase into an intent.
+ * @returns {{ intent: string, phrase: string } | null}
+ */
+export function parseCommand(phrase) {
+  const text = normalise(phrase);
+  if (!text) return null;
+  for (const [pattern, intent] of COMMAND_TABLE) {
+    if (pattern.test(text)) return { intent, phrase: text };
+  }
+  return null;
+}
+
+/** Every phrase the recogniser understands, for the help panel. */
+export function commandExamples() {
+  return COMMAND_TABLE.map(([, , example]) => example);
+}
 
 export const VOICE_STATUS = {
   UNSUPPORTED: "unsupported",
   IDLE: "idle",
-  STARTING: "starting",
   LISTENING: "listening",
-  PROCESSING: "processing",
-  PAUSED: "paused",
+  HEARD: "heard",
   ERROR: "error"
 };
 
-export const COLOR_PALETTE = {
-  red: "#ef4444",
-  crimson: "#dc2626",
-  blue: "#3b82f6",
-  azure: "#0284c7",
-  cyan: "#06b6d4",
-  teal: "#14b8a6",
-  green: "#22c55e",
-  emerald: "#10b981",
-  gold: "#eab308",
-  yellow: "#facc15",
-  orange: "#f97316",
-  amber: "#f59e0b",
-  purple: "#a855f7",
-  violet: "#8b5cf6",
-  pink: "#ec4899",
-  rose: "#f43f5e",
-  white: "#f8fafc",
-  silver: "#cbd5e1",
-  dark: "#1e293b",
-  graphite: "#0f172a"
-};
-
-export class VoiceController {
-  constructor({
-    onStatus,
-    onHeard,
-    onCommand,
-    onError,
-    soundEnabled = true
-  } = {}) {
-    this.onStatus = onStatus || (() => {});
-    this.onHeard = onHeard || (() => {});
+export class VoiceControl {
+  /**
+   * @param {object} options
+   * @param {Function} options.onCommand (intent, phrase) => void
+   * @param {Function} [options.onState]  (state) => void
+   */
+  constructor({ onCommand, onState } = {}) {
     this.onCommand = onCommand || (() => {});
-    this.onError = onError || (() => {});
-    this.soundEnabled = soundEnabled;
+    this.onState = onState || (() => {});
 
-    this.status = VOICE_STATUS.IDLE;
+    const Recognition =
+      typeof window !== "undefined"
+        ? window.SpeechRecognition || window.webkitSpeechRecognition
+        : null;
+    this.Recognition = Recognition || null;
+    this.supported = Boolean(this.Recognition);
+
     this.recognition = null;
-    this.isListening = false;
-    this.lastTranscript = "";
-    this._audioCtx = null;
-    this._restartTimer = null;
-    this._shouldBeListening = false;
-
-    this._initRecognition();
+    this.listening = false;
+    this.status = this.supported ? VOICE_STATUS.IDLE : VOICE_STATUS.UNSUPPORTED;
+    this.error = this.supported ? null : "This browser has no speech recognition engine.";
+    this.lastPhrase = "";
+    this.lastIntent = null;
+    this._wantListening = false;
   }
 
-  /* ------------------------------------------------------------------------- */
-  /* WEB AUDIO SYNTHESIZER                                                     */
-  /* ------------------------------------------------------------------------- */
-
-  _getAudioContext() {
-    if (!this._audioCtx && typeof window !== "undefined") {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      if (AudioCtx) {
-        try {
-          this._audioCtx = new AudioCtx();
-        } catch {
-          this._audioCtx = null;
-        }
-      }
-    }
-    if (this._audioCtx && this._audioCtx.state === "suspended") {
-      this._audioCtx.resume().catch(() => {});
-    }
-    return this._audioCtx;
-  }
-
-  playChime(type = "command") {
-    if (!this.soundEnabled) return;
-    const ctx = this._getAudioContext();
-    if (!ctx) return;
-
-    try {
-      const now = ctx.currentTime;
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-
-      if (type === "command") {
-        // Futuristic two-tone confirmation
-        osc.type = "sine";
-        osc.frequency.setValueAtTime(587.33, now); // D5
-        osc.frequency.exponentialRampToValueAtTime(880, now + 0.08); // A5
-        gain.gain.setValueAtTime(0.001, now);
-        gain.gain.linearRampToValueAtTime(0.09, now + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
-        osc.start(now);
-        osc.stop(now + 0.23);
-      } else if (type === "listen") {
-        // High-tech activation ping
-        osc.type = "triangle";
-        osc.frequency.setValueAtTime(740, now);
-        osc.frequency.exponentialRampToValueAtTime(1108.73, now + 0.06);
-        gain.gain.setValueAtTime(0.001, now);
-        gain.gain.linearRampToValueAtTime(0.07, now + 0.015);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.18);
-        osc.start(now);
-        osc.stop(now + 0.19);
-      } else if (type === "spawn") {
-        // Geometric chord / chime
-        osc.type = "sine";
-        osc.frequency.setValueAtTime(440, now);
-        osc.frequency.exponentialRampToValueAtTime(659.25, now + 0.06);
-        osc.frequency.exponentialRampToValueAtTime(1318.5, now + 0.16);
-        gain.gain.setValueAtTime(0.001, now);
-        gain.gain.linearRampToValueAtTime(0.12, now + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.35);
-        osc.start(now);
-        osc.stop(now + 0.36);
-      } else if (type === "grab") {
-        // Mechanical latch click
-        osc.type = "square";
-        osc.frequency.setValueAtTime(220, now);
-        osc.frequency.exponentialRampToValueAtTime(110, now + 0.04);
-        gain.gain.setValueAtTime(0.04, now);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.05);
-        osc.start(now);
-        osc.stop(now + 0.055);
-      } else if (type === "release") {
-        // Soft snap release
-        osc.type = "triangle";
-        osc.frequency.setValueAtTime(320, now);
-        osc.frequency.exponentialRampToValueAtTime(480, now + 0.03);
-        gain.gain.setValueAtTime(0.03, now);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.04);
-        osc.start(now);
-        osc.stop(now + 0.045);
-      } else if (type === "error") {
-        // Subtle warning tone
-        osc.type = "sawtooth";
-        osc.frequency.setValueAtTime(280, now);
-        osc.frequency.setValueAtTime(210, now + 0.09);
-        gain.gain.setValueAtTime(0.001, now);
-        gain.gain.linearRampToValueAtTime(0.06, now + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
-        osc.start(now);
-        osc.stop(now + 0.23);
-      }
-    } catch {
-      // Audio autoplay policies or closed context
-    }
-  }
-
-  /* ------------------------------------------------------------------------- */
-  /* RECOGNITION SETUP                                                         */
-  /* ------------------------------------------------------------------------- */
-
-  _initRecognition() {
-    if (typeof window === "undefined") {
-      this._setStatus(VOICE_STATUS.UNSUPPORTED);
-      return;
-    }
-
-    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRec) {
-      this._setStatus(VOICE_STATUS.UNSUPPORTED);
-      return;
-    }
-
-    try {
-      const recognition = new SpeechRec();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = "en-US";
-      recognition.maxAlternatives = 1;
-
-      recognition.onstart = () => {
-        this.isListening = true;
-        this._setStatus(VOICE_STATUS.LISTENING);
-        this.playChime("listen");
-      };
-
-      recognition.onresult = event => {
-        let interim = "";
-        let final = "";
-
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          const res = event.results[i];
-          const text = res[0]?.transcript || "";
-          if (res.isFinal) final += text;
-          else interim += text;
-        }
-
-        const raw = (final || interim).trim();
-        if (!raw) return;
-
-        this.lastTranscript = raw;
-        this.onHeard(raw, Boolean(final));
-
-        if (final) {
-          const cmd = this.parseCommand(final);
-          if (cmd) {
-            this.playChime("command");
-            this.onCommand(cmd);
-          }
-        }
-      };
-
-      recognition.onerror = event => {
-        const error = event.error;
-        if (error === "no-speech") {
-          // Normal silence, keep listening
-          return;
-        }
-        if (error === "not-allowed" || error === "service-not-allowed") {
-          this._shouldBeListening = false;
-          this.isListening = false;
-          this._setStatus(VOICE_STATUS.ERROR, "Microphone permission denied.");
-          this.onError(new Error("Microphone permission was denied."));
-          return;
-        }
-        this.onError(new Error(`Voice error: ${error}`));
-      };
-
-      recognition.onend = () => {
-        this.isListening = false;
-        if (this._shouldBeListening) {
-          // Auto-reconnect so voice control remains seamless
-          clearTimeout(this._restartTimer);
-          this._restartTimer = setTimeout(() => {
-            if (this._shouldBeListening && !this.isListening) {
-              try {
-                this.recognition.start();
-              } catch {
-                // Already started or busy
-              }
-            }
-          }, 350);
-        } else {
-          this._setStatus(VOICE_STATUS.IDLE);
-        }
-      };
-
-      this.recognition = recognition;
-      this._setStatus(VOICE_STATUS.IDLE);
-    } catch (err) {
-      this._setStatus(VOICE_STATUS.ERROR, err.message);
-    }
-  }
-
-  _setStatus(status, error = null) {
-    this.status = status;
-    this.error = error;
-    this.onStatus(status, error);
-  }
-
-  /* ------------------------------------------------------------------------- */
-  /* PUBLIC CONTROL                                                            */
-  /* ------------------------------------------------------------------------- */
-
-  get isSupported() {
-    return this.status !== VOICE_STATUS.UNSUPPORTED && Boolean(this.recognition);
+  _emit(state = {}) {
+    this.onState({
+      status: this.status,
+      supported: this.supported,
+      listening: this.listening,
+      error: this.error,
+      phrase: this.lastPhrase,
+      intent: this.lastIntent,
+      ...state
+    });
   }
 
   start() {
-    if (!this.isSupported) {
-      this._setStatus(VOICE_STATUS.UNSUPPORTED);
+    if (!this.supported) {
+      this.status = VOICE_STATUS.UNSUPPORTED;
+      this._emit();
       return false;
     }
-    this._shouldBeListening = true;
+    if (this.listening) return true;
+
+    this._wantListening = true;
     try {
+      if (!this.recognition) this.recognition = this._build();
       this.recognition.start();
+      this.listening = true;
+      this.status = VOICE_STATUS.LISTENING;
+      this.error = null;
+      this._emit();
       return true;
-    } catch {
-      // If already started
-      this.isListening = true;
-      this._setStatus(VOICE_STATUS.LISTENING);
-      return true;
+    } catch (error) {
+      // start() throws if called twice; treat that as already listening.
+      if (/already started/i.test(error.message)) {
+        this.listening = true;
+        this.status = VOICE_STATUS.LISTENING;
+        this._emit();
+        return true;
+      }
+      this.error = error.message;
+      this.status = VOICE_STATUS.ERROR;
+      this._emit();
+      return false;
     }
   }
 
   stop() {
-    this._shouldBeListening = false;
-    clearTimeout(this._restartTimer);
-    if (this.recognition && this.isListening) {
-      try {
-        this.recognition.stop();
-      } catch {
-        // Ignore
-      }
-    }
-    this.isListening = false;
-    this._setStatus(VOICE_STATUS.IDLE);
+    this._wantListening = false;
+    this.listening = false;
+    try { this.recognition?.stop(); } catch { /* already stopped */ }
+    this.status = this.supported ? VOICE_STATUS.IDLE : VOICE_STATUS.UNSUPPORTED;
+    this._emit();
   }
 
   toggle() {
-    if (this.isListening || this._shouldBeListening) {
-      this.stop();
-      return false;
-    }
+    if (this.listening) { this.stop(); return false; }
     return this.start();
   }
 
-  /* ------------------------------------------------------------------------- */
-  /* COMMAND PARSER                                                            */
-  /* ------------------------------------------------------------------------- */
+  _build() {
+    const recognition = new this.Recognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = (typeof navigator !== "undefined" && navigator.language) || "en-US";
+    recognition.maxAlternatives = 1;
 
-  parseCommand(rawText) {
-    if (!rawText) return null;
-    const text = rawText.toLowerCase().trim().replace(/[.,!?;:]/g, "");
+    recognition.onstart = () => {
+      this.listening = true;
+      this.status = VOICE_STATUS.LISTENING;
+      this.error = null;
+      this._emit();
+    };
 
-    // 1. Interaction Modes
-    if (/\b(select|pick|point)\b/.test(text)) {
-      return { type: "mode", mode: "select", label: "SELECT mode", raw: rawText };
-    }
-    if (/\b(move|drag|translate|shift)\b/.test(text)) {
-      return { type: "mode", mode: "move", label: "MOVE mode", raw: rawText };
-    }
-    if (/\b(rotate|spin|turn|yaw|pitch)\b/.test(text)) {
-      return { type: "mode", mode: "rotate", label: "ROTATE mode", raw: rawText };
-    }
-    if (/\b(scale|resize|zoom)\b/.test(text)) {
-      return { type: "mode", mode: "scale", label: "SCALE mode", raw: rawText };
-    }
-    if (/\b(explode|disassemble|separate|break down)\b/.test(text)) {
-      // Check for specific percentage
-      const percentMatch = text.match(/([0-9]{1,3})\s*(?:percent|%)/);
-      if (percentMatch) {
-        const val = Math.max(0, Math.min(100, parseInt(percentMatch[1], 10)));
-        return { type: "explode-amount", amount: val / 100, label: `Explode ${val}%`, raw: rawText };
+    recognition.onresult = event => {
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        const transcript = result[0]?.transcript || "";
+        this.lastPhrase = transcript.trim();
+
+        // Fire on the first match, whether interim or final, so commands feel
+        // immediate. Interim text repeats, so guard against re-firing the same
+        // phrase.
+        const parsed = parseCommand(transcript);
+        if (parsed && (parsed.intent !== this.lastIntent || result.isFinal)) {
+          this.lastIntent = parsed.intent;
+          this.status = VOICE_STATUS.HEARD;
+          this._emit({ final: result.isFinal });
+          this.onCommand(parsed.intent, transcript.trim());
+        } else if (!parsed) {
+          this._emit({ final: result.isFinal });
+        }
       }
-      return { type: "mode", mode: "explode", label: "EXPLODE mode", raw: rawText };
-    }
-    if (/\b(assemble|collapse|put together|join|close)\b/.test(text)) {
-      return { type: "explode-amount", amount: 0, label: "Assemble (0%)", raw: rawText };
-    }
+    };
 
-    // 2. 3D Playground Objects (Add Shapes)
-    if (/\b(add|spawn|create|new|make)\s+(cube|box)\b/.test(text) || text === "cube" || text === "box") {
-      return { type: "add-object", shape: "cube", label: "Add Cube", raw: rawText };
-    }
-    if (/\b(add|spawn|create|new|make)\s+(sphere|ball|globe)\b/.test(text) || text === "sphere") {
-      return { type: "add-object", shape: "sphere", label: "Add Sphere", raw: rawText };
-    }
-    if (/\b(add|spawn|create|new|make)\s+(cylinder|can|tube)\b/.test(text) || text === "cylinder") {
-      return { type: "add-object", shape: "cylinder", label: "Add Cylinder", raw: rawText };
-    }
-    if (/\b(add|spawn|create|new|make)\s+(torus|donut|ring)\b/.test(text) || text === "torus") {
-      return { type: "add-object", shape: "torus", label: "Add Torus", raw: rawText };
-    }
-    if (/\b(add|spawn|create|new|make)\s+(cone)\b/.test(text) || text === "cone") {
-      return { type: "add-object", shape: "cone", label: "Add Cone", raw: rawText };
-    }
-    if (/\b(add|spawn|create|new|make)\s+(pyramid)\b/.test(text) || text === "pyramid") {
-      return { type: "add-object", shape: "pyramid", label: "Add Pyramid", raw: rawText };
-    }
-    if (/\b(clear objects|delete objects|remove all objects)\b/.test(text)) {
-      return { type: "action", action: "clear-objects", label: "Clear Playground Objects", raw: rawText };
-    }
-    if (/\b(delete|remove)\b/.test(text)) {
-      return { type: "action", action: "delete-selected", label: "Delete Selection", raw: rawText };
-    }
+    recognition.onerror = event => {
+      // "no-speech" and "aborted" are routine; everything else is worth
+      // surfacing.
+      if (event.error === "no-speech" || event.error === "aborted") return;
+      this.error =
+        event.error === "not-allowed" || event.error === "service-not-allowed"
+          ? "Microphone permission was denied."
+          : `Speech recognition error: ${event.error}`;
+      this.status = VOICE_STATUS.ERROR;
+      this.listening = false;
+      this._emit();
+    };
 
-    // 3. Materials & Color
-    if (/\b(wireframe|wire frame)\b/.test(text)) {
-      return { type: "action", action: "toggle-wireframe", label: "Toggle Wireframe", raw: rawText };
-    }
-    if (/\b(solid|shaded)\b/.test(text)) {
-      return { type: "action", action: "solid", label: "Solid Surface", raw: rawText };
-    }
-    for (const [name, hex] of Object.entries(COLOR_PALETTE)) {
-      if (new RegExp(`\\b(color|make|paint)\\s+${name}\\b`).test(text) || text === `color ${name}`) {
-        return { type: "color", color: hex, name, label: `Color: ${name.toUpperCase()}`, raw: rawText };
+    recognition.onend = () => {
+      this.listening = false;
+      // Chrome ends the session after a pause; keep listening if the user has
+      // not asked to stop.
+      if (this._wantListening) {
+        try { recognition.start(); return; } catch { /* fall through */ }
       }
-    }
+      this.status = this.supported ? VOICE_STATUS.IDLE : VOICE_STATUS.UNSUPPORTED;
+      this._emit();
+    };
 
-    // 4. View & Environment
-    if (/\b(reset|home|recenter|re-center)\b/.test(text)) {
-      return { type: "action", action: "reset", label: "Reset View", raw: rawText };
-    }
-    if (/\b(camera|webcam)\b/.test(text)) {
-      return { type: "action", action: "toggle-camera", label: "Toggle Camera", raw: rawText };
-    }
-    if (/\b(switch view|toggle view|full camera|preview view)\b/.test(text)) {
-      return { type: "action", action: "toggle-camera-view", label: "Toggle Camera View", raw: rawText };
-    }
-    if (/\b(grid)\b/.test(text)) {
-      return { type: "action", action: "toggle-grid", label: "Toggle Grid", raw: rawText };
-    }
-    if (/\b(shadow|shadows)\b/.test(text)) {
-      return { type: "action", action: "toggle-shadows", label: "Toggle Shadows", raw: rawText };
-    }
-    if (/\b(auto rotate|auto-rotate|orbit|spin assembly|stop orbit)\b/.test(text)) {
-      return { type: "action", action: "toggle-orbit", label: "Toggle Auto-Orbit", raw: rawText };
-    }
-    if (/\b(isolate|solo)\b/.test(text)) {
-      return { type: "action", action: "isolate", label: "Isolate Selection", raw: rawText };
-    }
-    if (/\b(focus|center on)\b/.test(text)) {
-      return { type: "action", action: "focus", label: "Focus Selection", raw: rawText };
-    }
-    if (/\b(clear selection|deselect)\b/.test(text)) {
-      return { type: "action", action: "clear-selection", label: "Clear Selection", raw: rawText };
-    }
-    if (/\b(panels|sidebars|toggle panels)\b/.test(text)) {
-      return { type: "action", action: "toggle-panels", label: "Toggle Panels", raw: rawText };
-    }
-    if (/\b(fullscreen|full screen)\b/.test(text)) {
-      return { type: "action", action: "toggle-fullscreen", label: "Toggle Fullscreen", raw: rawText };
-    }
+    return recognition;
+  }
 
-    // 5. Model Loading
-    if (/\b(rocket|launch vehicle|astra)\b/.test(text)) {
-      return { type: "model", modelId: "launchVehicle", label: "Load Launch Vehicle", raw: rawText };
+  /** Feed text directly — used by the keyboard fallback and by tests. */
+  submitText(text) {
+    const parsed = parseCommand(text);
+    if (parsed) {
+      this.lastPhrase = text;
+      this.lastIntent = parsed.intent;
+      this.status = VOICE_STATUS.HEARD;
+      this._emit({ final: true, manual: true });
+      this.onCommand(parsed.intent, text);
+      return parsed;
     }
-    if (/\b(turbojet|jet|turbine engine)\b/.test(text)) {
-      return { type: "model", modelId: "turbojet", label: "Load Turbojet", raw: rawText };
-    }
-    if (/\b(engine|inline|automotive)\b/.test(text)) {
-      return { type: "model", modelId: "inlineEngine", label: "Load Inline Engine", raw: rawText };
-    }
-    if (/\b(gear|gears|gear train)\b/.test(text)) {
-      return { type: "model", modelId: "gearTrain", label: "Load Gear Train", raw: rawText };
-    }
-    if (/\b(robot|robot arm|industrial robot)\b/.test(text)) {
-      return { type: "model", modelId: "robotArm", label: "Load Robot Arm", raw: rawText };
-    }
-    if (/\b(pcb|circuit|circuit board)\b/.test(text)) {
-      return { type: "model", modelId: "controlPCB", label: "Load Control PCB", raw: rawText };
-    }
-    if (/\b(cpu|processor|package)\b/.test(text)) {
-      return { type: "model", modelId: "cpuPackage", label: "Load CPU Package", raw: rawText };
-    }
-    if (/\b(wind turbine|windmill)\b/.test(text)) {
-      return { type: "model", modelId: "windTurbine", label: "Load Wind Turbine", raw: rawText };
-    }
-
+    this.lastPhrase = text;
+    this._emit({ final: true, manual: true });
     return null;
+  }
+
+  dispose() {
+    this._wantListening = false;
+    try { this.recognition?.abort?.(); } catch { /* ignore */ }
+    this.recognition = null;
   }
 }

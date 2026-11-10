@@ -53,14 +53,14 @@ export class Workspace {
     this.partTransforms = new Map(); // part -> {offset, rotationX, rotationZ, scale}
     this._previousVisibility = null;
     this._selectedOrigEmissive = null;
-    this.playgroundObjects = [];
-    this._playgroundNextId = 1;
 
     this._partTargets = new Map();
     this._cameraGoal = null;
     this._targetGoal = null;
     this._clock = new THREE.Clock();
     this._hoverPending = null;
+    /** Group composited after the main pass (the hand skeletons). */
+    this.lateLayer = null;
 
     this._initRenderer();
     this._initScene();
@@ -236,11 +236,14 @@ export class Workspace {
         })
       );
       ring.rotation.x = -Math.PI / 2;
+      ring.userData.baseOpacity = 0.5;
       rings.add(ring);
     }
     rings.position.y = -3.595;
     this.scene.add(rings);
     this.rings = rings;
+    // Remember the authored strength so setGridEmphasis can fade and restore.
+    if (grid.material) grid.userData.baseOpacity = 0.75;
   }
 
   _initPost() {
@@ -329,30 +332,6 @@ export class Workspace {
       this._hoverPending = null;
       this.setHover(null);
     });
-
-    // Viewport drag-and-drop for 3D GLB/GLTF models
-    this._handleDragOver = event => {
-      event.preventDefault();
-      event.stopPropagation();
-      this.container.classList.add("dragover");
-    };
-    this._handleDragLeave = event => {
-      event.preventDefault();
-      event.stopPropagation();
-      this.container.classList.remove("dragover");
-    };
-    this._handleDrop = async event => {
-      event.preventDefault();
-      event.stopPropagation();
-      this.container.classList.remove("dragover");
-      const file = event.dataTransfer?.files?.[0];
-      if (file && (file.name.toLowerCase().endsWith(".glb") || file.name.toLowerCase().endsWith(".gltf"))) {
-        await this.loadFile(file);
-      }
-    };
-    this.container.addEventListener("dragover", this._handleDragOver);
-    this.container.addEventListener("dragleave", this._handleDragLeave);
-    this.container.addEventListener("drop", this._handleDrop);
   }
 
   resize() {
@@ -846,225 +825,127 @@ export class Workspace {
     }
   }
 
+  /**
+   * How strongly the ground grid draws.
+   *
+   * With the camera filling the stage, a 40-unit wireframe laid over the live
+   * feed reads as clutter and muddies the person on camera. The grid is kept
+   * for spatial reference but faded well back so the model and the hands stay
+   * the subject; over a plain background it draws at full strength.
+   */
+  setGridEmphasis(emphasis = 1) {
+    const opacity = Math.max(0, Math.min(1, emphasis));
+    const apply = (object, base) => {
+      if (!object?.material) return;
+      object.material.transparent = true;
+      object.material.opacity = base * opacity;
+      object.material.depthWrite = opacity > 0.5;
+      object.material.needsUpdate = true;
+    };
+    apply(this.grid, 0.75);
+    if (this.rings) {
+      this.rings.traverse(child => {
+        if (child.material) apply(child, child.userData.baseOpacity ?? 0.5);
+      });
+    }
+  }
+
   /* ===================================================================== */
-  /* 3D PLAYGROUND & OBJECT SYSTEM                                         */
+  /* MATERIALS                                                             */
   /* ===================================================================== */
 
   /**
-   * Add a primitive 3D object to the interactive workspace.
-   * Spawns real, interactive 3D geometry (Cube, Sphere, Cylinder, Torus, Cone, Pyramid)
-   * that can be immediately grabbed, translated, rotated, and scaled with hands or mouse.
+   * Apply material changes to a part.
+   *
+   * Ported from the `main` branch, which grew this for its voice colour
+   * commands and inspector sliders. It walks every mesh under the part because
+   * a part can be a Group, and tolerates multi-material meshes.
+   *
+   * Playground objects live in the playground module rather than the assembly,
+   * so they are resolved first by id.
    */
-  addPlaygroundObject(type = "cube", options = {}) {
-    const idNum = this._playgroundNextId++;
-    const partId = `pg-${type}-${idNum}`;
-
-    let geom;
-    switch (type) {
-      case "sphere":
-        geom = new THREE.SphereGeometry(1.0, 32, 24);
-        break;
-      case "cylinder":
-        geom = new THREE.CylinderGeometry(0.8, 0.8, 1.8, 32);
-        break;
-      case "torus":
-        geom = new THREE.TorusGeometry(0.9, 0.35, 24, 48);
-        break;
-      case "cone":
-        geom = new THREE.ConeGeometry(0.95, 1.8, 32);
-        break;
-      case "pyramid":
-        geom = new THREE.ConeGeometry(1.2, 1.8, 4);
-        geom.rotateY(Math.PI / 4);
-        break;
-      case "cube":
-      default:
-        geom = new THREE.BoxGeometry(1.6, 1.6, 1.6);
-        break;
-    }
-
-    const defaultColors = [0x3fd0ff, 0x10b981, 0xa855f7, 0xf59e0b, 0xf43f5e, 0x3b82f6];
-    const color = options.color !== undefined
-      ? options.color
-      : defaultColors[(idNum - 1) % defaultColors.length];
-
-    const mat = new THREE.MeshStandardMaterial({
-      color,
-      roughness: options.roughness !== undefined ? options.roughness : 0.32,
-      metalness: options.metalness !== undefined ? options.metalness : 0.42,
-      wireframe: Boolean(options.wireframe)
-    });
-
-    const mesh = new THREE.Mesh(geom, mat);
-    mesh.castShadow = this.settings.shadows;
-    mesh.receiveShadow = this.settings.shadows;
-    mesh.name = `${type.toUpperCase()} #${idNum}`;
-
-    // Place nicely on ground around the workspace
-    const count = this.playgroundObjects.length;
-    const angle = count * 1.25;
-    const radius = 2.4 + (count % 3) * 0.8;
-    const px = options.x !== undefined ? options.x : Math.cos(angle) * radius;
-    const py = options.y !== undefined ? options.y : 0;
-    const pz = options.z !== undefined ? options.z : Math.sin(angle) * radius;
-    mesh.position.set(px, py, pz);
-
-    mesh.userData = {
-      partId,
-      partRoot: mesh,
-      isPlaygroundObject: true,
-      playgroundType: type,
-      name: mesh.name,
-      home: mesh.position.clone(),
-      explodeDirection: mesh.position.clone().normalize(),
-      explodeDistance: 1.5
-    };
-    if (mesh.userData.explodeDirection.lengthSq() < 1e-4) {
-      mesh.userData.explodeDirection.set(0, 1, 0);
-    }
-
-    if (!this.assembly) {
-      const group = new THREE.Group();
-      group.name = "playgroundAssembly";
-      this.assembly = {
-        group,
-        parts: [],
-        byId: new Map(),
-        definition: { id: "playground", name: "Playground Scene", imported: false }
-      };
-      this.manipulator.add(group);
-    }
-
-    this.assembly.parts.push(mesh);
-    this.assembly.byId.set(partId, mesh);
-    this._partTargets.set(mesh, {
-      position: mesh.position.clone(),
-      scale: new THREE.Vector3(1, 1, 1)
-    });
-    this.assembly.group.add(mesh);
-    this.playgroundObjects.push(mesh);
-
-    this.select(partId);
-    this.onStatus({
-      model: this.assembly.definition,
-      parts: this.assembly.parts.length,
-      playground: true
-    });
-    return mesh;
-  }
-
-  removePlaygroundObject(partId) {
-    const part = this.getPart(partId);
-    if (!part || !part.userData.isPlaygroundObject) return false;
-
-    if (this.selected === part) {
-      this.clearSelection();
-    }
-    if (this.hovered === part) {
-      this.setHover(null);
-    }
-    this._clearOutline(part);
-
-    part.geometry?.dispose();
-    if (Array.isArray(part.material)) {
-      part.material.forEach(m => m.dispose());
-    } else {
-      part.material?.dispose();
-    }
-
-    part.parent?.remove(part);
-    this._partTargets.delete(part);
-    this.partTransforms.delete(part);
-
-    const idx = this.assembly.parts.indexOf(part);
-    if (idx !== -1) this.assembly.parts.splice(idx, 1);
-    this.assembly.byId.delete(partId);
-
-    const pIdx = this.playgroundObjects.indexOf(part);
-    if (pIdx !== -1) this.playgroundObjects.splice(pIdx, 1);
-
-    this.onStatus({
-      model: this.assembly.definition,
-      parts: this.assembly.parts.length,
-      playground: true
-    });
-    return true;
-  }
-
-  clearPlaygroundObjects() {
-    const toRemove = [...this.playgroundObjects];
-    for (const obj of toRemove) {
-      this.removePlaygroundObject(obj.userData.partId);
-    }
-  }
-
   setPartMaterial(partId, options = {}) {
-    const part = this.getPart(partId);
-    if (!part) return false;
-    part.traverse(child => {
+    const target = this.getPart(partId) || this.getAnyMesh(partId);
+    if (!target) return false;
+
+    target.traverse(child => {
       if (!child.isMesh || !child.material) return;
-      const mats = Array.isArray(child.material) ? child.material : [child.material];
-      for (const m of mats) {
-        if (options.color !== undefined) {
-          if (typeof options.color === "string" || typeof options.color === "number") {
-            m.color.set(options.color);
-          }
+      const materials = Array.isArray(child.material) ? child.material : [child.material];
+      for (const material of materials) {
+        if (options.color !== undefined &&
+            (typeof options.color === "string" || typeof options.color === "number")) {
+          material.color?.set(options.color);
         }
-        if (options.roughness !== undefined) m.roughness = THREE.MathUtils.clamp(options.roughness, 0, 1);
-        if (options.metalness !== undefined) m.metalness = THREE.MathUtils.clamp(options.metalness, 0, 1);
-        if (options.wireframe !== undefined) m.wireframe = Boolean(options.wireframe);
+        if (options.roughness !== undefined && "roughness" in material) {
+          material.roughness = THREE.MathUtils.clamp(options.roughness, 0, 1);
+        }
+        if (options.metalness !== undefined && "metalness" in material) {
+          material.metalness = THREE.MathUtils.clamp(options.metalness, 0, 1);
+        }
+        if (options.wireframe !== undefined && "wireframe" in material) {
+          material.wireframe = Boolean(options.wireframe);
+        }
         if (options.opacity !== undefined) {
-          m.opacity = THREE.MathUtils.clamp(options.opacity, 0.1, 1);
-          m.transparent = m.opacity < 1;
+          material.opacity = THREE.MathUtils.clamp(options.opacity, 0.1, 1);
+          material.transparent = material.opacity < 1;
         }
-        m.needsUpdate = true;
+        material.needsUpdate = true;
       }
     });
     return true;
   }
 
+  /**
+   * Resolve any mesh in the scene by id, not just documented assembly parts.
+   * Playground objects are attached by main.js, so this keeps material edits
+   * working for them without the renderer knowing about the playground.
+   */
+  getAnyMesh(partId) {
+    if (!partId) return null;
+    let found = null;
+    this.scene.traverse(object => {
+      if (found || !object.isMesh) return;
+      if (object.userData?.partId === partId) found = object;
+    });
+    return found;
+  }
+
+  /** Toggle wireframe for one part, or the whole scene when no id is given. */
   toggleWireframe(partId = null) {
     if (partId) {
-      const part = this.getPart(partId);
-      if (!part) return false;
-      let nextState = true;
-      part.traverse(child => {
-        if (child.isMesh && child.material) {
-          const m = Array.isArray(child.material) ? child.material[0] : child.material;
-          nextState = !m.wireframe;
-        }
-      });
-      this.setPartMaterial(partId, { wireframe: nextState });
-      return nextState;
+      const current = this.getPartMaterial(partId);
+      if (!current) return false;
+      const next = !current.wireframe;
+      this.setPartMaterial(partId, { wireframe: next });
+      return next;
     }
-    // Global toggle
     let anyWire = false;
     this.scene.traverse(child => {
-      if (child.isMesh && child.material && child.material.wireframe) anyWire = true;
+      if (child.isMesh && child.material?.wireframe) anyWire = true;
     });
     const target = !anyWire;
-    this.parts.forEach(part => {
-      this.setPartMaterial(part.userData.partId, { wireframe: target });
-    });
+    for (const part of this.parts) {
+      this.setPartMaterial(part.userData?.partId, { wireframe: target });
+    }
     return target;
   }
 
+  /** Read back the first material found on a part, for the inspector. */
   getPartMaterial(partId) {
-    const part = this.getPart(partId);
-    if (!part) return null;
-    let foundMat = null;
-    part.traverse(child => {
-      if (!foundMat && child.isMesh && child.material) {
-        foundMat = Array.isArray(child.material) ? child.material[0] : child.material;
-      }
+    const target = this.getPart(partId) || this.getAnyMesh(partId);
+    if (!target) return null;
+    let found = null;
+    target.traverse(child => {
+      if (found || !child.isMesh || !child.material) return;
+      found = Array.isArray(child.material) ? child.material[0] : child.material;
     });
-    if (!foundMat) return null;
+    if (!found) return null;
     return {
-      color: "#" + foundMat.color.getHexString(),
-      roughness: foundMat.roughness ?? 0.5,
-      metalness: foundMat.metalness ?? 0.5,
-      wireframe: Boolean(foundMat.wireframe),
-      opacity: foundMat.opacity ?? 1
+      color: `#${found.color?.getHexString?.() ?? "ffffff"}`,
+      roughness: found.roughness ?? 0.5,
+      metalness: found.metalness ?? 0.5,
+      wireframe: Boolean(found.wireframe),
+      opacity: found.opacity ?? 1
     };
   }
 
@@ -1237,8 +1118,44 @@ export class Workspace {
 
     this.controls.update();
 
+    // ---- render, with the hands drawn late -------------------------------
+    // The hand rigs are scene objects so they keep real 3D shape and depth, but
+    // they are excluded from the scene/bloom pass and drawn afterwards with
+    // depth testing off. Two things follow:
+    //
+    //   1. A model sweeping in front of the hand can never hide it. Losing the
+    //      skeleton mid-gesture is far worse than a small occlusion error.
+    //   2. The skeleton is not smeared by bloom, so bones and joints stay crisp
+    //      instead of glowing into a blur.
+    //
+    // Depth is not thrown away: the rig dims and shrinks when scene geometry is
+    // between it and the camera (see HandRig.applyDepth), so it still reads as
+    // 3D rather than as a flat sticker.
+    const late = this.lateLayer && this.lateLayer.visible;
+    if (late) this.lateLayer.visible = false;
+
     if (this.composer) this.composer.render();
     else this.renderer.render(this.scene, this.camera);
+
+    if (late) {
+      this.lateLayer.visible = true;
+      const autoClear = this.renderer.autoClear;
+      this.renderer.autoClear = false;
+      this.renderer.clearDepth();
+      this.renderer.render(this.scene, this.camera);
+      this.renderer.autoClear = autoClear;
+    }
+  }
+
+  /**
+   * Attach the group that must be composited over the frame.
+   *
+   * main.js hands over the hand-skeleton root here once the rigs exist, so the
+   * render loop knows what to hold back for the second pass.
+   */
+  setLateLayer(object3d) {
+    this.lateLayer = object3d || null;
+    return this.lateLayer;
   }
 
   /**
