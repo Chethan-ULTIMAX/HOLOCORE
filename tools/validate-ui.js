@@ -485,7 +485,7 @@ section("5c · Camera mode must not break hand tracking");
 section("5d · Defaults for a first visit");
 
 {
-  const { DEFAULT_SETTINGS } = await import(join(root, "store.js"));
+  const { DEFAULT_SETTINGS } = await import("../store.js");
   check("the camera does not take over the workspace by default",
     DEFAULT_SETTINGS.camera.workspaceView === false,
     String(DEFAULT_SETTINGS.camera.workspaceView));

@@ -62,6 +62,10 @@ export const DEFAULT_SETTINGS = {
     leftOpen: true,
     rightOpen: true,
     rightTab: "inspector"
+  },
+  voice: {
+    enabled: true,
+    soundEffects: true
   }
 };
 

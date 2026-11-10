@@ -60,7 +60,35 @@ export class ComponentInspector {
   /* --------------------------------------------------------------------- */
 
   _data() {
-    if (!this.partId || !this.modelId) return null;
+    if (!this.partId) return null;
+    const ws = this.getWorkspace?.();
+    const part = typeof ws?.getPart === "function" ? ws.getPart(this.partId) : null;
+    if (part?.userData?.isPlaygroundObject) {
+      return {
+        id: this.partId,
+        name: part.userData.name || part.name || "Playground Object",
+        category: "3D Playground",
+        short: `Interactive 3D ${part.userData.playgroundType || "object"} in the workspace`,
+        function: "An interactive 3D model that responds in real-time to hand gestures and voice commands. Grab, drag, rotate, scale and recolor it.",
+        principle: "Parametric polygonal geometry shaded with physically based materials (PBR) and real-time shadows.",
+        role: "Playground entity for testing spatial hand tracking and physical manipulation.",
+        specs: [
+          { label: "Type", value: (part.userData.playgroundType || "mesh").toUpperCase() },
+          { label: "Geometry", value: `${part.geometry?.attributes?.position?.count || 0} vertices` },
+          { label: "Physics", value: "Real-time kinematic" },
+          { label: "Material", value: "PBR Standard" }
+        ],
+        materials: ["PBR Standard Material", "Soft Shadow Caster"],
+        facts: [
+          "Pinch with thumb and index to grab and translate in 3D space.",
+          "Use voice command 'color [red/blue/green/gold/cyan/purple]' to change its material.",
+          "Say 'wireframe' to inspect the polygonal wireframe."
+        ],
+        relations: [],
+        education: "Interactive shape created in your 3D workspace. You can control it freely using your hands or voice."
+      };
+    }
+    if (!this.modelId) return null;
     return getComponentData(this.modelId, this.partId);
   }
 
@@ -205,6 +233,151 @@ export class ComponentInspector {
       for (const fact of data.facts) list.appendChild(this._el("li", "", fact));
       facts.appendChild(list);
     }
+
+    this._renderProperties(body, data);
+  }
+
+  _renderProperties(body, data) {
+    const ws = this.getWorkspace?.();
+    if (!ws || typeof ws.getPart !== "function") return;
+    const part = ws.getPart(this.partId);
+    if (!part) return;
+
+    const section = this._section(body, "Object Properties & Appearance", "section-properties");
+
+    // Transform readouts
+    const tf = (typeof ws.getPartTransform === "function" ? ws.getPartTransform(this.partId) : null) || {
+      offset: { x: 0, y: 0, z: 0 },
+      rotationX: 0,
+      rotationZ: 0,
+      scale: 1
+    };
+    const tfBox = this._el("div", "prop-group");
+    tfBox.innerHTML = `
+      <div class="prop-row">
+        <span class="prop-label">Position</span>
+        <span class="prop-val" id="prop-pos">${tf.offset.x.toFixed(2)}, ${tf.offset.y.toFixed(2)}, ${tf.offset.z.toFixed(2)}</span>
+      </div>
+      <div class="prop-row">
+        <span class="prop-label">Rotation</span>
+        <span class="prop-val" id="prop-rot">${Math.round((tf.rotationZ * 180) / Math.PI)}°, ${Math.round((tf.rotationX * 180) / Math.PI)}°</span>
+      </div>
+      <div class="prop-row">
+        <span class="prop-label">Scale</span>
+        <span class="prop-val" id="prop-scale">${tf.scale.toFixed(2)}×</span>
+      </div>
+    `;
+    section.appendChild(tfBox);
+
+    // Appearance / Material controls
+    const mat = ws.getPartMaterial?.(this.partId) || {
+      color: "#3fd0ff",
+      roughness: 0.4,
+      metalness: 0.4,
+      wireframe: false
+    };
+    const matBox = this._el("div", "prop-group");
+
+    // Wireframe switch
+    const wireLabel = this._el("label", "prop-switch-label");
+    const wireCheck = this._el("input", "prop-switch");
+    wireCheck.type = "checkbox";
+    wireCheck.checked = Boolean(mat.wireframe);
+    wireCheck.addEventListener("change", () => {
+      ws.setPartMaterial?.(this.partId, { wireframe: wireCheck.checked });
+    });
+    wireLabel.appendChild(wireCheck);
+    wireLabel.appendChild(this._el("span", "", " Wireframe rendering"));
+    matBox.appendChild(wireLabel);
+
+    // Color picker & Swatches
+    const colorLabel = this._el("div", "prop-label-sub", "Color & Material Tone");
+    matBox.appendChild(colorLabel);
+
+    const colorRow = this._el("div", "prop-color-row");
+    const colorInput = this._el("input", "prop-color-input");
+    colorInput.type = "color";
+    colorInput.value = mat.color.startsWith("#") ? mat.color : "#3fd0ff";
+    colorInput.title = "Custom color";
+    colorInput.addEventListener("input", () => {
+      ws.setPartMaterial?.(this.partId, { color: colorInput.value });
+    });
+
+    const swatchRow = this._el("div", "prop-swatches");
+    const swatches = [
+      "#3fd0ff", "#10b981", "#a855f7", "#f59e0b",
+      "#ef4444", "#3b82f6", "#f8fafc", "#1e293b"
+    ];
+    for (const hex of swatches) {
+      const sw = this._el("button", "prop-swatch");
+      sw.type = "button";
+      sw.style.backgroundColor = hex;
+      sw.title = hex;
+      sw.addEventListener("click", () => {
+        colorInput.value = hex;
+        ws.setPartMaterial?.(this.partId, { color: hex });
+      });
+      swatchRow.appendChild(sw);
+    }
+    colorRow.appendChild(colorInput);
+    colorRow.appendChild(swatchRow);
+    matBox.appendChild(colorRow);
+
+    // Sliders for Roughness and Metalness
+    const sliderRow = this._el("div", "prop-sliders");
+    sliderRow.innerHTML = `
+      <label class="prop-slider-item">
+        <span>Roughness <b id="prop-rough-val">${mat.roughness.toFixed(2)}</b></span>
+        <input type="range" class="prop-slider-input" id="prop-rough-input" min="0" max="1" step="0.05" value="${mat.roughness}">
+      </label>
+      <label class="prop-slider-item">
+        <span>Metalness <b id="prop-metal-val">${mat.metalness.toFixed(2)}</b></span>
+        <input type="range" class="prop-slider-input" id="prop-metal-input" min="0" max="1" step="0.05" value="${mat.metalness}">
+      </label>
+    `;
+    const roughInput = sliderRow.querySelector("#prop-rough-input");
+    const metalInput = sliderRow.querySelector("#prop-metal-input");
+    const roughVal = sliderRow.querySelector("#prop-rough-val");
+    const metalVal = sliderRow.querySelector("#prop-metal-val");
+
+    roughInput?.addEventListener("input", () => {
+      const val = parseFloat(roughInput.value);
+      if (roughVal) roughVal.textContent = val.toFixed(2);
+      ws.setPartMaterial?.(this.partId, { roughness: val });
+    });
+    metalInput?.addEventListener("input", () => {
+      const val = parseFloat(metalInput.value);
+      if (metalVal) metalVal.textContent = val.toFixed(2);
+      ws.setPartMaterial?.(this.partId, { metalness: val });
+    });
+    matBox.appendChild(sliderRow);
+
+    // Playground Object Specific Action
+    if (part.userData?.isPlaygroundObject) {
+      const pgActions = this._el("div", "prop-actions");
+      const delBtn = this._el("button", "btn btn-danger btn-sm", "Delete 3D Object");
+      delBtn.type = "button";
+      delBtn.addEventListener("click", () => {
+        ws.removePlaygroundObject?.(this.partId);
+      });
+      pgActions.appendChild(delBtn);
+      matBox.appendChild(pgActions);
+    }
+
+    section.appendChild(matBox);
+  }
+
+  updateProperties() {
+    if (!this.partId || this.tab !== "overview") return;
+    const ws = this.getWorkspace();
+    const tf = ws?.getPartTransform(this.partId);
+    if (!tf) return;
+    const posEl = this.root.querySelector("#prop-pos");
+    const rotEl = this.root.querySelector("#prop-rot");
+    const scaleEl = this.root.querySelector("#prop-scale");
+    if (posEl) posEl.textContent = `${tf.offset.x.toFixed(2)}, ${tf.offset.y.toFixed(2)}, ${tf.offset.z.toFixed(2)}`;
+    if (rotEl) rotEl.textContent = `${Math.round((tf.rotationZ * 180) / Math.PI)}°, ${Math.round((tf.rotationX * 180) / Math.PI)}°`;
+    if (scaleEl) scaleEl.textContent = `${tf.scale.toFixed(2)}×`;
   }
 
   _renderSystem(body, data) {

@@ -33,6 +33,7 @@ import {
   getModelDefinition,
   getComponentData
 } from "./engineeringData.js";
+import { VoiceController, VOICE_STATUS } from "./voiceControl.js";
 
 /* ------------------------------------------------------------------------- */
 /* DOM HELPERS                                                               */
@@ -49,8 +50,12 @@ const dom = {
   cameraToggle: $("#camera-toggle"),
   cameraToggleLabel: $("#camera-toggle-label"),
   cameraDot: $("#camera-dot"),
+  voiceToggle: $("#voice-toggle"),
+  voiceToggleLabel: $("#voice-toggle-label"),
+  voiceDot: $("#voice-dot"),
 
   pillCamera: $("#pill-camera"),
+  pillVoice: $("#pill-voice"),
   pillHands: $("#pill-hands"),
   pillGesture: $("#pill-gesture"),
 
@@ -58,7 +63,15 @@ const dom = {
   modelList: $("#model-list"),
   partList: $("#part-list"),
   partCount: $("#part-count"),
+  playgroundCount: $("#playground-count"),
   libraryFootModel: $("#library-foot-model"),
+
+  pgAddCube: $("#pg-add-cube"),
+  pgAddSphere: $("#pg-add-sphere"),
+  pgAddCylinder: $("#pg-add-cylinder"),
+  pgAddTorus: $("#pg-add-torus"),
+  pgAddCone: $("#pg-add-cone"),
+  pgClear: $("#pg-clear"),
 
   toolExplode: $("#tool-explode"),
   toolIsolate: $("#tool-isolate"),
@@ -92,6 +105,10 @@ const dom = {
 
   reticle: $("#reticle"),
   reticleLabel: $("#reticle-label"),
+  voiceHud: $("#voice-hud"),
+  voiceHudMic: $("#voice-hud-mic"),
+  voiceHudText: $("#voice-hud-text"),
+  voiceHudBadge: $("#voice-hud-badge"),
   viewportHint: $("#viewport-hint"),
   readoutPos: $("#readout-pos"),
   readoutRot: $("#readout-rot"),
@@ -142,12 +159,16 @@ const dom = {
   chatInput: $("#chat-input"),
 
   statusCamera: $("#status-camera"),
+  statusVoice: $("#status-voice"),
   statusHands: $("#status-hands"),
   statusGesture: $("#status-gesture"),
   statusTracking: $("#status-tracking"),
   statusSelected: $("#status-selected"),
   statusMode: $("#status-mode"),
   statusApp: $("#status-app"),
+
+  setVoiceEnabled: $("#set-voice-enabled"),
+  setSoundEffects: $("#set-sound-effects"),
 
   settingsDrawer: $("#settings-drawer"),
   drawerBackdrop: $("#drawer-backdrop"),
@@ -246,6 +267,7 @@ let tracker;
 let overlay;
 let inspector;
 let assistant;
+let voice;
 
 /**
  * Boot is split in two so that a missing GPU degrades the experience instead of
@@ -255,6 +277,7 @@ let assistant;
 function setupChrome() {
   setupSceneTools();
   setupCameraControls();
+  setupVoiceControls();
   setupAssistantChrome();
   setupDrawer();
   buildCategoryRow();
@@ -629,6 +652,13 @@ function updateStatusSelection(partId) {
 /* ------------------------------------------------------------------------- */
 
 function setupSceneTools() {
+  dom.pgAddCube?.addEventListener("click", () => addPlaygroundShape("cube"));
+  dom.pgAddSphere?.addEventListener("click", () => addPlaygroundShape("sphere"));
+  dom.pgAddCylinder?.addEventListener("click", () => addPlaygroundShape("cylinder"));
+  dom.pgAddTorus?.addEventListener("click", () => addPlaygroundShape("torus"));
+  dom.pgAddCone?.addEventListener("click", () => addPlaygroundShape("cone"));
+  dom.pgClear?.addEventListener("click", () => clearPlaygroundShapes());
+
   dom.toolExplode.addEventListener("click", () => {
     if (!workspace) return;
     const next = (workspace.explodeAmount ?? 0) > 0.001 ? 0 : 100;
@@ -826,6 +856,220 @@ function setupCameraControls() {
   });
   dom.cameraView?.addEventListener("click", toggleCameraView);
   dom.workspaceCamEnable?.addEventListener("click", toggleCamera);
+}
+
+/* ------------------------------------------------------------------------- */
+/* 3D PLAYGROUND OBJECT HELPERS                                              */
+/* ------------------------------------------------------------------------- */
+
+function addPlaygroundShape(type) {
+  if (!workspace) {
+    toast("3D renderer unavailable", "warn", 3000);
+    return;
+  }
+  const mesh = workspace.addPlaygroundObject(type);
+  if (voice) voice.playChime("spawn");
+  updatePlaygroundCount();
+  renderPartList();
+  handleSelect(mesh.userData.partId, "playground");
+  toast(`Spawned 3D ${type.toUpperCase()}`, "accent", 2400);
+}
+
+function clearPlaygroundShapes() {
+  if (!workspace) return;
+  const count = workspace.playgroundObjects?.length || 0;
+  workspace.clearPlaygroundObjects();
+  updatePlaygroundCount();
+  renderPartList();
+  handleSelect(null, "ui");
+  toast(`Cleared ${count} playground object(s)`, "", 2000);
+}
+
+function updatePlaygroundCount() {
+  const count = workspace?.playgroundObjects?.length || 0;
+  if (dom.playgroundCount) dom.playgroundCount.textContent = String(count);
+}
+
+/* ------------------------------------------------------------------------- */
+/* VOICE COMMANDS                                                            */
+/* ------------------------------------------------------------------------- */
+
+function setupVoiceControls() {
+  voice = new VoiceController({
+    soundEnabled: settings.voice?.soundEffects !== false,
+    onStatus: (status, error) => {
+      syncVoiceUI(status, error);
+    },
+    onHeard: (transcript, isFinal) => {
+      if (dom.voiceHud) {
+        dom.voiceHud.hidden = false;
+        if (dom.voiceHudText) dom.voiceHudText.textContent = transcript;
+        if (dom.voiceHudBadge) dom.voiceHudBadge.textContent = isFinal ? "PROCESSED" : "HEARING…";
+      }
+    },
+    onCommand: cmd => {
+      handleVoiceCommand(cmd);
+    },
+    onError: err => {
+      toast(`Voice: ${err.message}`, "warn", 3500);
+    }
+  });
+
+  dom.voiceToggle?.addEventListener("click", () => {
+    toggleVoice();
+  });
+}
+
+function toggleVoice() {
+  if (!voice) return;
+  if (!voice.isSupported) {
+    toast("Speech recognition is not supported in this browser environment.", "warn", 5000);
+    return;
+  }
+  const listening = voice.toggle();
+  if (listening) {
+    toast("Voice commands active. Say 'move', 'rotate', 'add cube', 'wireframe', 'reset'…", "accent", 3500);
+  } else {
+    toast("Voice commands paused", "", 1800);
+  }
+}
+
+function syncVoiceUI(status, error) {
+  const isLive = status === VOICE_STATUS.LISTENING;
+  if (dom.voiceDot) {
+    dom.voiceDot.className = `dot ${isLive ? "dot-on dot-pulse" : "dot-off"}`;
+  }
+  if (dom.voiceToggleLabel) {
+    dom.voiceToggleLabel.textContent = isLive ? "Listening…" : "Voice control";
+  }
+  if (dom.pillVoice) {
+    dom.pillVoice.classList.toggle("pill-live", isLive);
+    const span = dom.pillVoice.querySelector("span");
+    if (span) span.textContent = isLive ? "VOICE ON" : "VOICE OFF";
+  }
+  if (dom.statusVoice) {
+    dom.statusVoice.textContent = isLive ? "Listening" : error ? "Error" : "Inactive";
+    dom.statusVoice.className = `status-val ${isLive ? "status-ok" : ""}`;
+  }
+  if (dom.voiceHud) {
+    dom.voiceHud.hidden = !isLive;
+    if (isLive && dom.voiceHudText) {
+      dom.voiceHudText.textContent = "Listening for commands…";
+      if (dom.voiceHudBadge) dom.voiceHudBadge.textContent = "SAY A COMMAND";
+    }
+  }
+}
+
+function handleVoiceCommand(cmd) {
+  if (!cmd) return;
+  if (dom.voiceHudBadge) dom.voiceHudBadge.textContent = `✓ ${cmd.label.toUpperCase()}`;
+  if (dom.voiceHudText) dom.voiceHudText.textContent = `"${cmd.raw}"`;
+
+  switch (cmd.type) {
+    case "mode":
+      setMode(cmd.mode);
+      toast(`Voice: Switched to ${cmd.mode.toUpperCase()} mode`, "accent", 2500);
+      break;
+
+    case "explode-amount":
+      setExplodeAmount(cmd.amount * 100);
+      toast(`Voice: Explode set to ${Math.round(cmd.amount * 100)}%`, "accent", 2500);
+      break;
+
+    case "add-object":
+      addPlaygroundShape(cmd.shape);
+      break;
+
+    case "color":
+      if (workspace) {
+        const targetPart = state.partId || workspace.selected?.userData?.partId;
+        if (targetPart) {
+          workspace.setPartMaterial(targetPart, { color: cmd.color });
+          toast(`Voice: Recaptured ${targetPart} color to ${cmd.name.toUpperCase()}`, "accent", 2500);
+        } else {
+          workspace.parts.forEach(p => {
+            workspace.setPartMaterial(p.userData.partId, { color: cmd.color });
+          });
+          toast(`Voice: Recaptured assembly color to ${cmd.name.toUpperCase()}`, "accent", 2500);
+        }
+      }
+      break;
+
+    case "model":
+      switchModel(cmd.modelId);
+      break;
+
+    case "action":
+      switch (cmd.action) {
+        case "reset":
+          workspace?.resetView();
+          setExplodeAmount(0);
+          workspace?.clearSelection();
+          handleSelect(null, "ui");
+          toast("Voice: Reset view & transforms", "accent", 2200);
+          break;
+        case "toggle-camera":
+          toggleCamera();
+          break;
+        case "toggle-camera-view":
+          toggleCameraView();
+          break;
+        case "toggle-grid":
+          store.update("view", { grid: !settings.view.grid });
+          toast(`Voice: Grid ${!settings.view.grid ? "enabled" : "disabled"}`, "", 1800);
+          break;
+        case "toggle-shadows":
+          store.update("view", { shadows: !settings.view.shadows });
+          toast(`Voice: Shadows ${!settings.view.shadows ? "enabled" : "disabled"}`, "", 1800);
+          break;
+        case "toggle-orbit":
+          store.update("view", { autoRotate: !settings.view.autoRotate });
+          toast(`Voice: Auto-orbit ${!settings.view.autoRotate ? "active" : "stopped"}`, "", 1800);
+          break;
+        case "toggle-wireframe":
+          if (workspace) {
+            const isWire = workspace.toggleWireframe(state.partId);
+            toast(`Voice: Wireframe ${isWire ? "ON" : "OFF"}`, "accent", 2000);
+          }
+          break;
+        case "solid":
+          if (workspace) {
+            workspace.parts.forEach(p => workspace.setPartMaterial(p.userData.partId, { wireframe: false }));
+            toast("Voice: Shaded solid surface", "accent", 2000);
+          }
+          break;
+        case "isolate":
+          toggleIsolate();
+          break;
+        case "focus":
+          workspace?.focusSelected();
+          toast("Voice: Focused selected component", "accent", 2000);
+          break;
+        case "clear-selection":
+          workspace?.clearSelection();
+          handleSelect(null, "ui");
+          toast("Voice: Cleared selection", "", 1800);
+          break;
+        case "toggle-panels":
+          setPanelState({ left: !settings.ui.leftOpen, right: !settings.ui.rightOpen });
+          break;
+        case "toggle-fullscreen":
+          toggleFullscreen();
+          break;
+        case "clear-objects":
+          clearPlaygroundShapes();
+          break;
+        case "delete-selected":
+          if (state.partId && workspace?.getPart(state.partId)?.userData?.isPlaygroundObject) {
+            workspace.removePlaygroundObject(state.partId);
+            updatePlaygroundCount();
+            renderPartList();
+            toast("Voice: Deleted 3D object", "", 2000);
+          }
+          break;
+      }
+      break;
+  }
 }
 
 
@@ -1152,6 +1396,7 @@ function startLoop() {
     animator.update(dt);
     processHands(now / 1000);
     updateHud(dt);
+    inspector?.updateProperties?.();
 
     requestAnimationFrame(loop);
   };
@@ -1265,6 +1510,14 @@ function processHands(now) {
 
   overlay?.draw(hands, handedness, { pinched: overlayPinched, activity, targets });
   drawWorkspaceOverlay(hands, handedness, activeStates, activity, targets, tethers);
+
+  const anyPinched = activeStates.some(hand => hand?.pinched);
+  if (anyPinched && !state.wasPinched) {
+    voice?.playChime("grab");
+  } else if (!anyPinched && state.wasPinched) {
+    voice?.playChime("release");
+  }
+  state.wasPinched = anyPinched;
 
   // ---- run the solver -------------------------------------------------------
   // A pinch in MOVE/ROTATE grabs what you are pointing at. Promote the hovered
@@ -1856,7 +2109,9 @@ const BINDINGS = [
   ["set-shadows", "view", "shadows", "checkbox"],
   ["set-autorotate", "view", "autoRotate", "checkbox"],
   ["set-bloom", "view", "bloom", "checkbox"],
-  ["set-quality", "view", "quality", "select"]
+  ["set-quality", "view", "quality", "select"],
+  ["set-voice-enabled", "voice", "enabled", "checkbox"],
+  ["set-sound-effects", "voice", "soundEffects", "checkbox"]
 ];
 
 function setupSettingsUI() {
@@ -2049,6 +2304,16 @@ function applySettings({ section, keys } = {}) {
       scaleSensitivity: settings.object.scaleSensitivity,
       zSensitivity: settings.object.depthSensitivity
     });
+  }
+
+  // ---- Voice ----
+  if (all || section === "voice") {
+    if (voice) {
+      voice.soundEnabled = settings.voice?.soundEffects !== false;
+      if (settings.voice?.enabled === false && voice.isListening) {
+        voice.stop();
+      }
+    }
   }
 
   if (!settingsAppliedOnce && all) {
@@ -2266,6 +2531,10 @@ function setupShortcuts() {
       case "v":
         event.preventDefault();
         toggleCameraView();
+        break;
+      case "m":
+        event.preventDefault();
+        toggleVoice();
         break;
       case "c":
         event.preventDefault();
