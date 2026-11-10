@@ -2147,10 +2147,23 @@ function handleVoiceIntent(intent, phrase) {
       return;
     }
 
+    case "select": {
+      const props = playground?.props || [];
+      const match = props.find(prop => prop.primitive === value);
+      if (match) {
+        selectProp(match.id, "voice");
+        toast(`Selected ${match.name}`, "accent", 1400);
+      } else {
+        toast(`No ${value} in the scene — say "add ${value}" first`, "warn", 2400);
+      }
+      return;
+    }
+
     case "object":
       if (value === "duplicate") { playground?.duplicate(); refreshSceneOutliner(); }
       if (value === "delete") { playground?.remove(); refreshSceneOutliner(); }
       if (value === "clear") { playground?.clear(); refreshSceneOutliner(); }
+      if (value === "next" || value === "prev") cyclePropSelection(value === "next" ? 1 : -1);
       return;
 
     case "transform":
@@ -2186,6 +2199,21 @@ function handleVoiceIntent(intent, phrase) {
     default:
       void phrase;
   }
+}
+
+/** Step the playground selection, so voice and keyboard can both cycle. */
+function cyclePropSelection(direction) {
+  const props = playground?.props || [];
+  if (!props.length) {
+    toast("Nothing to select yet", "warn", 1600);
+    return null;
+  }
+  const current = props.findIndex(prop => prop.id === playground.selectedId);
+  const next = ((current < 0 ? 0 : current + direction) + props.length) % props.length;
+  const prop = props[next];
+  selectProp(prop.id, "voice");
+  toast(`Selected ${prop.name}`, "accent", 1200);
+  return prop;
 }
 
 function applyVoiceTransform(direction) {

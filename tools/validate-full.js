@@ -579,6 +579,46 @@ check("select never transforms the scene",
   !sel.position && sel.scale === undefined && sel.rotationZ === undefined,
   sel.intent);
 
+section("5e2 · Voice can pick a target by name");
+
+const voicePg = api.getPlayground();
+voicePg.clear();
+voicePg.addPrimitive("cube");
+voicePg.addPrimitive("sphere");
+voicePg.select(null);
+
+api.handleVoiceIntentForTest("select:cube");
+const cubeProp = voicePg.props.find(p => p.primitive === "cube");
+check("'select the cube' selects the cube", voicePg.selectedId === cubeProp.id,
+  voicePg.selectedId || "(none)");
+
+api.handleVoiceIntentForTest("select:sphere");
+const sphereProp = voicePg.props.find(p => p.primitive === "sphere");
+check("'select the sphere' switches to the sphere", voicePg.selectedId === sphereProp.id);
+
+api.handleVoiceIntentForTest("object:next");
+check("'next object' cycles the selection",
+  voicePg.selectedId !== sphereProp.id && voicePg.selectedId === cubeProp.id,
+  voicePg.selectedId || "(none)");
+
+// Transforms must now land on the selected object, not the assembly.
+const beforeMove = voicePg.getTransform(cubeProp.id).position.y;
+api.handleVoiceIntentForTest("transform:up");
+const afterMove = voicePg.getTransform(cubeProp.id).position.y;
+check("a transform applies to the voice-selected object",
+  afterMove > beforeMove, `${beforeMove.toFixed(2)} -> ${afterMove.toFixed(2)}`);
+
+// Selecting something absent must say so rather than silently doing nothing.
+// Assert on the real toast DOM: the toast helper is a hoisted local function,
+// so replacing it on the debug API would not intercept the call.
+const toastStack = doc.querySelector(".toast-stack") || doc.getElementById("toast-stack");
+toastStack?.replaceChildren();
+api.handleVoiceIntentForTest("select:cone");
+const latestToast = toastStack?.lastElementChild?.textContent || "";
+check("selecting an absent object reports it", /cone/i.test(latestToast), latestToast);
+
+voicePg.clear();
+
 section("5f · 3D and 2D skeletons agree on screen");
 
 // The 2D overlay compensates for object-fit: cover cropping; the 3D rigs used

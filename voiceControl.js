@@ -20,8 +20,20 @@
 
 /** Command grammar: each entry is [patterns, intent, example]. */
 const COMMAND_TABLE = [
+  // ---- pick a specific object (before the mode verbs, so "select the cube"
+  // selects the cube instead of switching to SELECT mode) --------------------
+  [/\b(select|grab|pick|choose)\b.*\b(cube|box)\b/, "select:cube", "select the cube"],
+  [/\b(select|grab|pick|choose)\b.*\b(sphere|ball|orb)\b/, "select:sphere", "select the sphere"],
+  [/\b(select|grab|pick|choose)\b.*\b(cylinder|tube)\b/, "select:cylinder", "select the cylinder"],
+  [/\b(select|grab|pick|choose)\b.*\b(cone)\b/, "select:cone", "select the cone"],
+  [/\b(select|grab|pick|choose)\b.*\b(torus|donut|ring)\b/, "select:torus", "select the torus"],
+  [/\b(select|grab|pick|choose)\b.*\b(knot)\b/, "select:torusKnot", "select the knot"],
+  [/\b(select|grab|pick|choose)\b.*\b(crystal|gem|icosahedron)\b/, "select:icosahedron", "select the crystal"],
+
+
   // ---- modes -------------------------------------------------------------
-  [/\b(select|selection|inspect)\s*(mode)?\b/, "mode:select", "select mode"],
+  // "select" only means SELECT mode when it is not naming an object to pick.
+  [/\b(select|selection|inspect)\b(?!\s+(?:the\s+|a\s+|an\s+|my\s+)?(?:cube|box|sphere|ball|orb|cylinder|tube|cone|torus|donut|ring|knot|crystal|gem|icosahedron)\b)/, "mode:select", "select mode"],
   [/\b(move|translate|drag)\b(?!\s+(it|the object|this|that)?\s*(up|down|left|right|forward|back))\s*(mode)?\b/, "mode:move", "move mode"],
   [/\b(rotate|rotation|spin|turn)\s*(mode)?\b/, "mode:rotate", "rotate mode"],
   [/\b(scale|resize)\s*(mode)?\b(?!.*\b(bigger|smaller|up|down)\b)/, "mode:scale", "scale mode"],
@@ -35,6 +47,9 @@ const COMMAND_TABLE = [
   [/\b(add|create|spawn|new)\b.*\b(torus|donut|ring)\b/, "add:torus", "add torus"],
   [/\b(add|create|spawn|new)\b.*\b(knot)\b/, "add:torusKnot", "add knot"],
   [/\b(add|create|spawn|new)\b.*\b(crystal|gem|icosahedron)\b/, "add:icosahedron", "add crystal"],
+
+  [/\b(next)\b.*\bobject\b/, "object:next", "next object"],
+  [/\b(previous|prev|last)\b.*\bobject\b/, "object:prev", "previous object"],
 
   [/\b(duplicate|copy|clone)\b/, "object:duplicate", "duplicate"],
   [/\b(delete|remove|destroy)\b/, "object:delete", "delete"],
