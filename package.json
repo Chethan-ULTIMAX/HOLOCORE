@@ -13,7 +13,8 @@
     "preview": "node tools/render-preview.js",
     "preview:parts": "node tools/render-preview.js --parts",
     "validate:full": "node tools/validate-full.js",
-    "visual": "node tools/visual/render-hand.mjs && node tools/visual/layout-preview.mjs"
+    "visual": "node tools/visual/render-hand.mjs && node tools/visual/layout-preview.mjs",
+    "visual:rig": "node tools/visual/render-rig3d.mjs"
   },
   "dependencies": {
     "three": "0.187.0"

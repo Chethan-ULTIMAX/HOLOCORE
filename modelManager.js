@@ -59,6 +59,8 @@ export class Workspace {
     this._targetGoal = null;
     this._clock = new THREE.Clock();
     this._hoverPending = null;
+    /** Group composited after the main pass (the hand skeletons). */
+    this.lateLayer = null;
 
     this._initRenderer();
     this._initScene();
@@ -1017,8 +1019,44 @@ export class Workspace {
 
     this.controls.update();
 
+    // ---- render, with the hands drawn late -------------------------------
+    // The hand rigs are scene objects so they keep real 3D shape and depth, but
+    // they are excluded from the scene/bloom pass and drawn afterwards with
+    // depth testing off. Two things follow:
+    //
+    //   1. A model sweeping in front of the hand can never hide it. Losing the
+    //      skeleton mid-gesture is far worse than a small occlusion error.
+    //   2. The skeleton is not smeared by bloom, so bones and joints stay crisp
+    //      instead of glowing into a blur.
+    //
+    // Depth is not thrown away: the rig dims and shrinks when scene geometry is
+    // between it and the camera (see HandRig.applyDepth), so it still reads as
+    // 3D rather than as a flat sticker.
+    const late = this.lateLayer && this.lateLayer.visible;
+    if (late) this.lateLayer.visible = false;
+
     if (this.composer) this.composer.render();
     else this.renderer.render(this.scene, this.camera);
+
+    if (late) {
+      this.lateLayer.visible = true;
+      const autoClear = this.renderer.autoClear;
+      this.renderer.autoClear = false;
+      this.renderer.clearDepth();
+      this.renderer.render(this.scene, this.camera);
+      this.renderer.autoClear = autoClear;
+    }
+  }
+
+  /**
+   * Attach the group that must be composited over the frame.
+   *
+   * main.js hands over the hand-skeleton root here once the rigs exist, so the
+   * render loop knows what to hold back for the second pass.
+   */
+  setLateLayer(object3d) {
+    this.lateLayer = object3d || null;
+    return this.lateLayer;
   }
 
   /**

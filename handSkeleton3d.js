@@ -38,20 +38,54 @@ const TIP_INDICES = [4, 8, 12, 16, 20];
 /** Distance from the camera to the hand plane, in world units. */
 const HAND_DEPTH = 6.2;
 
+/**
+ * Neon cyan, kept deliberately close to the reference implementation's
+ * `0x00ccff` line colour. The two hands differ only enough to be told apart at
+ * a glance - the single-colour look is what makes the overlay read as one
+ * instrument rather than two unrelated drawings.
+ */
 const PALETTE = {
   left: {
-    core: 0x9df3ff,
-    ring: 0x4ad8ff,
-    bone: 0x38c8ff,
+    // White is confined to `core`, and the core is deliberately small. Fingertip
+    // caps are cyan like the bones — a white tip at that size reads as a grey
+    // blob and breaks the neon identity of the whole overlay.
+    core: 0xffffff,
+    ring: 0x53e4ff,
+    bone: 0x00d4ff,
+    glow: 0x009dff,
+    tip: 0x5fe8ff,
+    palm: 0x0fa8d8,
     emissive: 0x14708f
   },
   right: {
-    core: 0xd8fbff,
-    ring: 0x62e0ff,
-    bone: 0x48d0ff,
+    core: 0xffffff,
+    ring: 0x74ecff,
+    bone: 0x22c4ff,
+    glow: 0x1a86ff,
+    tip: 0x7ceeff,
+    palm: 0x1490cc,
     emissive: 0x157a99
   }
 };
+
+/** True when `node` is `ancestor` or somewhere beneath it. */
+function isDescendantOf(node, ancestor) {
+  let current = node;
+  while (current) {
+    if (current === ancestor) return true;
+    current = current.parent;
+  }
+  return false;
+}
+
+/**
+ * A quaternion that makes a flat piece (the fingertip halo) face the camera.
+ * Cheaper and more stable than lookAt for something rebuilding every frame.
+ */
+function cameraFacingQuaternion(camera) {
+  if (!camera) return new THREE.Quaternion();
+  return camera.quaternion.clone();
+}
 
 function paletteFor(side) {
   return String(side).toLowerCase() === "left" ? PALETTE.left : PALETTE.right;
@@ -116,88 +150,161 @@ export function landmarkToWorld(point, camera, {
 }
 
 /**
- * One hand's skeleton: 21 joint spheres, 21 bone tubes, and a palm plate.
- * Geometry is shared across hands; only materials differ, so this is cheap
- * enough to run at frame rate.
+ * One hand's skeleton.
+ *
+ * This is real 3D geometry, not a billboard: tapered bone volumes with genuine
+ * thickness, layered joints, fingertip tips with haloes, and a palm plate that
+ * fills the back of the hand. Fingers reaching toward the lens foreshorten and
+ * the pieces genuinely sit in front of / behind one another in depth.
+ *
+ * RENDER ORDER (the "hybrid" part)
+ *
+ * The rig draws late and with `depthTest: false`, so a model in front of the
+ * hand can never hide it — losing the skeleton the moment it passes over the
+ * object is far worse than a small occlusion inaccuracy. Depth is *not*
+ * discarded, though: each piece's opacity and size are scaled by how far behind
+ * the nearest scene geometry it is, so a hand passing behind the model dims and
+ * shrinks as it recedes instead of flattening to the same brightness. That is
+ * what keeps it reading as 3D while staying always-visible.
  */
 class HandRig {
   constructor(side) {
     const colours = paletteFor(side);
     this.group = new THREE.Group();
     this.group.name = `hand-${side}`;
+    this.side = side;
 
-    this.jointGeometry = new THREE.SphereGeometry(1, 14, 12);
-    this.tipGeometry = new THREE.SphereGeometry(1, 16, 14);
+    // Shared geometry — 21 joints × 2 hands at 60fps must not allocate.
+    this.jointGeometry = new THREE.SphereGeometry(1, 16, 12);
+    this.tipGeometry = new THREE.SphereGeometry(1, 20, 16);
+    // An annulus, not a filled disc: a ring reads as an aura, a disc reads as
+    // a flat sticker over the video.
+    this.haloGeometry = new THREE.RingGeometry(0.55, 1, 28);
+    this.boneGeometry = new THREE.CylinderGeometry(1, 1, 1, 10, 1, false);
 
-    // The workspace renders with ACES filmic tone mapping. Applied to these
-    // overlays it drags the authored cyan towards grey: #1ad1ff (saturation
-    // 0.90) comes out as #5cbac4 (0.53), and the hot cores flatten to
-    // near-white. The hands are a UI overlay, not scene-lit geometry, so they
-    // opt out of tone mapping and keep the colour that was authored — which is
-    // what makes the skeleton read as vivid rather than muted.
-    this.jointMaterial = new THREE.MeshStandardMaterial({
-      color: colours.ring,
-      emissive: colours.emissive,
-      emissiveIntensity: 2.4,
-      roughness: 0.25,
-      metalness: 0,
+    // Every material opts out of tone mapping: ACES at 1.05 exposure drags the
+    // authored cyan towards grey (#1ad1ff -> #5cbac4) and flattens the hot
+    // cores to near-white, which is what made the skeleton look muted.
+    const make = (options) => new THREE.MeshBasicMaterial({
       transparent: true,
-      opacity: 0.96
-    });
-    this.coreMaterial = new THREE.MeshBasicMaterial({ color: colours.core });
-    this.boneMaterial = new THREE.MeshBasicMaterial({
-      color: colours.bone,
-      transparent: true,
-      opacity: 0.78
-    });
-    this.palmMaterial = new THREE.MeshBasicMaterial({
-      color: colours.bone,
-      transparent: true,
-      opacity: 0.16,
-      side: THREE.DoubleSide,
-      depthWrite: false
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: false,
+      ...options
     });
 
-    for (const material of [
-      this.jointMaterial, this.coreMaterial, this.boneMaterial, this.palmMaterial
-    ]) {
-      material.toneMapped = false;
+    this.materials = {
+      // Outer glow sleeve. Additive, so it accumulates into a real halo against
+      // whatever is behind it rather than washing the backdrop toward grey.
+      boneGlow: make({
+        color: colours.glow,
+        opacity: 0.5,
+        blending: THREE.AdditiveBlending
+      }),
+      // The solid bone core: saturated cyan, fully opaque, so the limb reads as
+      // a defined object rather than a smudge.
+      bone: make({ color: colours.bone, opacity: 1 }),
+      // Joint ring: deeper cyan than the bone, so joints register as nodes.
+      joint: make({ color: colours.ring, opacity: 1 }),
+      // Hot centre, small and bright.
+      jointCore: make({ color: colours.core, opacity: 1 }),
+      // Fingertips read brightest of all — they are where the interaction is.
+      tip: make({ color: colours.tip, opacity: 1 }),
+      halo: make({
+        color: colours.glow,
+        opacity: 0.55,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending
+      }),
+      // The palm is a whisper. Additive and very low, so it reads as a soft
+      // energy fill behind the bones rather than a solid slab laid over the
+      // model — the thing that made an early pass look like a sticker.
+      palm: make({
+        color: colours.palm,
+        opacity: 0.16,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending
+      })
+    };
+
+    // ---- layers, in draw order -------------------------------------------
+    // Each layer is a separate group so renderOrder is stable and the whole
+    // rig can be faded by one multiplier.
+    this.palmLayer = new THREE.Group();
+    this.palmLayer.renderOrder = 30;
+
+    this.glowLayer = new THREE.Group();
+    this.glowLayer.renderOrder = 31;
+
+    this.boneLayer = new THREE.Group();
+    this.boneLayer.renderOrder = 32;
+
+    this.jointLayer = new THREE.Group();
+    this.jointLayer.renderOrder = 33;
+
+    this.tipLayer = new THREE.Group();
+    this.tipLayer.renderOrder = 34;
+
+    // Palm plate: a single triangle fan through wrist + knuckles.
+    this.palm = new THREE.Mesh(new THREE.BufferGeometry(), this.materials.palm);
+    this.palm.renderOrder = 30;
+    this.palmLayer.add(this.palm);
+
+    // Bones: a glow sleeve plus a solid core, per connection.
+    this.boneGlows = [];
+    this.bones = [];
+    for (let i = 0; i < HAND_CONNECTIONS.length; i++) {
+      const glow = new THREE.Mesh(this.boneGeometry, this.materials.boneGlow);
+      glow.renderOrder = 31;
+      this.glowLayer.add(glow);
+      this.boneGlows.push(glow);
+
+      const bone = new THREE.Mesh(this.boneGeometry, this.materials.bone);
+      bone.renderOrder = 32;
+      this.boneLayer.add(bone);
+      this.bones.push(bone);
+
     }
 
+    // Joints.
     this.joints = [];
-    for (let i = 0; i < 21; i++) {
-      const isTip = TIP_INDICES.includes(i);
-      const mesh = new THREE.Mesh(isTip ? this.tipGeometry : this.jointGeometry, this.jointMaterial);
-      mesh.renderOrder = 10;
-      this.group.add(mesh);
-      this.joints.push(mesh);
-    }
-
-    // A small bright core inside each joint gives the glow a hot centre.
     this.cores = [];
     for (let i = 0; i < 21; i++) {
-      const core = new THREE.Mesh(this.jointGeometry, this.coreMaterial);
-      core.renderOrder = 11;
-      this.group.add(core);
+      const isTip = TIP_INDICES.includes(i);
+      const joint = new THREE.Mesh(isTip ? this.tipGeometry : this.jointGeometry,
+        isTip ? this.materials.tip : this.materials.joint);
+      joint.renderOrder = 33;
+      this.jointLayer.add(joint);
+      this.joints.push(joint);
+
+      const core = new THREE.Mesh(this.jointGeometry, this.materials.jointCore);
+      core.renderOrder = 34;
+      this.jointLayer.add(core);
       this.cores.push(core);
     }
 
-    // Bones are cylinders re-oriented each frame. Reusing them avoids
-    // allocating 21 geometries per hand per frame.
-    this.bones = [];
-    const boneGeometry = new THREE.CylinderGeometry(1, 1, 1, 8, 1, true);
-    for (let i = 0; i < HAND_CONNECTIONS.length; i++) {
-      const mesh = new THREE.Mesh(boneGeometry, this.boneMaterial);
-      mesh.renderOrder = 9;
-      this.group.add(mesh);
-      this.bones.push(mesh);
+    // Fingertip haloes: a soft ring that pulses while grabbing.
+    this.haloes = [];
+    for (const index of TIP_INDICES) {
+      const halo = new THREE.Mesh(this.haloGeometry, this.materials.halo);
+      halo.renderOrder = 34;
+      halo.userData.landmark = index;
+      this.tipLayer.add(halo);
+      this.haloes.push(halo);
     }
 
-    this.palm = new THREE.Mesh(new THREE.BufferGeometry(), this.palmMaterial);
-    this.palm.renderOrder = 8;
-    this.group.add(this.palm);
+    for (const layer of [this.palmLayer, this.glowLayer, this.boneLayer,
+      this.jointLayer, this.tipLayer]) {
+      this.group.add(layer);
+    }
 
     this.visible = true;
+    this._cameraRef = null;
+    this.pulse = 0;
+    this._depth = 1;
+    this._up = new THREE.Vector3(0, 1, 0);
+    this._dir = new THREE.Vector3();
+    this._mid = new THREE.Vector3();
   }
 
   setVisible(visible) {
@@ -207,46 +314,108 @@ class HandRig {
   }
 
   /**
+   * Depth cue, not depth occlusion.
+   *
+   * @param {number} nearness 0 = behind the model, 1 = at the hand plane.
+   * Everything about the rig scales with this: opacity, bone thickness and the
+   * halo, so a hand that has moved behind the object visibly recedes.
+   */
+  applyDepth(nearness) {
+    const n = Math.max(0, Math.min(1, nearness));
+    this._depth = n;
+    const fade = 0.42 + 0.58 * n;
+    this.materials.bone.opacity = 0.9 * fade;
+    this.materials.boneGlow.opacity = 0.16 * fade;
+    this.materials.joint.opacity = 0.95 * fade;
+    this.materials.jointCore.opacity = fade;
+    this.materials.tip.opacity = fade;
+    this.materials.halo.opacity = 0.22 * fade;
+    this.materials.palm.opacity = 0.2 * fade;
+  }
+
+  /**
    * @param {THREE.Vector3[]} positions world positions, one per landmark
    * @param {number} heat 0..1 gesture activity
    * @param {boolean} pinched
+   * @param {number} dt seconds since the last frame
    */
-  update(positions, heat = 0, pinched = false) {
-    const active = 1 + heat * 0.35 + (pinched ? 0.2 : 0);
+  update(positions, heat = 0, pinched = false, dt = 1 / 60) {
+    // Grabbed hands breathe: a gentle scale pulse is the clearest possible
+    // "the app knows you are holding something" signal.
+    const target = pinched ? 1 : 0;
+    this.pulse += (target - this.pulse) * Math.min(1, dt * 10);
+    this._pulsePhase = (this._pulsePhase || 0) + dt * 6.5;
+    const breathe = 1 + this.pulse * 0.14 * (0.5 + 0.5 * Math.sin(this._pulsePhase));
 
+    const depthScale = 0.82 + 0.18 * this._depth;
+    const active = (1 + heat * 0.22) * breathe * depthScale;
+
+    // ---- joints ----------------------------------------------------------
     for (let i = 0; i < 21; i++) {
       const isTip = TIP_INDICES.includes(i);
       const isWrist = i === 0;
-      const radius = (isWrist ? 0.052 : isTip ? 0.044 : 0.03) * active;
+      const radius = (isWrist ? 0.075 : isTip ? 0.062 : 0.042) * active;
+
       const joint = this.joints[i];
       joint.position.copy(positions[i]);
       joint.scale.setScalar(radius);
 
+      // A compact white core inside each joint: this is what makes the dots
+      // read as lit rather than as flat circles. Kept small (not much over half
+      // the sphere) or the joint would wash out to a white blob at distance.
       const core = this.cores[i];
       core.position.copy(positions[i]);
-      core.scale.setScalar(radius * 0.5);
+      const coreScale = isWrist ? 0.5 : isTip ? 0.34 : 0.3;
+      core.scale.setScalar(radius * coreScale);
     }
 
+    // ---- bones -----------------------------------------------------------
     for (let i = 0; i < HAND_CONNECTIONS.length; i++) {
       const [a, b] = HAND_CONNECTIONS[i];
       const pa = positions[a];
       const pb = positions[b];
       const bone = this.bones[i];
-      const mid = pa.clone().add(pb).multiplyScalar(0.5);
-      const dir = pb.clone().sub(pa);
-      const length = dir.length();
-      if (length < 1e-5) { bone.visible = false; continue; }
-      bone.visible = true;
-      bone.position.copy(mid);
-      bone.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
-      // Taper slightly toward fingertip bones.
+      const glow = this.boneGlows[i];
+
+      this._dir.subVectors(pb, pa);
+      const length = this._dir.length();
+      if (length < 1e-5) {
+        bone.visible = false;
+        glow.visible = false;
+        continue;
+      }
+      const mid = this._mid.addVectors(pa, pb).multiplyScalar(0.5);
+      const quaternion = new THREE.Quaternion().setFromUnitVectors(
+        this._up, this._dir.clone().normalize()
+      );
+
+      // Fingertip segments taper; the palm rays are the heaviest.
       const tipBone = TIP_INDICES.includes(a) || TIP_INDICES.includes(b);
-      const radius = (tipBone ? 0.011 : 0.017) * active;
-      bone.scale.set(radius, length, radius);
+      const palmRay = a === 0 || b === 0;
+      const radius = (palmRay ? 0.026 : tipBone ? 0.019 : 0.023) * active;
+
+      for (const [mesh, scale] of [[bone, 1], [glow, 2.1]]) {
+        mesh.visible = true;
+        mesh.position.copy(mid);
+        mesh.quaternion.copy(quaternion);
+        mesh.scale.set(radius * scale, length, radius * scale);
+      }
+      // Glow is a hair longer so the sleeve wraps the ends.
+      glow.scale.y = length * 1.08;
     }
 
-    // Palm plate: a quad fan through wrist + the five knuckles. Reads as the
-    // back of the hand and anchors the fingers.
+    // ---- fingertip haloes -------------------------------------------------
+    for (const halo of this.haloes) {
+      const point = positions[halo.userData.landmark];
+      halo.position.copy(point);
+      const size = (0.115 + this.pulse * 0.06) * active;
+      halo.scale.setScalar(size);
+      halo.quaternion.copy(cameraFacingQuaternion(this._cameraRef));
+    }
+
+    // ---- palm ------------------------------------------------------------
+    // Wrist, thumb base and the four knuckles: enough to fill the back of the
+    // hand without implying geometry MediaPipe does not actually track.
     const palmIndices = [0, 1, 5, 9, 13, 17];
     const verts = new Float32Array(palmIndices.length * 3);
     palmIndices.forEach((index, i) => {
@@ -268,12 +437,10 @@ class HandRig {
     this.group.removeFromParent();
     this.jointGeometry.dispose();
     this.tipGeometry.dispose();
-    this.jointMaterial.dispose();
-    this.coreMaterial.dispose();
-    this.boneMaterial.dispose();
-    this.palmMaterial.dispose();
+    this.haloGeometry.dispose();
+    this.boneGeometry.dispose();
+    for (const material of Object.values(this.materials)) material.dispose();
     this.palm.geometry.dispose();
-    this.bones[0]?.geometry.dispose();
   }
 }
 
@@ -291,6 +458,79 @@ export class HandSkeleton3D {
     scene.add(this.root);
     this.visible = true;
     this._tmp = new THREE.Vector3();
+    this._camPos = new THREE.Vector3();
+    this._cast = new THREE.Raycaster();
+    this._castDir = new THREE.Vector3();
+    this._castOrigin = new THREE.Vector3();
+    // Objects the depth cue measures against. Populated lazily from the scene
+    // so new playground objects are picked up without extra wiring.
+    this._occluders = [];
+    this._occluderRefreshAt = 0;
+    this._depthProbeAt = 0;
+    // Smoothed per-rig nearness, keyed like the rigs themselves.
+    this._nearness = new Map();
+  }
+
+  /**
+   * The objects worth measuring hand depth against: anything visible and made
+   * of triangles that is not the hands themselves or the ground.
+   *
+   * Refreshed on a timer rather than every frame — the raycaster is only asked
+   * about a handful of points, but rebuilding this list each frame would walk
+   * the whole scene graph for every hand.
+   */
+  _refreshOccluders(now) {
+    if (now < this._occluderRefreshAt && this._occluders.length) return this._occluders;
+    this._occluderRefreshAt = now + 500;
+    const found = [];
+    const root = this.root.parent || this.scene;
+    root.traverse(object => {
+      if (!object.isMesh || !object.visible) return;
+      // Never measure against the hands, the ground plane or the grid.
+      if (this.root && isDescendantOf(object, this.root)) return;
+      if (object.material?.depthWrite === false && object.material?.transparent) return;
+      found.push(object);
+    });
+    this._occluders = found;
+    return found;
+  }
+
+  /**
+   * How far in front of the scene geometry a hand is, as 0..1.
+   *
+   * 1 means nothing is between the hand and the camera (the normal case, hand
+   * at the lens). Lower values mean scene geometry sits in front of it. The rig
+   * uses this to dim and shrink rather than vanish, because `depthTest: false`
+   * keeps the skeleton visible but should not make it look flat.
+   */
+  _nearnessFor(positions) {
+    if (!positions?.length) return 1;
+    const now = performance.now();
+    if (now < this._depthProbeAt) return this._lastNearness ?? 1;
+    this._depthProbeAt = now + 60; // ~16 probes/second is plenty
+
+    const occluders = this._refreshOccluders(now);
+    if (!occluders.length) return (this._lastNearness = 1);
+
+    // Probe the wrist and every fingertip: a hand half behind the model should
+    // read as partly occluded, not all-or-nothing.
+    const probes = [0, 4, 8, 12, 16, 20];
+    let blocked = 0;
+    this._castOrigin.copy(this._camPos);
+    for (const index of probes) {
+      const point = positions[index];
+      if (!point) continue;
+      this._castDir.subVectors(point, this._camPos);
+      const distance = this._castDir.length();
+      if (distance < 1e-4) continue;
+      this._castDir.divideScalar(distance);
+      this._cast.set(this._castOrigin, this._castDir);
+      this._cast.far = distance - 0.02;
+      this._cast.near = 0;
+      if (this._cast.intersectObjects(occluders, false).length) blocked += 1;
+    }
+    const fraction = blocked / probes.length;
+    return (this._lastNearness = 1 - fraction * 0.65);
   }
 
   updateSettings({ mirror } = {}) {
@@ -319,9 +559,10 @@ export class HandSkeleton3D {
    * @param {object} options { pinched: boolean[], activity: number[] }
    */
   update(landmarks, worldLandmarks, handedness, {
-    pinched = [], activity = [], fit = null
+    pinched = [], activity = [], fit = null, dt = 1 / 60
   } = {}) {
     if (!this.visible) return;
+    this.camera.getWorldPosition(this._camPos);
     this.camera.updateMatrixWorld();
 
     const seen = new Set();
@@ -339,6 +580,7 @@ export class HandSkeleton3D {
 
       const rig = this._rigFor(key, effectiveSide);
       rig.setVisible(true);
+      rig._cameraRef = this.camera;
 
       const world = worldLandmarks?.[handIndex] || null;
 
@@ -395,7 +637,9 @@ export class HandSkeleton3D {
       });
 
       rig.group.visible = true;
-      rig.update(positions, activity[handIndex] ?? 0, Boolean(pinched[handIndex]));
+      rig.applyDepth(this._nearnessFor(positions));
+      rig.update(positions, activity[handIndex] ?? 0,
+        Boolean(pinched[handIndex]), dt);
     });
 
     // Hide rigs whose hand has left the frame rather than deleting them, so

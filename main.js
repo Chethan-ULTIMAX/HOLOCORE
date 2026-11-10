@@ -449,6 +449,9 @@ function boot() {
     camera: workspace.camera,
     mirror: settings.camera.mirror !== false
   });
+  // Register the rigs for the late composite pass, so a model can never hide
+  // the hands and bloom never smears them.
+  workspace.setLateLayer?.(skeleton3d.root);
 
   setBoot(55, "Loading assembly…");
 
@@ -1278,6 +1281,7 @@ function startLoop() {
     const now = performance.now();
     const dt = Math.min((now - state.lastFrameTime) / 1000, 0.05);
     state.lastFrameTime = now;
+    state.frameDelta = dt;
 
     animator.update(dt);
     // Playground animation (glTF clips and the idle spin) runs on the same
@@ -1429,7 +1433,7 @@ function processHands(now) {
       hands,
       tracker.worldLandmarks || [],
       handedness,
-      { pinched: overlayPinched, activity, fit }
+      { pinched: overlayPinched, activity, fit, dt: state.frameDelta ?? 1 / 60 }
     );
   }
 

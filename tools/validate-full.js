@@ -180,6 +180,25 @@ check("the model has parts", (workspace?.parts?.length || 0) > 0,
 check("the model is attached to the rendered scene",
   workspace?.diagnostics?.().attached === true);
 
+section("1b · No console errors during boot and interaction");
+
+// Everything below runs against the real main.js in jsdom. Errors raised during
+// boot are captured by the harness; this section asserts the count stays zero
+// after driving the interactive paths too.
+{
+  const before = errors.length;
+  api.setMode("move");
+  api.handleVoiceIntentForTest("add:cube");
+  api.handleVoiceIntentForTest("select:cube");
+  api.handleVoiceIntentForTest("transform:right");
+  api.handleVoiceIntentForTest("object:duplicate");
+  api.handleVoiceIntentForTest("object:delete");
+  api.getPlayground()?.clear();
+  api.setMode("select");
+  check("interacting raises no console errors", errors.length === before,
+    errors.slice(before).join(" | "));
+}
+
 section("2 · Scene-space hand skeletons are live");
 
 const skeleton = api?.getHandSkeleton?.();
@@ -740,10 +759,30 @@ for (const spec of alignCases) {
     Array.from({ length: 20 }, (_, i) => ({ x: 0.5 + i * 0.002, y: 0.5 + i * 0.002, z: 0 }))
   )], [], ["Right"], {});
   const rig2 = [...sk2.rigs.values()][0];
-  const rigMaterials = [rig2.jointMaterial, rig2.coreMaterial, rig2.boneMaterial, rig2.palmMaterial];
+  const rigMaterials = Object.values(rig2.materials || {});
   check("every skeleton material bypasses tone mapping",
-    rigMaterials.every(m => m.toneMapped === false),
-    rigMaterials.map(m => m.toneMapped).join(","));
+    rigMaterials.length > 0 && rigMaterials.every(m => m.toneMapped === false),
+    `${rigMaterials.filter(m => m.toneMapped === false).length}/${rigMaterials.length}`);
+
+  // Hybrid rendering contract: drawn late with depth testing off, so a model in
+  // front of the hand can never hide the skeleton.
+  const lateMeshes = [...rig2.bones, ...rig2.joints, ...rig2.cores, ...rig2.boneGlows];
+  check("skeleton pieces skip depth testing",
+    lateMeshes.length > 0 && lateMeshes.every(m => m.material.depthTest === false),
+    `${lateMeshes.filter(m => m.material.depthTest === false).length}/${lateMeshes.length}`);
+  check("skeleton pieces draw after the scene",
+    [...rig2.bones, ...rig2.joints].every(m => m.renderOrder >= 30),
+    [...new Set([...rig2.bones, ...rig2.joints].map(m => m.renderOrder))].join(","));
+
+  // Depth is preserved as a cue, not discarded: a receding hand must dim.
+  rig2.applyDepth(1);
+  const nearOpacity = rig2.materials.bone.opacity;
+  rig2.applyDepth(0);
+  const farOpacity = rig2.materials.bone.opacity;
+  check("a hand behind geometry dims instead of vanishing",
+    farOpacity < nearOpacity && farOpacity > 0.2,
+    `${nearOpacity.toFixed(2)} -> ${farOpacity.toFixed(2)}`);
+  rig2.applyDepth(1);
 
   check("a hand twice the size in frame is drawn twice as large",
     Math.abs(large / small - 3) < 0.35, `${(large / small).toFixed(2)}x`);
@@ -793,6 +832,101 @@ check("an open hand stays un-pinched", pump(0.95, 8).pinched === false);
 check("a pinch latches", pump(0.2, 8).pinched === true);
 check("a held pinch stays latched", pump(0.22, 8).pinched === true);
 check("releasing the pinch clears it", pump(0.95, 8).pinched === false);
+
+section("5h · The late pass is wired into the real renderer");
+
+const ws = api.getWorkspace();
+check("the renderer knows about the hand layer", ws.lateLayer === api.getHandSkeleton().root,
+  ws.lateLayer?.name || "(none)");
+check("the late layer is the skeleton root",
+  ws.lateLayer?.name === "hand-skeletons", ws.lateLayer?.name);
+
+// Drive the real render path and confirm the hands are held out of the main
+// pass and composited in the second one.
+const passes = [];
+const realRender = ws.renderer.render.bind(ws.renderer);
+let clearDepthCalls = 0;
+const realClearDepth = ws.renderer.clearDepth?.bind(ws.renderer);
+ws.renderer.clearDepth = () => { clearDepthCalls += 1; };
+ws.renderer.render = (scene, camera) => {
+  passes.push({ lateVisible: ws.lateLayer ? ws.lateLayer.visible : null });
+  return realRender(scene, camera);
+};
+ws.update(1 / 60);
+ws.renderer.render = realRender;
+if (realClearDepth) ws.renderer.clearDepth = realClearDepth;
+
+check("the frame renders twice when the hand layer is live", passes.length === 2,
+  `${passes.length} pass(es)`);
+check("the main pass excludes the hands", passes[0]?.lateVisible === false);
+check("the late pass draws the hands", passes[1]?.lateVisible === true);
+check("depth is cleared between the passes", clearDepthCalls >= 1, `${clearDepthCalls}`);
+check("the hand layer is visible again after the frame", ws.lateLayer.visible === true);
+
+// With no hand layer the frame must still render exactly once.
+ws.setLateLayer(null);
+const soloPass = [];
+ws.renderer.render = (scene, camera) => { soloPass.push(1); return realRender(scene, camera); };
+ws.update(1 / 60);
+ws.renderer.render = realRender;
+check("without a hand layer the frame renders once", soloPass.length === 1,
+  `${soloPass.length}`);
+
+// setLateLayer is the contract main.js uses; assert it round-trips.
+const marker = new THREE.Group();
+ws.setLateLayer(marker);
+check("setLateLayer swaps the composited group", ws.lateLayer === marker);
+ws.setLateLayer(api.getHandSkeleton().root);
+
+section("5i · Gestures move real objects through the full stack");
+
+// End-to-end: hand landmarks in, a playground object moving out — through the
+// real processHands, the real solver and the real render data.
+const gs = api.getPlayground();
+gs.clear();
+const target = gs.addPrimitive("cube");
+gs.setTransform(target.id, { position: { x: 0, y: 0, z: 0 }, scale: 1 });
+gs.select(target.id);
+api.setMode("move");
+
+const grabOpen = syntheticHand(false);
+const grabPinch = syntheticHand(true);
+const startPos = { ...gs.getTransform(target.id).position };
+
+let gestureError = null;
+try {
+  // Open hand to settle the pointer, then pinch to grab, then drag.
+  api.tracker.hands = [grabOpen];
+  api.tracker.handedness = ["Right"];
+  api.tracker.worldLandmarks = [grabOpen];
+  for (let i = 0; i < 6; i++) api._internals.processHands(performance.now() + i * 16);
+
+  api.tracker.hands = [grabPinch];
+  for (let i = 0; i < 8; i++) api._internals.processHands(performance.now() + 200 + i * 16);
+
+  // Drag: shift the whole hand sideways and let the solver follow.
+  const dragged = syntheticHand(true).map(p => ({ ...p, x: p.x + 0.18 }));
+  api.tracker.hands = [dragged];
+  for (let i = 0; i < 10; i++) api._internals.processHands(performance.now() + 400 + i * 16);
+} catch (error) {
+  gestureError = error;
+}
+
+check("the full gesture path runs without throwing", gestureError === null,
+  gestureError ? `${gestureError.name}: ${gestureError.message}` : "");
+
+const endPos = gs.getTransform(target.id).position;
+const dragDistance = Math.hypot(endPos.x - startPos.x, endPos.y - startPos.y, endPos.z - startPos.z);
+check("a pinched drag actually moves the object", dragDistance > 0.05,
+  `${dragDistance.toFixed(3)} units`);
+check("the object stays on the stage", Math.abs(endPos.x) <= 4.21 && Math.abs(endPos.y) <= 3.21,
+  `${endPos.x.toFixed(2)}, ${endPos.y.toFixed(2)}`);
+
+api.tracker.hands = [];
+api.tracker.handedness = [];
+api.tracker.worldLandmarks = [];
+api.setMode("select");
+gs.clear();
 
 section("6 · Modes still gate gestures");
 
