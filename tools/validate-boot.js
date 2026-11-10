@@ -302,6 +302,41 @@ check("no toast claims the camera or tracking works",
   !toasts.some(text => /tracking active|hands detected/i.test(text)));
 
 /* ------------------------------------------------------------------------- */
+/* 4. RENDER DIAGNOSTICS                                                     */
+/* ------------------------------------------------------------------------- */
+
+section("4 · Render diagnostics in the running app");
+
+const diagPanel = document.getElementById("diagnostics");
+const diagToggle = document.getElementById("diag-toggle");
+
+check("the diagnostics panel is present after boot", Boolean(diagPanel));
+
+// The toggle must actually open and close the panel.
+const closedFirst = diagPanel?.dataset.open === "false";
+diagToggle?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+const opened = diagPanel?.dataset.open === "true";
+diagToggle?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+const closedAgain = diagPanel?.dataset.open === "false";
+
+check("the toggle opens the panel", closedFirst && opened);
+check("the toggle closes the panel again", closedAgain);
+check("the toggle reports its state to assistive tech",
+  diagToggle?.getAttribute("aria-expanded") === "false");
+
+// With no renderer this must report failure, not a green light. This is the
+// whole point of the panel: it must never claim a model is rendering when it
+// is not.
+check("the panel reports a problem when 3D is unavailable",
+  diagPanel?.dataset.ok === "false", `data-ok=${diagPanel?.dataset.ok}`);
+check("the model field explains why there is no model",
+  /unavailable|not loaded/i.test(document.getElementById("diag-model")?.textContent || ""),
+  document.getElementById("diag-model")?.textContent);
+check("the render loop field reads as stopped",
+  /stopped/i.test(document.getElementById("diag-loop")?.textContent || ""),
+  document.getElementById("diag-loop")?.textContent);
+
+/* ------------------------------------------------------------------------- */
 /* SUMMARY                                                                   */
 /* ------------------------------------------------------------------------- */
 

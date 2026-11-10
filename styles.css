@@ -573,9 +573,74 @@ kbd, .kbd {
 .workspace-cam-note .btn { margin-top: 6px; }
 .workspace-cam-note[hidden] { display: none; }
 
-/* The Three.js canvas must never paint an opaque background over the video. */
-#viewport > canvas { position: relative; z-index: 2; display: block; width: 100%; height: 100%; }
-.viewport canvas { display: block; width: 100%; height: 100%; }
+/* ---- render diagnostics ------------------------------------------------ */
+.diag {
+  position: absolute;
+  z-index: 6;
+  right: 18px;
+  bottom: 18px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  background: rgba(6, 10, 16, 0.86);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  backdrop-filter: blur(10px);
+  overflow: hidden;
+  max-width: 240px;
+}
+.diag-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+}
+.diag-toggle:hover { color: var(--text); }
+.diag-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-faint);
+  box-shadow: 0 0 6px currentColor;
+  flex: none;
+}
+.diag[data-ok="true"] .diag-dot { background: var(--cyan); color: var(--cyan); }
+.diag[data-ok="false"] .diag-dot { background: var(--red); color: var(--red); }
+
+.diag-grid {
+  display: none;
+  grid-template-columns: auto 1fr;
+  gap: 3px 12px;
+  margin: 0;
+  padding: 2px 10px 9px;
+  border-top: 1px solid var(--line);
+}
+.diag[data-open="true"] .diag-grid { display: grid; }
+.diag-grid dt { color: var(--text-faint); }
+.diag-grid dd { margin: 0; color: var(--text); text-align: right; }
+.diag-grid dd.is-bad { color: var(--red); }
+@media (max-width: 560px) { .diag { display: none; } }
+
+/* The Three.js canvas must never paint an opaque background over the video.
+   It is targeted by class, NOT by "canvas": #workspace-overlay is also a
+   <canvas> in this container, and a `#viewport > canvas` rule (1,0,1) would
+   outrank `.workspace-overlay` (0,1,0), forcing the overlay into normal flow.
+   That made the overlay a full-width block *above* the renderer canvas. */
+#viewport > .workspace-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+#viewport > .workspace-canvas:focus { outline: none; }
 
 .viewport-hud {
   position: absolute;

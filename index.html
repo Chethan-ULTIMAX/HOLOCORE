@@ -203,6 +203,27 @@
           <span class="kbd">PINCH</span> grab
         </div>
 
+        <!-- Live render diagnostics. Every value is read from the running
+             scene graph; nothing here is hardcoded. Toggle with the button. -->
+        <div class="diag" id="diagnostics" data-open="false">
+          <button type="button" class="diag-toggle" id="diag-toggle" aria-expanded="false">
+            <span class="diag-dot" aria-hidden="true"></span>
+            RENDER DIAGNOSTICS
+          </button>
+          <dl class="diag-grid" id="diag-grid">
+            <dt>MODEL</dt><dd id="diag-model">—</dd>
+            <dt>MESHES</dt><dd id="diag-meshes">—</dd>
+            <dt>VISIBLE</dt><dd id="diag-visible">—</dd>
+            <dt>TRIANGLES</dt><dd id="diag-tris">—</dd>
+            <dt>BOUNDS</dt><dd id="diag-bounds">—</dd>
+            <dt>CAM DIST</dt><dd id="diag-camdist">—</dd>
+            <dt>ATTACHED</dt><dd id="diag-attached">—</dd>
+            <dt>IN FRAME</dt><dd id="diag-infrustum">—</dd>
+            <dt>RENDER LOOP</dt><dd id="diag-loop">—</dd>
+            <dt>WEBGL ERRORS</dt><dd id="diag-errors">—</dd>
+          </dl>
+        </div>
+
         <!-- Interaction mode bar -->
         <div class="mode-bar" id="mode-bar" role="toolbar" aria-label="Interaction mode">
           <span class="mode-bar-label">MODE</span>

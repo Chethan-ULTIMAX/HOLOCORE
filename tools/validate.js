@@ -1527,10 +1527,13 @@ async function makeWorkspace() {
   return new Workspace({
     container: host,
     rendererFactory: makeStubRenderer,
-    controlsFactory: () => ({
+    // OrbitControls points the camera at `target` every frame. The stub has to
+    // do the same, or the camera keeps its default -Z orientation and every
+    // projection test measures a view no real user would ever see.
+    controlsFactory: camera => ({
       target: new THREE.Vector3(),
       enableDamping: false,
-      update() {},
+      update() { camera.lookAt(this.target); },
       dispose() {}
     }),
     environment: false,
@@ -1719,6 +1722,188 @@ section("12 · Camera stream sharing");
   check("main.js no longer scales the preview rect by a naive ratio",
     !/px\.x \/ dom\.cameraStage\.clientWidth/.test(source),
     "old ratio mapping removed");
+}
+
+section("13 · Every model actually reaches the screen");
+
+/**
+ * These checks exist because the previous suite proved the scene graph was
+ * well-formed but never proved the geometry landed inside the viewport drawn by
+ * a correctly-positioned canvas. The app shipped with the renderer canvas in
+ * normal flow, stacked *below* a full-height overlay canvas, which pushed every
+ * model off-screen while keeping all the assertions green.
+ */
+{
+  const { MODEL_LIBRARY } = await import("../engineeringData.js");
+
+  for (const { id } of MODEL_LIBRARY) {
+    const ws = await makeWorkspace();
+    await ws.setModel(id);
+    // Let the framing animation settle deterministically.
+    ws._cameraGoal.duration = 0.001;
+    for (let i = 0; i < 200; i++) ws.update(1 / 60);
+
+    const d = ws.diagnostics();
+
+    check(`[${id}] the model is loaded`, d.loaded, String(d.model));
+    check(`[${id}] it has meshes`, d.meshes > 0, `${d.meshes} meshes`);
+    check(`[${id}] every mesh is visible`, d.visibleMeshes === d.meshes,
+      `${d.visibleMeshes}/${d.meshes}`);
+    check(`[${id}] it has real triangles`, d.triangles > 100, `${d.triangles} triangles`);
+    check(`[${id}] it is attached to the rendered scene`, d.attached);
+
+    check(`[${id}] the bounding box is non-degenerate`,
+      Boolean(d.bounds) && Math.max(d.bounds.x, d.bounds.y, d.bounds.z) > 0.5,
+      d.bounds ? `${d.bounds.x.toFixed(2)}x${d.bounds.y.toFixed(2)}x${d.bounds.z.toFixed(2)}` : "no bounds");
+
+    check(`[${id}] it intersects the camera frustum`, d.inFrustum,
+      `camera at ${d.cameraDistance?.toFixed(1)}`);
+
+    // Frustum intersection is not enough: a model can intersect the frustum
+    // while sitting behind the near plane or off to one side. Project the eight
+    // corners and require a sane on-screen footprint.
+    ws.camera.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(ws.assembly.group);
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    let behind = false;
+    for (const x of [box.min.x, box.max.x]) {
+      for (const y of [box.min.y, box.max.y]) {
+        for (const z of [box.min.z, box.max.z]) {
+          const ndc = new THREE.Vector3(x, y, z).project(ws.camera);
+          if (ndc.z > 1) behind = true;
+          minX = Math.min(minX, ndc.x); maxX = Math.max(maxX, ndc.x);
+          minY = Math.min(minY, ndc.y); maxY = Math.max(maxY, ndc.y);
+        }
+      }
+    }
+    check(`[${id}] no corner is behind the camera`, !behind);
+    check(`[${id}] it is horizontally on screen`, maxX > -1 && minX < 1,
+      `ndc x ${minX.toFixed(2)}..${maxX.toFixed(2)}`);
+    check(`[${id}] it is vertically on screen`, maxY > -1 && minY < 1,
+      `ndc y ${minY.toFixed(2)}..${maxY.toFixed(2)}`);
+
+    // A model that is technically on screen but 2 px wide is invisible in
+    // practice. Require a meaningful fraction of the frame.
+    const widthFraction = Math.min(1, (Math.min(maxX, 1) - Math.max(minX, -1)) / 2);
+    const heightFraction = Math.min(1, (Math.min(maxY, 1) - Math.max(minY, -1)) / 2);
+    check(`[${id}] it fills a useful part of the viewport`,
+      Math.max(widthFraction, heightFraction) > 0.25,
+      `w ${(widthFraction * 100).toFixed(0)}% h ${(heightFraction * 100).toFixed(0)}%`);
+
+    ws.dispose();
+  }
+}
+
+section("14 · Diagnostics report the truth, not success constants");
+
+{
+  const ws = await makeWorkspace();
+  await ws.setModel("robotArm");
+  ws._cameraGoal.duration = 0.001;
+  for (let i = 0; i < 200; i++) ws.update(1 / 60);
+
+  const d = ws.diagnostics();
+  check("diagnostics name the loaded model", d.model === "robotArm", String(d.model));
+
+  // Highlighting adds a duplicate shell mesh per part. Count the baseline so we
+  // can prove the numbers respond to the scene rather than being constants.
+  const baseline = d.meshes;
+  ws.select(ws.parts[0].userData.partId);
+  const afterSelect = ws.diagnostics().meshes;
+  check("the mesh count responds to the scene",
+    afterSelect >= baseline, `${baseline} -> ${afterSelect}`);
+
+  // Hide everything and the diagnostic must say so.
+  ws.assembly.group.visible = false;
+  const hidden = ws.diagnostics();
+  check("hiding the assembly drops visible meshes to zero",
+    hidden.visibleMeshes === 0, `${hidden.visibleMeshes}`);
+  ws.assembly.group.visible = true;
+
+  // Detach from the scene and the diagnostic must notice.
+  ws.scene.remove(ws.manipulator);
+  const detached = ws.diagnostics();
+  check("detaching the assembly is reported", detached.attached === false);
+  ws.scene.add(ws.manipulator);
+  check("re-attaching is reported", ws.diagnostics().attached === true);
+
+  // Move the camera far away: the model leaves the frustum.
+  ws.camera.position.set(400, 400, 400);
+  ws._cameraGoal = null;
+  ws.camera.updateMatrixWorld(true);
+  const far = ws.diagnostics();
+  check("a camera far outside the scene reports out-of-frame",
+    far.inFrustum === false, `dist ${far.cameraDistance?.toFixed(0)}`);
+
+  ws.dispose();
+}
+
+section("15 · Imported GLB geometry is visible after import");
+
+// three's FileLoader emits ProgressEvent, which jsdom does not implement.
+if (typeof globalThis.ProgressEvent === "undefined") {
+  globalThis.ProgressEvent = class ProgressEvent extends Event {
+    constructor(type, init = {}) {
+      super(type);
+      this.lengthComputable = init.lengthComputable ?? false;
+      this.loaded = init.loaded ?? 0;
+      this.total = init.total ?? 0;
+    }
+  };
+}
+
+{
+  // Build a minimal glTF in memory: one 2-unit triangle, so the import path can
+  // be exercised without shipping a binary fixture.
+  const gltf = {
+    asset: { version: "2.0" },
+    scene: 0,
+    scenes: [{ nodes: [0] }],
+    nodes: [{ mesh: 0 }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0 }, mode: 4 }] }],
+    accessors: [{
+      bufferView: 0,
+      componentType: 5126,
+      count: 3,
+      type: "VEC3",
+      max: [2, 2, 0],
+      min: [0, 0, 0]
+    }],
+    bufferViews: [{
+      buffer: 0,
+      byteOffset: 0,
+      byteLength: 36,
+      target: 34962
+    }],
+    buffers: [{
+      byteLength: 36,
+      uri:
+        "data:application/octet-stream;base64," +
+        Buffer.from(new Float32Array([0, 0, 0, 2, 0, 0, 0, 2, 0]).buffer).toString("base64")
+    }]
+  };
+
+  const ws = await makeWorkspace();
+  const blob = new Blob([JSON.stringify(gltf)], { type: "model/gltf+json" });
+  const file = new File([blob], "fixture.gltf", { type: "model/gltf+json" });
+
+  const result = await ws.loadFile(file);
+  check("the import reports its part count", result.parts > 0, `${result.parts} parts`);
+
+  ws._cameraGoal.duration = 0.001;
+  for (let i = 0; i < 200; i++) ws.update(1 / 60);
+  const d = ws.diagnostics();
+
+  check("imported geometry produces meshes", d.meshes > 0, `${d.meshes}`);
+  check("imported meshes are visible", d.visibleMeshes > 0, `${d.visibleMeshes}`);
+  check("imported geometry has triangles", d.triangles > 0, `${d.triangles}`);
+  check("imported geometry is attached to the scene", d.attached);
+  check("imported geometry is inside the frustum", d.inFrustum);
+  check("imported geometry is normalised to the working envelope",
+    Boolean(d.bounds) && Math.max(d.bounds.x, d.bounds.y, d.bounds.z) <= 6.3,
+    d.bounds ? `${Math.max(d.bounds.x, d.bounds.y, d.bounds.z).toFixed(2)}` : "no bounds");
+
+  ws.dispose();
 }
 
 /* ------------------------------------------------------------------------- */

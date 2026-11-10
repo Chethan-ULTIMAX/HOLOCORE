@@ -36,9 +36,9 @@ Open <http://localhost:8000>. Allow the camera when prompted if you want gesture
 | Command | What it does |
 | --- | --- |
 | `npm start` | Static server on port 8000, bound to `0.0.0.0` |
-| `npm run validate` | 294 headless checks: data, geometry, gestures, modes, solver, explode, assistant, wiring, 3D workspace |
-| `npm run validate:ui` | 76 jsdom checks of the DOM, interface and camera layer |
-| `npm run validate:boot` | 41 jsdom checks of the full application boot path |
+| `npm run validate` | 395 headless checks: data, geometry, gestures, modes, solver, explode, assistant, wiring, on-screen placement |
+| `npm run validate:ui` | 90 jsdom checks of the DOM, interface, cascade and camera layer |
+| `npm run validate:boot` | 48 jsdom checks of the full application boot path |
 | `npm run validate:all` | All three harnesses |
 | `npm run preview` | Renders the eight assemblies to `tools/preview/*.png` |
 | `npm run preview:parts` | Same, but each part in its own colour (`*-parts.png`) |
@@ -196,15 +196,15 @@ Everything in `tools/` runs headlessly in Node — there is **no browser and no 
 which is both the point and the limitation.
 
 ```bash
-npm run validate:all      # 294 + 76 + 41 checks
+npm run validate:all      # 395 + 90 + 48 checks
 npm run validate          # data, geometry, gestures, modes, explode, assistant, wiring, workspace
 ```
 
 | Harness | Checks | Covers |
 | --- | --- | --- |
-| `tools/validate.js` | 294 (12 sections) | Knowledge-base coverage both ways, assembly geometry sanity, gesture primitives against a forward-kinematics fixture, the manipulation solver, assistant retrieval, every element in `index.html` being wired, the real `Workspace` driven through a stub renderer, the mid-gesture mode gate, continuous explode and per-part transforms, camera-stream sharing |
-| `tools/validate-ui.js` | 76 | DOM behaviour in jsdom: panels, sliders, toasts, keyboard, markdown safety, camera-layer stacking and cropping, the mode bar, the explode slider, view controls |
-| `tools/validate-boot.js` | 41 | The full application boot in jsdom, including the degraded no-WebGL path and live mode/view/slider wiring |
+| `tools/validate.js` | 395 (15 sections) | Knowledge-base coverage both ways, assembly geometry sanity, gesture primitives against a forward-kinematics fixture, the manipulation solver, assistant retrieval, every element in `index.html` being wired, the real `Workspace` driven through a stub renderer, the mid-gesture mode gate, continuous explode and per-part transforms, camera-stream sharing |
+| `tools/validate-ui.js` | 90 | DOM behaviour in jsdom: panels, sliders, toasts, keyboard, markdown safety, camera-layer stacking and cropping, the mode bar, the explode slider, view controls |
+| `tools/validate-boot.js` | 48 | The full application boot in jsdom, including the degraded no-WebGL path and live mode/view/slider wiring |
 | `tools/render-preview.js` | — | A software rasteriser that renders the *real* scene graph through the *real* camera to PNG |
 
 The preview renderer exists because visual defects do not show up in assertions. It is what
@@ -215,7 +215,16 @@ caught the worst bugs in this codebase:
 2. Material colours are stored **linear** by three.js, so writing them straight to 8-bit gave
    black-on-black interiors.
 
-3. The hand pointer used to be mapped from normalised landmarks straight onto the viewport,
+3. **A CSS cascade collision hid every model.** The renderer canvas was styled with
+   `#viewport > canvas` (specificity 1,0,1). The landmark overlay is *also* a `<canvas>` and a
+   direct child of `#viewport`, so that rule outranked `.workspace-overlay` (0,1,0) and forced
+   the overlay to `position: relative`. The overlay then became a full-height block in normal
+   flow, and since the renderer canvas is appended *after* it, the renderer was pushed to the
+   second viewport-height and clipped by `overflow: hidden`. Every model was drawn — just
+   entirely below the visible box. The renderer canvas is now targeted by class
+   (`.workspace-canvas`) instead of by element type, and the suite resolves the cascade for
+   each canvas rather than grepping for the presence of a rule.
+4. The hand pointer used to be mapped from normalised landmarks straight onto the viewport,
    ignoring that `object-fit: cover` crops the video. On a 4:3 camera in a 16:9 viewport that
    is **90 px of drift** at the corner of the frame — enough to make you pinch the wrong part.
    `handGeometry.js` now does the cover-fit inverse, and the test suite checks the measured
@@ -244,11 +253,35 @@ cannot prove the shaded pixels, which needs a GPU. Cover-fit maths is separately
 portrait and landscape sources: a 4:3 camera in a 16:9 box crops 250 px off the top, and a
 portrait camera crops the sides, and the overlay follows the crop in both directions.
 
+### Render diagnostics
+
+The bottom-right of the viewport has a collapsible **RENDER DIAGNOSTICS** panel. Every value in
+it is read from the live scene graph at sample time — there are no success constants and no
+cached state:
+
+| Field | Source |
+| --- | --- |
+| MODEL | `workspace.modelId` + whether an assembly exists |
+| MESHES / VISIBLE | traversal of the assembly, checking every ancestor's `visible` flag |
+| TRIANGLES | index/position counts, summed over visible meshes |
+| BOUNDS | `Box3.setFromObject` on the assembly root |
+| CAM DIST | live camera position to the orbit target |
+| ATTACHED | walks to the scene root and checks it is the rendered scene |
+| IN FRAME | frustum built from the camera's current projection × world-inverse, tested against the assembly's bounding sphere |
+| RENDER LOOP | whether the animation frame id is live |
+| WEBGL ERRORS | context-creation and context-loss events on the renderer canvas |
+
+The dot beside the title turns red if any field indicates a problem, and the panel says
+"renderer unavailable" rather than going blank when there is no WebGL context at all — a blank
+panel is indistinguishable from a stale one, and this panel must never look like success.
+
 ### What is *not* verified
 
 Be clear about this before trusting the green checkmarks:
 
-- **WebGL rendering.** No GPU here. The scene graph, camera math and materials are tested; the
+- **WebGL rendering.** No GPU here. The suite now proves the geometry lands inside the
+  frustum and inside the projected viewport box, and that the canvas stacking allows it to be
+  seen — but it still does not shade a pixel through a real `WebGLRenderer`. The scene graph, camera math and materials are tested; the
   actual shaded output of the real `WebGLRenderer` is not. `render-preview.js` is a separate
   approximation, not three.js.
 - **Camera and hand tracking.** No webcam, and MediaPipe's WASM runtime cannot execute here.
