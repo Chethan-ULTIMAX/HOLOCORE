@@ -2711,3 +2711,16 @@ body.is-interacting .stage-keys { opacity: 0; }
   color: rgba(150, 225, 255, 0.85);
   background: rgba(56, 189, 248, 0.1);
 }
+
+/* Grouped property block (transform readout). main's inset card, retuned to
+   the drawer's spacing. */
+.prop-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 9px 10px;
+  margin-bottom: 9px;
+  border: 1px solid rgba(120, 210, 255, 0.14);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.02);
+}

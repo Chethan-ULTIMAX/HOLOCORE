@@ -23,7 +23,7 @@ import { HandOverlay } from "./handOverlay.js";
 import { HandSkeleton3D } from "./handSkeleton3d.js";
 import { Playground, PRIMITIVES } from "./playground.js";
 import { chimes } from "./chimes.js";
-import { VoiceControl, VOICE_STATUS, COLOR_PALETTE } from "./voiceControl.js";
+import { VoiceControl, VOICE_STATUS, COLOR_PALETTE, parseCommand } from "./voiceControl.js";
 import { MODES, getMode, isMode, instructionFor } from "./interactionModes.js";
 import { landmarkToNdc, landmarkToStage, coverFit } from "./handGeometry.js";
 import { ComponentInspector } from "./componentInspector.js";
@@ -3312,6 +3312,8 @@ window.HOLOCORE = {
     selectProp,
     updateGestureLabels,
     inspector,
+    parseCommand,
+    COLOR_PALETTE,
 
     // Re-render the inspector so material controls match the current selection.
     // The playground reports its own selection, so re-selecting the same part

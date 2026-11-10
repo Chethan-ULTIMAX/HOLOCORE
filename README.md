@@ -134,10 +134,29 @@ The hand skeleton is drawn over the feed the whole time you are interacting: 21 
 joints per hand in cyan, with fingertips enlarged, a glowing index pointer and a pinch ring
 that closes as thumb and index meet.
 
+### Voice
+
+Press <kbd>M</kbd> or click the microphone in the stage toolbar. Built on the browser's native
+Web Speech API, with synthesised audio cues via the Web Audio API, so commands work alongside
+your hands rather than instead of them:
+
+- **Modes:** *"select"*, *"move"*, *"drag"*, *"rotate"*, *"scale"*, *"explode"*, *"assemble"*
+- **Objects:** *"add cube"*, *"add sphere"*, *"add cylinder"*, *"add torus"*, *"add cone"*,
+  *"duplicate"*, *"delete"*, *"clear objects"*
+- **Appearance:** *"wireframe"*, *"solid"*, *"make it matte"*, *"make it metallic"*,
+  *"color red"*, *"color cyan"*, *"color gold"*, *"color purple"*
+- **View:** *"grid"*, *"shadows"*, *"orbit"*, *"focus"*, *"isolate"*, *"deselect"*,
+  *"fullscreen"*, *"reset everything"*
+- **Assemblies:** *"load turbojet"*, *"load turbine"*, *"load the robot"*, and the rest
+
+Voice and audio can both be switched off in settings; the choices persist.
+
+Every command changes one thing. A pinch does exactly one thing, decided by the selected mode.
+
 ### Keyboard
 
 <kbd>1</kbd>–<kbd>5</kbd> interaction mode · <kbd>V</kbd> camera view · <kbd>C</kbd> camera ·
-<kbd>L</kbd> panels · <kbd>F</kbd> fullscreen · <kbd>S</kbd> settings ·
+<kbd>M</kbd> voice · <kbd>L</kbd> panels · <kbd>F</kbd> fullscreen · <kbd>S</kbd> settings ·
 <kbd>A</kbd> assistant · <kbd>R</kbd> reset view · <kbd>E</kbd> explode · <kbd>I</kbd> isolate ·
 <kbd>G</kbd> grid · <kbd>?</kbd> help · arrows move · <kbd>Q</kbd>/<kbd>W</kbd> depth ·
 <kbd>Z</kbd>/<kbd>X</kbd> roll
@@ -168,6 +187,10 @@ modelManager.js     the 3D workspace: renderer, controls, parts, selection, expl
 modelFactory.js     procedural geometry for the eight assemblies
 engineeringData.js  the knowledge base (8 models, 80 parts)
 gestures.js         landmark analysis, filters, mode-gated manipulation solver
+voiceControl.js     Web Speech API recognition and the command grammar
+chimes.js           synthesised audio cues (Web Audio, no assets)
+playground.js       spawnable primitives, GLB import, selection
+handSkeleton3d.js   the scene-space 3D hand rig
 interactionModes.js the five modes: colour, gesture instruction, intent allow-list
 handGeometry.js     cover-fit inverse mapping — landmarks to stage, NDC and pixels
 handTracking.js     camera lifecycle, MediaPipe wrapper

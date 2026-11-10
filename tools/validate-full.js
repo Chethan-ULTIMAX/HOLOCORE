@@ -1072,6 +1072,30 @@ check("the in-place refresh shows the new position",
 tp.clear();
 api._internals.refreshInspector();
 
+section("5n · The README's voice commands all parse");
+
+// The README is documentation the user reads before they have a microphone
+// set up, so a phrase it promises must not silently stop matching the grammar.
+const documented = [
+  "select", "move", "drag", "rotate", "scale", "explode", "assemble",
+  "add cube", "add sphere", "add cylinder", "add torus", "add cone",
+  "duplicate", "delete", "clear objects",
+  "wireframe", "solid", "make it matte", "make it metallic",
+  "color red", "color cyan", "color gold", "color purple",
+  "grid", "shadows", "orbit", "focus", "isolate", "deselect", "fullscreen",
+  "reset everything",
+  "load turbojet", "load turbine", "load the robot"
+];
+const unparsed = documented.filter(phrase => !api._internals.parseCommand(phrase));
+check("every documented phrase parses", unparsed.length === 0, unparsed.join(", "));
+
+// And the colour names the palette advertises must all be reachable by voice.
+const paletteNames = Object.keys(api._internals.COLOR_PALETTE);
+const unreachable = paletteNames.filter(
+  name => api._internals.parseCommand(`color ${name}`)?.intent !== `color:${name}`
+);
+check("every palette colour is voice-reachable", unreachable.length === 0, unreachable.join(", "));
+
 section("6 · Modes still gate gestures");
 
 const modes = ["select", "move", "rotate", "scale", "explode"];
