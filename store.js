@@ -15,10 +15,18 @@ export const DEFAULT_SETTINGS = {
     showLandmarks: true,
     showSkeleton: true,
     mirror: true,
-    /** true = camera fills the 3D workspace; false = small preview card. */
-    workspaceView: true,
-    /** How strongly the legibility wash dims the camera image, 0..1. */
-    scrim: 0.4
+    /**
+     * false = the camera stays a small preview card and the 3D model sits on
+     * the normal dark workspace. true = the feed fills the workspace behind the
+     * model. Defaults to false so a first visit shows the model immediately.
+     */
+    workspaceView: false,
+    /**
+     * How strongly the legibility wash dims the camera image, 0..1.
+     * 0 = the feed is shown at full brightness, which is the point of camera
+     * mode: you should see yourself clearly, not through a dark filter.
+     */
+    scrim: 0
   },
   tracking: {
     maxHands: 2,
@@ -41,7 +49,13 @@ export const DEFAULT_SETTINGS = {
     grid: true,
     shadows: true,
     autoRotate: false,
-    bloom: true,
+    /**
+     * Bloom previously defaulted on with a 0.85 threshold, which turned the
+     * lit assemblies into glowing white shapes -- especially over a bright
+     * camera image, where there is no dark background to separate them from.
+     * Off by default; still available in settings.
+     */
+    bloom: false,
     quality: "balanced"
   },
   ui: {

@@ -36,8 +36,8 @@ Open <http://localhost:8000>. Allow the camera when prompted if you want gesture
 | Command | What it does |
 | --- | --- |
 | `npm start` | Static server on port 8000, bound to `0.0.0.0` |
-| `npm run validate` | 395 headless checks: data, geometry, gestures, modes, solver, explode, assistant, wiring, on-screen placement |
-| `npm run validate:ui` | 90 jsdom checks of the DOM, interface, cascade and camera layer |
+| `npm run validate` | 407 headless checks: data, geometry, gestures, modes, solver, explode, assistant, wiring, on-screen placement |
+| `npm run validate:ui` | 100 jsdom checks of the DOM, interface, cascade and camera layer |
 | `npm run validate:boot` | 48 jsdom checks of the full application boot path |
 | `npm run validate:all` | All three harnesses |
 | `npm run preview` | Renders the eight assemblies to `tools/preview/*.png` |
@@ -121,13 +121,18 @@ it is obvious what you are moving and from where.
 
 ### Camera view
 
-The feed can fill the workspace or shrink to the corner card. <kbd>V</kbd> toggles, and both
-the toggle button and the settings sheet do the same thing. Full-workspace mode keeps the
-camera card minimised so the feed is not decoded and drawn twice.
+The app opens in **normal mode**: the assembly on the dark workspace, camera off. Enabling the
+camera switches to **camera mode** automatically — the feed fills the workspace at **full
+brightness** and the model is composited in front of it. <kbd>V</kbd> (or the corner button)
+swaps between the full-workspace feed and the small preview card.
 
-A dimming wash sits between the video and the 3D layer. It is a vignette by default (dark at
-the edges where the HUD lives, clear in the middle where you are), adjustable from 0 to 100 %
-in settings.
+There is no dimming wash by default (`scrim: 0`), because the point of camera mode is to see
+yourself clearly. A slider in settings raises it from 0 to 90 % if you want more contrast
+behind the model.
+
+The hand skeleton is drawn over the feed the whole time you are interacting: 21 connected
+joints per hand in cyan, with fingertips enlarged, a glowing index pointer and a pinch ring
+that closes as thumb and index meet.
 
 ### Keyboard
 
@@ -196,14 +201,14 @@ Everything in `tools/` runs headlessly in Node — there is **no browser and no 
 which is both the point and the limitation.
 
 ```bash
-npm run validate:all      # 395 + 90 + 48 checks
+npm run validate:all      # 407 + 100 + 48 checks
 npm run validate          # data, geometry, gestures, modes, explode, assistant, wiring, workspace
 ```
 
 | Harness | Checks | Covers |
 | --- | --- | --- |
-| `tools/validate.js` | 395 (15 sections) | Knowledge-base coverage both ways, assembly geometry sanity, gesture primitives against a forward-kinematics fixture, the manipulation solver, assistant retrieval, every element in `index.html` being wired, the real `Workspace` driven through a stub renderer, the mid-gesture mode gate, continuous explode and per-part transforms, camera-stream sharing |
-| `tools/validate-ui.js` | 90 | DOM behaviour in jsdom: panels, sliders, toasts, keyboard, markdown safety, camera-layer stacking and cropping, the mode bar, the explode slider, view controls |
+| `tools/validate.js` | 407 (17 sections) | Knowledge-base coverage both ways, assembly geometry sanity, gesture primitives against a forward-kinematics fixture, the manipulation solver, assistant retrieval, every element in `index.html` being wired, the real `Workspace` driven through a stub renderer, the mid-gesture mode gate, continuous explode and per-part transforms, camera-stream sharing |
+| `tools/validate-ui.js` | 100 | DOM behaviour in jsdom: panels, sliders, toasts, keyboard, markdown safety, camera-layer stacking and cropping, the mode bar, the explode slider, view controls |
 | `tools/validate-boot.js` | 48 | The full application boot in jsdom, including the degraded no-WebGL path and live mode/view/slider wiring |
 | `tools/render-preview.js` | — | A software rasteriser that renders the *real* scene graph through the *real* camera to PNG |
 
@@ -224,7 +229,14 @@ caught the worst bugs in this codebase:
    entirely below the visible box. The renderer canvas is now targeted by class
    (`.workspace-canvas`) instead of by element type, and the suite resolves the cascade for
    each canvas rather than grepping for the presence of a rule.
-4. The hand pointer used to be mapped from normalised landmarks straight onto the viewport,
+4. **Camera mode silently killed hand tracking.** The tracked `<video>` lives inside
+   `.camera-stage`, and that container was collapsed with `display: none` whenever the feed
+   filled the workspace. Browsers stop decoding frames for a `display: none` video, so
+   `currentTime` froze, `detectForVideo` was never called, and the HUD sat at `TRACKING —`
+   with no landmarks — precisely when the user had just turned the camera on. It is now
+   collapsed with `height: 0; visibility: hidden; overflow: hidden`, which hides it visually
+   without stopping the decoder.
+5. The hand pointer used to be mapped from normalised landmarks straight onto the viewport,
    ignoring that `object-fit: cover` crops the video. On a 4:3 camera in a 16:9 viewport that
    is **90 px of drift** at the corner of the frame — enough to make you pinch the wrong part.
    `handGeometry.js` now does the cover-fit inverse, and the test suite checks the measured

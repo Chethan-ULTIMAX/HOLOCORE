@@ -28,29 +28,34 @@ export const HAND_CONNECTIONS = [
 /** Thumb tip, then the four fingertips. */
 export const TIP_INDICES = [4, 8, 12, 16, 20];
 
-const HANDS = {
-  Left: {
-    bone: "rgba(86, 226, 255, 0.95)",
-    joint: "#a9f0ff",
-    tip: "#e8fdff",
-    pointer: [86, 226, 255],
-    label: "#8fe8ff"
-  },
-  Right: {
-    bone: "rgba(190, 148, 255, 0.95)",
-    joint: "#d5c2ff",
-    tip: "#f4ecff",
-    pointer: [190, 148, 255],
-    label: "#cbadff"
-  },
-  Unknown: {
-    bone: "rgba(150, 205, 235, 0.95)",
-    joint: "#d8ecf8",
-    tip: "#ffffff",
-    pointer: [150, 205, 235],
-    label: "#cfe4f2"
-  }
+/**
+ * Both hands use the same cyan palette, which is what makes the overlay read as
+ * one tracking layer over the feed (see the reference implementation). A very
+ * slight hue shift on the second hand keeps it possible to tell them apart at a
+ * glance without breaking that single-colour look.
+ */
+const CYAN = {
+  bone: "rgba(64, 224, 255, 0.92)",
+  joint: "#8ef0ff",
+  tip: "#eafdff",
+  pointer: [64, 224, 255],
+  label: "#9beeff"
 };
+
+const HANDS = {
+  Left: CYAN,
+  Right: {
+    ...CYAN,
+    // A touch warmer so two hands are still distinguishable while grabbed.
+    bone: "rgba(96, 208, 255, 0.92)",
+    joint: "#a8e6ff",
+    label: "#b3ecff"
+  },
+  Unknown: CYAN
+};
+
+/** Exponential smoothing factor for joint positions, per frame at 60 fps. */
+const SMOOTHING = 0.55;
 
 /**
  * Probe for a usable 2D context without producing noisy console output.
@@ -96,6 +101,12 @@ export class HandOverlay {
     /** Pinch animation phase, advanced by draw() so the ring can animate. */
     this._pulse = 0;
     this._lastFrame = 0;
+    /**
+     * Smoothed canvas-space positions per hand index, per landmark.
+     * Raw MediaPipe joints jitter by a few pixels frame to frame; interpolating
+     * toward the new position removes the shimmer without adding visible lag.
+     */
+    this._smooth = new Map();
     this._resizeObserver = new ResizeObserver(() => this.resize());
     this._resizeObserver.observe(canvas.parentElement || canvas);
     this.resize();
@@ -134,6 +145,29 @@ export class HandOverlay {
       boxWidth: this.width,
       boxHeight: this.height
     };
+  }
+
+  /**
+   * Map a landmark into canvas pixels, exponentially smoothed.
+   * `handIndex`/`landmarkIndex` identify the slot; when they are omitted the raw
+   * mapping is returned (used by fingertipPixels for hit-testing, which must not
+   * lag behind the pointer).
+   */
+  smoothed(handIndex, landmarkIndex, point) {
+    const key = `${handIndex}:${landmarkIndex}`;
+    const raw = this.toCanvas(point);
+    if (!raw.inside) return raw;
+    const previous = this._smooth.get(key);
+    if (!previous) {
+      this._smooth.set(key, { x: raw.x, y: raw.y });
+      return raw;
+    }
+    // Frame-rate independent: at 60 fps this is the plain factor, and it eases
+    // toward a tighter follow if the loop runs slower.
+    const t = 1 - Math.pow(1 - SMOOTHING, Math.max(0.4, this._frameScale || 1));
+    previous.x += (raw.x - previous.x) * t;
+    previous.y += (raw.y - previous.y) * t;
+    return { x: previous.x, y: previous.y, inside: true };
   }
 
   /** Map a normalised landmark into canvas pixels (crop + mirror aware). */
@@ -182,15 +216,15 @@ export class HandOverlay {
       const isPinched = Boolean(pinched[index]);
       const heat = Math.max(0, Math.min(1, activity[index] ?? (isPinched ? 1 : 0)));
 
-      this._drawSkeleton(landmarks, colours, heat);
-      this._drawJoints(landmarks, colours, heat, isPinched);
-      this._drawPinch(landmarks, colours, isPinched, heat);
-      this._drawPointer(landmarks, colours, isPinched, heat, targets[index], tethers[index]);
-      this._drawLabel(landmarks, colours, side, heat);
+      this._drawSkeleton(landmarks, colours, heat, index);
+      this._drawJoints(landmarks, colours, heat, isPinched, index);
+      this._drawPinch(landmarks, colours, isPinched, heat, index);
+      this._drawPointer(landmarks, colours, isPinched, heat, targets[index], tethers[index], index);
+      this._drawLabel(landmarks, colours, side, heat, index);
     });
   }
 
-  _drawSkeleton(landmarks, colours, heat) {
+  _drawSkeleton(landmarks, colours, heat, handIndex) {
     if (!this.settings.showSkeleton) return;
     const ctx = this.ctx;
     ctx.save();
@@ -201,8 +235,8 @@ export class HandOverlay {
     ctx.shadowBlur = 6 + heat * 14;
     ctx.beginPath();
     for (const [a, b] of HAND_CONNECTIONS) {
-      const p1 = this.toCanvas(landmarks[a]);
-      const p2 = this.toCanvas(landmarks[b]);
+      const p1 = this.smoothed(handIndex, a, landmarks[a]);
+      const p2 = this.smoothed(handIndex, b, landmarks[b]);
       if (!p1.inside && !p2.inside) continue;
       ctx.moveTo(p1.x, p1.y);
       ctx.lineTo(p2.x, p2.y);
@@ -211,10 +245,10 @@ export class HandOverlay {
     ctx.restore();
   }
 
-  _drawJoints(landmarks, colours, heat, isPinched) {
+  _drawJoints(landmarks, colours, heat, isPinched, handIndex) {
     const ctx = this.ctx;
     for (let i = 0; i < landmarks.length; i++) {
-      const point = this.toCanvas(landmarks[i]);
+      const point = this.smoothed(handIndex, i, landmarks[i]);
       if (!point.inside) continue;
       const isTip = TIP_INDICES.includes(i);
       // Fingertips read as pointers, not dots: bigger, brighter, haloed.
@@ -234,9 +268,9 @@ export class HandOverlay {
   }
 
   /** Thumb–index tether plus the closing activation ring. */
-  _drawPinch(landmarks, colours, isPinched, heat) {
-    const thumb = this.toCanvas(landmarks[4]);
-    const index = this.toCanvas(landmarks[8]);
+  _drawPinch(landmarks, colours, isPinched, heat, handIndex) {
+    const thumb = this.smoothed(handIndex, 4, landmarks[4]);
+    const index = this.smoothed(handIndex, 8, landmarks[8]);
     if (!thumb.inside && !index.inside) return;
 
     const ctx = this.ctx;
@@ -245,8 +279,8 @@ export class HandOverlay {
 
     // Proximity is expressed relative to the hand's own size so it works at any
     // distance from the camera.
-    const palm = this.toCanvas(landmarks[0]);
-    const middle = this.toCanvas(landmarks[9]);
+    const palm = this.smoothed(handIndex, 0, landmarks[0]);
+    const middle = this.smoothed(handIndex, 9, landmarks[9]);
     const handSpan = Math.max(8, Math.hypot(palm.x - middle.x, palm.y - middle.y));
     const closeness = Math.max(0, Math.min(1, 1 - distance / (handSpan * 2.2)));
 
@@ -300,8 +334,8 @@ export class HandOverlay {
   }
 
   /** The index fingertip as an interactive pointer: outer glow, ring, crosshair. */
-  _drawPointer(landmarks, colours, isPinched, heat, target, tether) {
-    const tip = this.toCanvas(landmarks[8]);
+  _drawPointer(landmarks, colours, isPinched, heat, target, tether, handIndex) {
+    const tip = this.smoothed(handIndex, 8, landmarks[8]);
     if (!tip.inside) return;
 
     const ctx = this.ctx;
@@ -385,8 +419,8 @@ export class HandOverlay {
     ctx.restore();
   }
 
-  _drawLabel(landmarks, colours, side, heat) {
-    const wrist = this.toCanvas(landmarks[0]);
+  _drawLabel(landmarks, colours, side, heat, handIndex) {
+    const wrist = this.smoothed(handIndex, 0, landmarks[0]);
     if (!wrist.inside) return;
     const ctx = this.ctx;
     ctx.save();
