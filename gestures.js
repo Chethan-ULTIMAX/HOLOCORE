@@ -752,10 +752,23 @@ export class ManipulationSolver {
     }
 
     const [a, b] = hands;
-    const distance = Math.max(
-      0.001,
-      Math.hypot(a.palm.x - b.palm.x, a.palm.y - b.palm.y)
-    );
+    // Fall back to the pinch/index points when a palm centre is missing: a
+    // hand state built from partial landmarks has neither, and dereferencing it
+    // threw on every frame.
+    const pointOf = hand => hand.palm || hand.pinch || hand.indexTip || null;
+    const pa = pointOf(a);
+    const pb = pointOf(b);
+    if (!pa || !pb) {
+      this.explodeFrame = null;
+      this._setMode("idle");
+      return {
+        mode: "idle",
+        active: false,
+        intent: "none",
+        pointer: hands[0]?.indexTip || hands[0]?.pinch
+      };
+    }
+    const distance = Math.max(0.001, Math.hypot(pa.x - pb.x, pa.y - pb.y));
 
     if (this.mode !== "frame" || !this.explodeFrame) {
       this.explodeFrame = { distance, start: current };

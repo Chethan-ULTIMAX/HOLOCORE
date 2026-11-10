@@ -502,6 +502,128 @@ api.tracker.handedness = [];
 api.tracker.worldLandmarks = [];
 pg.clear();
 
+section("5e · Every mode does exactly one thing");
+
+const probeSolver = new (await import("../gestures.js")).ManipulationSolver({
+  settings: { mode: "scale" }
+});
+const restState = () => ({
+  position: { x: 0, y: 0, z: 0 }, rotationZ: 0, rotationX: 0, scale: 1, explode: 0
+});
+const fakeHand = (x, pinched = true) => ({
+  pinch: { x, y: 0.5, z: 0 }, indexTip: { x, y: 0.5, z: 0 },
+  pinched, present: true, landmarks: new Array(21).fill({ x, y: 0.5, z: 0 })
+});
+let probeClock = 0;
+const step = (hands, state3d = restState()) =>
+  probeSolver.update(hands, state3d, (probeClock += 16));
+
+// SCALE: both hands, spread drives scale only.
+probeSolver.updateSettings({ mode: "scale" });
+probeSolver.mode = "idle";
+let scaleResult = step([fakeHand(0.4), fakeHand(0.6)]);
+scaleResult = step([fakeHand(0.35), fakeHand(0.65)]);
+check("two-hand spread scales proportionally",
+  Math.abs(scaleResult.scale - 1.5) < 0.02, String(scaleResult.scale));
+check("scaling does not translate",
+  scaleResult.intent === "scale" && !scaleResult.position,
+  scaleResult.intent);
+const shrink = step([fakeHand(0.45), fakeHand(0.55)]);
+check("bringing the hands together shrinks",
+  Math.abs(shrink.scale - 0.5) < 0.02, String(shrink.scale));
+const released = step([fakeHand(0.45), fakeHand(0.55, false)]);
+check("releasing one hand holds instead of jumping",
+  released.scale === undefined || Math.abs(released.scale - 1) < 0.5,
+  `${released.intent} ${released.scale}`);
+
+// ROTATE: yaw only.
+probeSolver.updateSettings({ mode: "rotate" });
+probeSolver.mode = "idle";
+step([fakeHand(0.5)]);
+const rotA = step([fakeHand(0.5)]);
+const rotB = step([fakeHand(0.7)]);
+check("rotate reports a yaw and nothing else",
+  rotB.intent === "rotate" && typeof rotB.rotationZ === "number" &&
+    !rotB.position && rotB.scale === undefined,
+  `${rotB.intent} rz=${rotB.rotationZ?.toFixed(2)}`);
+check("rotating one way moves the yaw",
+  Number.isFinite(rotB.rotationZ) && Number.isFinite(rotA.rotationZ));
+
+// EXPLODE: spread only, never a transform.
+probeSolver.updateSettings({ mode: "explode" });
+probeSolver.mode = "idle";
+const exA = step([fakeHand(0.4), fakeHand(0.6)]);
+const exB = step([fakeHand(0.3), fakeHand(0.7)]);
+check("explode changes only the explosion amount",
+  exB.intent === "explode" && typeof exB.explode === "number" &&
+    !exB.position && exB.scale === undefined,
+  `${exB.intent} ${exB.explode}`);
+check("a wider spread explodes further", exB.explode > exA.explode,
+  `${exA.explode?.toFixed(2)} -> ${exB.explode?.toFixed(2)}`);
+
+// MOVE: translation only.
+probeSolver.updateSettings({ mode: "move" });
+probeSolver.mode = "idle";
+const moveState = restState();
+step([fakeHand(0.5)], moveState);
+const mv = step([fakeHand(0.6, true)], moveState);
+check("move translates without rotating or scaling",
+  mv.intent === "translate" && mv.rotationZ === undefined && mv.scale === undefined,
+  mv.intent);
+
+// SELECT: no transform at all.
+probeSolver.updateSettings({ mode: "select" });
+probeSolver.mode = "idle";
+const sel = step([fakeHand(0.5)]);
+check("select never transforms the scene",
+  !sel.position && sel.scale === undefined && sel.rotationZ === undefined,
+  sel.intent);
+
+section("5f · Pinch recognition curve");
+
+// A hand whose palm scale is normalised to 1, with the thumb tip placed at a
+// known distance from the index tip. Distances follow the measured values the
+// detector documents: ~0.95 open, ~0.30 relaxed pinch, 0 pads touching.
+function handAt(normalisedGap) {
+  const pts = Array.from({ length: 21 }, () => ({ x: 0, y: 0, z: 0 }));
+  pts[0] = { x: 0.5, y: 0.85, z: 0 };
+  pts[5] = { x: 0.43, y: 0.64, z: 0 };
+  pts[9] = { x: 0.5, y: 0.625, z: 0 };
+  pts[13] = { x: 0.56, y: 0.64, z: 0 };
+  pts[17] = { x: 0.61, y: 0.665, z: 0 };
+  const s = 0.216;
+  for (const base of [5, 9, 13, 17]) {
+    for (let i = 1; i <= 3; i++) {
+      pts[base + i] = { x: pts[base].x, y: pts[base].y - 0.055 * i, z: 0 };
+    }
+  }
+  const tip = pts[8];
+  pts[4] = { x: tip.x - normalisedGap * s, y: tip.y + normalisedGap * s * 0.2, z: 0 };
+  return pts;
+}
+
+const { pinchStrength, HandAnalyzer } = await import("../gestures.js");
+check("an open hand does not read as a pinch", pinchStrength(handAt(0.95)) < 0.2,
+  pinchStrength(handAt(0.95)).toFixed(3));
+check("touching pads read as a full pinch", pinchStrength(handAt(0.0)) > 0.95,
+  pinchStrength(handAt(0.0)).toFixed(3));
+check("the strength curve is monotonic",
+  [0, 0.2, 0.4, 0.6, 0.95].every((g, i, arr) =>
+    i === 0 || pinchStrength(handAt(g)) < pinchStrength(handAt(arr[i - 1])) + 1e-9));
+
+// Hysteresis: one clean latch, one clean release, no chatter in between.
+const probe = new HandAnalyzer({ pinchThreshold: 0.62, pinchRelease: 0.44, smoothing: 0.45 });
+let clock = 0;
+const pump = (gap, frames) => {
+  let last = null;
+  for (let i = 0; i < frames; i++) last = probe.update(handAt(gap), "Right", (clock += 0.016));
+  return last;
+};
+check("an open hand stays un-pinched", pump(0.95, 8).pinched === false);
+check("a pinch latches", pump(0.2, 8).pinched === true);
+check("a held pinch stays latched", pump(0.22, 8).pinched === true);
+check("releasing the pinch clears it", pump(0.95, 8).pinched === false);
+
 section("6 · Modes still gate gestures");
 
 const modes = ["select", "move", "rotate", "scale", "explode"];
