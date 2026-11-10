@@ -306,6 +306,46 @@ check("closing the library leaves properties open",
 check("the closed drawer's toggle reports collapsed state",
   doc.getElementById("drawer-toggle-left")?.getAttribute("aria-expanded") === "false");
 
+// A drawer that slid off-screen must be inert, or keyboard focus lands on
+// controls the user cannot see.
+check("a closed drawer is inert",
+  doc.getElementById("panel-left")?.hasAttribute("inert") === true);
+check("an open drawer is not inert",
+  doc.getElementById("panel-right")?.hasAttribute("inert") === false);
+
+section("5b · The primitive library adds real objects");
+
+const tiles = [...doc.querySelectorAll("#primitive-grid .primitive-tile")];
+check("every primitive has a tile", tiles.length === 7, `${tiles.length} tiles`);
+check("each tile names its primitive",
+  tiles.every(t => !!t.dataset.primitive && !!t.textContent.trim()));
+
+const beforeAdd = api.getPlayground().props.length;
+for (const tile of tiles) {
+  tile.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+}
+const afterAdd = api.getPlayground().props.length;
+check("clicking the tiles adds one object each", afterAdd === beforeAdd + tiles.length,
+  `${beforeAdd} -> ${afterAdd}`);
+check("the added objects are the requested primitives",
+  tiles.every(t => api.getPlayground().props.some(p => p.primitive === t.dataset.primitive)));
+check("the object counter follows the library",
+  doc.getElementById("hud-objects")?.textContent === String(afterAdd));
+check("the outliner lists every new object",
+  doc.querySelectorAll("#scene-outliner .outliner-row").length >= afterAdd);
+
+// The library's import button must drive the same file input as the toolbar.
+const importBtn = doc.getElementById("library-import");
+let openedInput = 0;
+const input = doc.getElementById("file-input");
+const realClick = input.click.bind(input);
+input.click = () => { openedInput += 1; };
+importBtn?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+check("the library import button opens the file picker", openedInput === 1);
+input.click = realClick;
+
+for (const prop of [...api.getPlayground().props]) api.getPlayground().remove(prop.id);
+
 section("6 · Modes still gate gestures");
 
 const modes = ["select", "move", "rotate", "scale", "explode"];

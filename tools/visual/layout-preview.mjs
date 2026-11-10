@@ -26,8 +26,10 @@ import { JSDOM } from "jsdom";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..", "..");
 
-const W = 1440;
-const H = 900;
+const argW = process.argv.find(a => /^--size=\d+x\d+$/.test(a));
+const [W, H] = argW
+  ? argW.slice(7).split("x").map(Number)
+  : [1440, 900];
 
 const html = readFileSync(join(root, "index.html"), "utf8");
 const css = readFileSync(join(root, "styles.css"), "utf8");
@@ -102,6 +104,7 @@ function computed(el, property) {
 // The real app applies the persisted panel state at boot. Mirror the default so
 // this preview shows what a first visit actually looks like.
 const wantDrawersOpen = process.argv.includes("--drawers");
+const cameraMode = process.argv.includes("--camera");
 const workspaceEl = document.getElementById("workspace");
 if (!wantDrawersOpen) {
   workspaceEl.classList.add("hide-left", "hide-right");
@@ -114,14 +117,24 @@ const ctx = canvas.getContext("2d");
 /* BACKGROUND: what the camera feed would be                                 */
 /* ------------------------------------------------------------------------- */
 
-// A stand-in for a real camera image: a soft warm room so the compositing
-// contrast is realistic rather than a flat grey.
+// A stand-in for a real camera image. In camera mode the feed is at full
+// brightness (scrim 0), so this is what actually sits behind the model.
 const bg = ctx.createLinearGradient(0, 0, W, H);
-bg.addColorStop(0, "#6b5f52");
-bg.addColorStop(0.5, "#8a7a68");
-bg.addColorStop(1, "#4a4038");
+bg.addColorStop(0, "#8d8072");
+bg.addColorStop(0.45, "#b0a08b");
+bg.addColorStop(1, "#6a5d51");
 ctx.fillStyle = bg;
 ctx.fillRect(0, 0, W, H);
+
+// A soft warm blob standing in for a person, so the model has something to
+// composite against.
+const bgStageTop = 46;
+const bgStageH = H - bgStageTop;
+const person = ctx.createRadialGradient(W * 0.44, bgStageTop + bgStageH * 0.52, 30, W * 0.44, bgStageTop + bgStageH * 0.52, 300);
+person.addColorStop(0, "rgba(226, 200, 175, 0.55)");
+person.addColorStop(1, "rgba(226, 200, 175, 0)");
+ctx.fillStyle = person;
+ctx.fillRect(0, bgStageTop, W, bgStageH);
 
 /* ------------------------------------------------------------------------- */
 /* STAGE ELEMENTS                                                            */
@@ -153,8 +166,10 @@ ctx.fillText(String(document.querySelector(".topbar-model")?.textContent || "Aer
 const stageTop = topbarH;
 const stageH = H - topbarH;
 ctx.save();
-ctx.fillStyle = "rgba(3, 6, 10, 0.10)";
-ctx.fillRect(0, stageTop, W, stageH);
+if (!cameraMode) {
+  ctx.fillStyle = "rgba(3, 6, 10, 0.10)";
+  ctx.fillRect(0, stageTop, W, stageH);
+}
 
 // A rendered stand-in for the WebGL model, so the layout can be judged against
 // something with the right visual weight.
@@ -211,7 +226,12 @@ function drawHand(x, y, scale) {
     ctx.beginPath(); ctx.arc(px, py, 3.4, 0, Math.PI * 2); ctx.fill();
   }
 }
-drawHand(W * 0.70, stageTop + stageH * 0.78, 150);
+if (cameraMode) {
+  drawHand(W * 0.30, stageTop + stageH * 0.80, 165);
+  drawHand(W * 0.74, stageTop + stageH * 0.72, 155);
+} else {
+  drawHand(W * 0.70, stageTop + stageH * 0.78, 150);
+}
 
 /* --- drawers, laid out from the real CSS ---------------------------------- */
 function drawDrawer(side) {
@@ -220,7 +240,7 @@ function drawDrawer(side) {
   const hidden = workspaceEl.classList.contains(side === "left" ? "hide-left" : "hide-right");
 
   const pad = 18;
-  const width = 320;
+  const width = W <= 820 ? Math.min(W * 0.88, 340) : 320;
   const top = stageTop + pad;
   const height = stageH - pad * 2;
   const x = side === "left" ? pad : W - pad - width;
@@ -250,6 +270,128 @@ function drawDrawer(side) {
   ctx.fillText(side === "left" ? "MODEL LIBRARY" : "SCENE", x + 16, top + 26);
   ctx.fillStyle = "rgba(255,255,255,0.06)";
   ctx.fillRect(x + 12, top + 36, width - 24, 1);
+
+  if (side === "left") drawLibraryBody(x, top + 50, width);
+  else drawSceneBody(x, top + 50, width);
+}
+
+/** The left drawer's real content: primitive palette, then the model list. */
+function drawLibraryBody(x, y, width) {
+  const inner = x + 14;
+  const innerW = width - 28;
+
+  ctx.font = "600 8px ui-monospace, monospace";
+  ctx.fillStyle = "rgba(190,220,240,0.5)";
+  ctx.fillText("PRIMITIVES", inner, y + 8);
+  ctx.fillStyle = "rgba(190,220,240,0.35)";
+  ctx.textAlign = "right";
+  ctx.fillText("7", inner + innerW, y + 8);
+  ctx.textAlign = "left";
+
+  const tiles = [
+    ["\u25a1", "CUBE"], ["\u25cb", "SPHERE"], ["\u25af", "CYLINDER"], ["\u25b3", "CONE"],
+    ["\u25ce", "TORUS"], ["\u2733", "KNOT"], ["\u25c8", "CRYSTAL"]
+  ];
+  const gap = 6;
+  const cols = 4;
+  const tileW = (innerW - gap * (cols - 1)) / cols;
+  const tileH = 44;
+  tiles.forEach(([glyph, label], i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const tx = inner + col * (tileW + gap);
+    const ty = y + 16 + row * (tileH + gap);
+    ctx.fillStyle = "rgba(18, 30, 44, 0.9)";
+    roundRect(tx, ty, tileW, tileH, 10);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(120, 210, 255, 0.14)";
+    ctx.lineWidth = 1;
+    roundRect(tx, ty, tileW, tileH, 10);
+    ctx.stroke();
+
+    ctx.textAlign = "center";
+    ctx.font = "13px ui-sans-serif, system-ui";
+    ctx.fillStyle = "#7fe9ff";
+    ctx.fillText(glyph, tx + tileW / 2, ty + 23);
+    ctx.font = "600 7px ui-monospace, monospace";
+    ctx.fillStyle = "rgba(190,220,240,0.62)";
+    ctx.fillText(label, tx + tileW / 2, ty + 36);
+    ctx.textAlign = "left";
+  });
+
+  const rows = Math.ceil(tiles.length / cols);
+  let cursor = y + 16 + rows * (tileH + gap) + 4;
+
+  // Import button
+  ctx.fillStyle = "rgba(20, 34, 48, 0.9)";
+  roundRect(inner, cursor, innerW, 28, 8);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(120, 210, 255, 0.16)";
+  roundRect(inner, cursor, innerW, 28, 8);
+  ctx.stroke();
+  ctx.font = "600 8.5px ui-monospace, monospace";
+  ctx.fillStyle = "rgba(200,230,245,0.8)";
+  ctx.textAlign = "center";
+  ctx.fillText("IMPORT GLB / GLTF", inner + innerW / 2, cursor + 18);
+  ctx.textAlign = "left";
+  cursor += 42;
+
+  // Engineering models
+  ctx.font = "600 8px ui-monospace, monospace";
+  ctx.fillStyle = "rgba(190,220,240,0.5)";
+  ctx.fillText("ENGINEERING MODELS", inner, cursor + 8);
+  cursor += 18;
+
+  const models = ["AERO-9 LAUNCH VEHICLE", "ORBITAL TUG", "FUSION CORE", "ROVER CHASSIS"];
+  for (const name of models) {
+    ctx.fillStyle = "rgba(16, 27, 39, 0.85)";
+    roundRect(inner, cursor, innerW, 34, 9);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(120, 210, 255, 0.08)";
+    roundRect(inner, cursor, innerW, 34, 9);
+    ctx.stroke();
+    ctx.fillStyle = "#7fe9ff";
+    ctx.font = "11px ui-sans-serif, system-ui";
+    ctx.fillText("\u25c8", inner + 10, cursor + 22);
+    ctx.font = "600 8.5px ui-monospace, monospace";
+    ctx.fillStyle = "rgba(210,235,250,0.82)";
+    ctx.fillText(name, inner + 28, cursor + 21);
+    cursor += 40;
+  }
+}
+
+/** The right drawer's real content: the scene outliner. */
+function drawSceneBody(x, y, width) {
+  const inner = x + 14;
+  const innerW = width - 28;
+
+  ctx.font = "600 8px ui-monospace, monospace";
+  ctx.fillStyle = "rgba(190,220,240,0.5)";
+  ctx.fillText("OBJECTS", inner, y + 8);
+
+  const rows = [
+    ["AERO-9 LAUNCH VEHICLE", "MODEL", true],
+    ["CUBE", "PRIMITIVE", false],
+    ["SPHERE", "PRIMITIVE", false],
+    ["TORUS KNOT", "PRIMITIVE", false]
+  ];
+  let cursor = y + 18;
+  for (const [name, meta, selected] of rows) {
+    if (selected) {
+      ctx.fillStyle = "rgba(90, 220, 255, 0.13)";
+      roundRect(inner, cursor, innerW, 32, 8);
+      ctx.fill();
+    }
+    ctx.fillStyle = selected ? "#8ff0ff" : "rgba(210,235,250,0.8)";
+    ctx.font = "600 9px ui-monospace, monospace";
+    ctx.fillText(name, inner + 10, cursor + 20);
+    ctx.font = "600 7px ui-monospace, monospace";
+    ctx.fillStyle = "rgba(190,220,240,0.4)";
+    ctx.textAlign = "right";
+    ctx.fillText(meta, inner + innerW - 10, cursor + 20);
+    ctx.textAlign = "left";
+    cursor += 36;
+  }
 }
 
 drawDrawer("left");
@@ -289,8 +431,9 @@ drawToggle("right");
 
 // --- mode bar + toolbar ---
 const modeNames = ["SELECT", "MOVE", "ROTATE", "SCALE", "EXPLODE"];
-const barW = 470;
-const barX = (W - barW) / 2;
+const compact = W <= 560;
+const barW = compact ? W - 2 * 18 : 470;
+const barX = compact ? 18 : (W - barW) / 2;
 const barY = H - 18 - 62 - 34;
 ctx.fillStyle = "rgba(8,13,20,0.9)";
 roundRect(barX, barY, barW, 30, 999);
@@ -298,11 +441,12 @@ ctx.fill();
 ctx.strokeStyle = "rgba(120,210,255,0.18)";
 ctx.stroke();
 ctx.font = "600 9px ui-monospace, monospace";
+const step = compact ? (barW - 20) / modeNames.length : 92;
 modeNames.forEach((name, i) => {
-  const x = barX + 14 + i * 92;
+  const x = barX + 14 + i * step;
   if (i === 1) {
     ctx.fillStyle = "rgba(74, 222, 128, 0.18)";
-    roundRect(x - 8, barY + 3, 82, 24, 999);
+    roundRect(x - 8, barY + 3, compact ? step - 4 : 82, 24, 999);
     ctx.fill();
   }
   ctx.fillStyle = i === 1 ? "#4ade80" : "rgba(190,220,240,0.55)";

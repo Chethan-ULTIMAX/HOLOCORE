@@ -2449,3 +2449,143 @@ body.is-interacting .stage-keys { opacity: 0; }
 @media (max-height: 680px) {
   .stage-keys { display: none; }
 }
+
+/* ==========================================================================
+   RESPONSIVE DRAWERS
+   The older mobile rules above predate the floating-drawer layout and fight it
+   (they position the panels at top:0 and rely on .mobile-left/.mobile-right).
+   These rules are later in the cascade and take precedence, so the drawers
+   slide and stack the same way on every screen size.
+   ========================================================================== */
+
+@media (max-width: 820px) {
+  .panel {
+    position: absolute;
+    top: calc(var(--stage-pad) + 44px);
+    bottom: var(--stage-pad);
+    width: min(88vw, 340px);
+    transform: translateX(0);
+  }
+  .panel-left { left: var(--stage-pad); right: auto; }
+  .panel-right { right: var(--stage-pad); left: auto; }
+
+  .workspace.hide-left .panel-left {
+    transform: translateX(calc(-100% - var(--stage-pad) - 16px));
+  }
+  .workspace.hide-right .panel-right {
+    transform: translateX(calc(100% + var(--stage-pad) + 16px));
+  }
+
+  /* The legacy mobile drawer classes must not re-open a closed drawer. */
+  .workspace.mobile-left .panel-left,
+  .workspace.mobile-right .panel-right {
+    transform: translateX(calc(-100% - var(--stage-pad) - 16px));
+  }
+  .workspace:not(.hide-left).mobile-left .panel-left { transform: translateX(0); }
+
+  /* Drawer toggles clear the top bar and stay reachable. */
+  .drawer-toggle { top: calc(var(--stage-pad) + 2px); }
+
+  .stage-toolbar { bottom: calc(var(--stage-pad) + 6px); }
+  .mode-bar { bottom: calc(var(--stage-pad) + 52px); }
+  .mode-instruction { bottom: calc(var(--stage-pad) + 92px); }
+  .voice-chip { max-width: calc(100vw - 40px); }
+  .voice-phrase { max-width: 120px; }
+
+  /* The camera card would collide with the toolbar on a phone. */
+  .camera-card { width: 150px; left: var(--stage-pad); bottom: calc(var(--stage-pad) + 52px); }
+  .diag { display: none; }
+}
+
+@media (max-width: 560px) {
+  .viewport-hud-tr { display: none; }
+  .stage-toolbar .mini-btn { width: 28px; height: 28px; }
+  .voice-label { display: none; }
+}
+
+/* On a narrow stage the mode bar must fit without clipping. It scrolls
+   horizontally rather than overflowing the viewport. */
+@media (max-width: 560px) {
+  .mode-bar {
+    left: var(--stage-pad);
+    right: var(--stage-pad);
+    transform: none;
+    width: auto;
+    max-width: none;
+    overflow-x: auto;
+    scrollbar-width: none;
+    justify-content: flex-start;
+  }
+  .mode-bar::-webkit-scrollbar { display: none; }
+  .mode-bar-label { display: none; }
+  .mode-buttons { gap: 4px; }
+  .mode-btn { padding: 5px 10px; font-size: 8.5px; letter-spacing: 0.08em; }
+  .mode-btn .mode-key { display: none; }
+  .stage-toolbar { max-width: calc(100% - 24px); }
+}
+
+/* ==========================================================================
+   PRIMITIVE LIBRARY
+   ========================================================================== */
+
+.primitive-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin: 8px 0 8px;
+}
+
+.primitive-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 9px 2px 7px;
+  border: 1px solid rgba(120, 210, 255, 0.14);
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(18, 30, 44, 0.9), rgba(10, 18, 28, 0.9));
+  color: var(--ink, #cfe6f5);
+  cursor: pointer;
+  transition: border-color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease,
+    background 0.16s ease;
+}
+
+.primitive-tile:hover {
+  border-color: rgba(120, 230, 255, 0.55);
+  background: linear-gradient(180deg, rgba(26, 48, 66, 0.95), rgba(12, 24, 36, 0.95));
+  box-shadow: 0 0 16px -4px rgba(90, 220, 255, 0.55);
+  transform: translateY(-1px);
+}
+
+.primitive-tile:active { transform: translateY(0) scale(0.97); }
+
+.primitive-tile:focus-visible {
+  outline: 1px solid rgba(120, 230, 255, 0.9);
+  outline-offset: 1px;
+}
+
+.primitive-glyph {
+  font-size: 15px;
+  line-height: 1;
+  color: #7fe9ff;
+  text-shadow: 0 0 10px rgba(90, 220, 255, 0.65);
+}
+
+.primitive-name {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 7.5px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: rgba(190, 220, 240, 0.62);
+}
+
+.primitive-tile:hover .primitive-name { color: rgba(215, 240, 255, 0.92); }
+
+.wide-btn {
+  width: 100%;
+  justify-content: center;
+  gap: 7px;
+}
+
+.panel-section-first { padding-top: 2px; }

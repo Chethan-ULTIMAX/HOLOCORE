@@ -59,6 +59,9 @@ const dom = {
 
   categoryRow: $("#category-row"),
   modelList: $("#model-list"),
+  primitiveGrid: $("#primitive-grid"),
+  primitiveCount: $("#primitive-count"),
+  libraryImport: $("#library-import"),
   partList: $("#part-list"),
   partCount: $("#part-count"),
   libraryFootModel: $("#library-foot-model"),
@@ -79,6 +82,8 @@ const dom = {
   hudFps: $("#hud-fps"),
   hudTris: $("#hud-tris"),
   hudHands: $("#hud-hands"),
+  panelLeft: $("#panel-left"),
+  panelRight: $("#panel-right"),
   drawerToggleLeft: $("#drawer-toggle-left"),
   drawerToggleRight: $("#drawer-toggle-right"),
   stageToolbar: $("#stage-toolbar"),
@@ -281,6 +286,7 @@ function setupChrome() {
   setupCameraControls();
   setupAssistantChrome();
   setupDrawer();
+  buildPrimitiveLibrary();
   buildCategoryRow();
   buildModelLibrary();
   checkSecureContext();
@@ -470,6 +476,38 @@ function boot() {
 /* ------------------------------------------------------------------------- */
 /* MODEL LIBRARY UI                                                          */
 /* ------------------------------------------------------------------------- */
+
+/**
+ * Primitive palette. Every tile adds a real object to the playground, so the
+ * library is the primary way to populate the scene.
+ */
+function buildPrimitiveLibrary() {
+  if (!dom.primitiveGrid) return;
+  dom.primitiveGrid.replaceChildren();
+  for (const primitive of PRIMITIVES) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "primitive-tile";
+    button.dataset.primitive = primitive.id;
+    button.title = `Add a ${primitive.label.toLowerCase()} to the scene`;
+    button.setAttribute("aria-label", `Add ${primitive.label}`);
+
+    const glyph = document.createElement("span");
+    glyph.className = "primitive-glyph";
+    glyph.textContent = primitive.icon;
+    const name = document.createElement("span");
+    name.className = "primitive-name";
+    name.textContent = primitive.label;
+    button.append(glyph, name);
+
+    button.addEventListener("click", () => {
+      const added = addPlaygroundPrimitive(primitive.id);
+      if (added) toast(`${primitive.label} added`, "", 1200);
+    });
+    dom.primitiveGrid.appendChild(button);
+  }
+  if (dom.primitiveCount) dom.primitiveCount.textContent = String(PRIMITIVES.length);
+}
 
 function buildCategoryRow() {
   const categories = ["All", ...new Set(MODEL_LIBRARY.map(model => model.category))];
@@ -709,6 +747,7 @@ function setupSceneTools() {
   });
 
   dom.toolImport.addEventListener("click", () => dom.fileInput.click());
+  dom.libraryImport?.addEventListener("click", () => dom.fileInput.click());
   dom.fileInput.addEventListener("change", async event => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -1682,6 +1721,20 @@ function updateHud(dt) {
 /* ------------------------------------------------------------------------- */
 /* PLAYGROUND (multi-object scene)                                           */
 /* ------------------------------------------------------------------------- */
+
+/**
+ * Add one primitive to the playground and refresh everything that reflects the
+ * object list. Shared by the library tiles, the toolbar and voice commands.
+ */
+function addPlaygroundPrimitive(kind) {
+  const scene3d = setupPlayground();
+  if (!scene3d) return null;
+  const prop = scene3d.addPrimitive(kind);
+  if (!prop) return null;
+  refreshSceneOutliner();
+  updateObjectHud();
+  return prop;
+}
 
 /**
  * The playground lives beside the engineering assemblies rather than replacing
@@ -2662,6 +2715,15 @@ function setPanelState({ left, right }, { persist = true } = {}) {
 
   dom.workspace.classList.toggle("hide-left", !nextLeft);
   dom.workspace.classList.toggle("hide-right", !nextRight);
+
+  // A drawer that has slid off-screen must not stay in the tab order: focus
+  // would land on controls nobody can see. `inert` is set purely as an
+  // attribute so it behaves identically in every environment.
+  for (const [panel, open] of [[dom.panelLeft, nextLeft], [dom.panelRight, nextRight]]) {
+    if (!panel) continue;
+    if (open) panel.removeAttribute("inert");
+    else panel.setAttribute("inert", "");
+  }
 
   // Keep the corner toggles in sync so they are always independently
   // reopenable and correctly labelled for assistive tech.
