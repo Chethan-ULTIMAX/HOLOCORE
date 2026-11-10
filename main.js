@@ -288,22 +288,32 @@ function setupChrome() {
   applyNonSceneSettings();
 }
 
+/**
+ * Build the workspace landmark overlay once and reuse it. It was previously
+ * constructed in three separate places (including inside applySettings, which
+ * runs on every settings change), leaking a ResizeObserver each time and
+ * resetting the pinch animation phase.
+ */
+function ensureWorkspaceOverlay() {
+  if (overlayWorkspace || !dom.workspaceOverlay) return overlayWorkspace;
+  overlayWorkspace = new HandOverlay({
+    canvas: dom.workspaceOverlay,
+    video: dom.workspaceVideo,
+    settings: settings.camera
+  });
+  return overlayWorkspace;
+}
+
 /** Settings that do not depend on the 3D renderer. */
 function applyNonSceneSettings() {
-  if (dom.workspaceOverlay) {
-    overlayWorkspace = new HandOverlay({
-      canvas: dom.workspaceOverlay,
-      video: dom.workspaceVideo,
-      settings: settings.camera
-    });
-  }
+  ensureWorkspaceOverlay();
 
   dom.cameraStage.classList.toggle("no-landmarks", !settings.camera.showLandmarks);
   dom.cameraVideo.classList.toggle("unmirrored", !settings.camera.mirror);
   dom.workspaceVideo?.classList.toggle("unmirrored", !settings.camera.mirror);
   overlay?.updateSettings?.(settings.camera);
   overlayWorkspace?.updateSettings?.(settings.camera);
-  dom.viewport?.style.setProperty("--scrim-strength", String(settings.camera.scrim ?? 0.4));
+  dom.viewport?.style.setProperty("--scrim-strength", String(settings.camera.scrim ?? 0));
   const workspaceViewInput = document.getElementById("set-workspace-view");
   if (workspaceViewInput) workspaceViewInput.checked = settings.camera.workspaceView !== false;
   syncWorkspaceVideo();
@@ -768,13 +778,7 @@ function setupOverlay() {
     onFrame: () => {} // per-frame work happens in the render loop
   });
 
-  if (dom.workspaceOverlay) {
-    overlayWorkspace = new HandOverlay({
-      canvas: dom.workspaceOverlay,
-      video: dom.workspaceVideo,
-      settings: settings.camera
-    });
-  }
+  ensureWorkspaceOverlay();
 
   dom.cameraStage.classList.toggle("no-landmarks", !settings.camera.showLandmarks);
   dom.cameraVideo.classList.toggle("unmirrored", !settings.camera.mirror);
@@ -792,6 +796,14 @@ async function toggleCamera() {
   const trackerState = await tracker.start({ deviceId: settings.camera.deviceId || undefined });
   if (trackerState.status === TRACKER_STATUS.ERROR) {
     showCameraError(trackerState.error);
+    return;
+  }
+
+  // Turning the camera on is the user asking for camera mode, so put the feed
+  // across the workspace straight away. The model is still composited in front
+  // of it; V (or the toggle) returns to the small preview card.
+  if (trackerState.status !== TRACKER_STATUS.ERROR && state.cameraView !== "workspace") {
+    setCameraView("workspace");
   }
 }
 
@@ -1496,9 +1508,20 @@ function updateHud(dt) {
     updateDiagnostics();
 
     const tracking = tracker?.getState();
+
+    // Hand count was looked up (dom.hudHands) but never written anywhere, so the
+    // HUD showed a permanent 0 even with both hands in frame. Read it from the
+    // tracker's live state instead.
+    if (dom.hudHands) {
+      const count = tracking?.hands ?? tracking?.handCount ?? 0;
+      dom.hudHands.textContent = String(count);
+    }
+
     dom.statusTracking.textContent = tracking?.fps
       ? `${tracking.fps} FPS · ${Number(tracking.inferenceMs || 0).toFixed(0)}MS`
-      : "—";
+      : tracking?.status === "error"
+        ? "ERROR"
+        : "—";
   }
 }
 
@@ -1990,15 +2013,9 @@ function applySettings({ section, keys } = {}) {
       dom.cameraRestore.hidden = false;
     }
 
-    if (dom.workspaceOverlay) {
-    overlayWorkspace = new HandOverlay({
-      canvas: dom.workspaceOverlay,
-      video: dom.workspaceVideo,
-      settings: settings.camera
-    });
-  }
-
-  dom.cameraStage.classList.toggle("no-landmarks", !settings.camera.showLandmarks);
+    ensureWorkspaceOverlay();
+    overlayWorkspace?.updateSettings(settings.camera);
+    dom.cameraStage.classList.toggle("no-landmarks", !settings.camera.showLandmarks);
     dom.cameraVideo.classList.toggle("unmirrored", !settings.camera.mirror);
     overlay?.updateSettings(settings.camera);
   }

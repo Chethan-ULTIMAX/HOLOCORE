@@ -1543,6 +1543,57 @@ async function makeWorkspace() {
   });
 }
 
+section("10b · SCALE waits for the second hand instead of releasing");
+
+{
+  // Real usage: the user pinches with one hand, then brings the second pinch
+  // in. A single-hand pinch must not abort the gesture, or the scale restarts
+  // from a different reference and visibly snaps.
+  const solver = new ManipulationSolver();
+  solver.setMode("scale");
+
+  const a = handState({ x: 0.40, y: 0.5, pinched: true });
+  const b = handState({ x: 0.60, y: 0.5, pinched: true });
+
+  const single = solver.update([a], neutralObject());
+  check("one pinched hand does not release in SCALE mode",
+    single.intent !== "release", single.intent);
+  check("one pinched hand waits instead of transforming",
+    single.intent === "hold" && single.active === false, single.intent);
+  check("waiting emits no scale", single.scale === undefined);
+
+  // Both hands: scaling engages.
+  let result = solver.update([a, b], neutralObject());
+  check("two pinched hands start scaling", result.intent === "scale", result.intent);
+
+  // Hands together => smaller.
+  const close = solver.update(
+    [handState({ x: 0.47, y: 0.5, pinched: true }), handState({ x: 0.53, y: 0.5, pinched: true })],
+    { position: { x: 0, y: 0, z: 0 }, rotationZ: 0, scale: result.scale }
+  );
+  check("pinched hands closer together shrink the model",
+    close.scale < result.scale, `${close.scale.toFixed(3)} < ${result.scale.toFixed(3)}`);
+
+  // Hands apart => larger.
+  const wide = solver.update(
+    [handState({ x: 0.25, y: 0.5, pinched: true }), handState({ x: 0.75, y: 0.5, pinched: true })],
+    { position: { x: 0, y: 0, z: 0 }, rotationZ: 0, scale: result.scale }
+  );
+  check("pinched hands further apart grow the model",
+    wide.scale > result.scale, `${wide.scale.toFixed(3)} > ${result.scale.toFixed(3)}`);
+
+  // Releasing both hands ends the gesture.
+  result = solver.update([handState({ pinched: false }), handState({ pinched: false })], neutralObject());
+  check("opening both pinches releases", result.intent === "release", result.intent);
+
+  // SCALE never moves or rotates.
+  const solver2 = new ManipulationSolver();
+  solver2.setMode("scale");
+  const scaled = solver2.update([a, b], neutralObject());
+  check("SCALE emits no position", scaled.position === undefined);
+  check("SCALE emits no rotation", scaled.rotationZ === undefined);
+}
+
 section("11 · Explode amount and per-component transforms");
 
 {
@@ -1792,6 +1843,32 @@ section("13 · Every model actually reaches the screen");
 
     ws.dispose();
   }
+}
+
+section("13b · HUD counters are actually written");
+
+{
+  const source = readFileSync(join(root, "main.js"), "utf8");
+
+  // #hud-hands existed, was looked up, and was never assigned: the HUD showed a
+  // permanent 0 even with both hands in frame. Guard against that class of
+  // bug by requiring that every live-counter id in the markup is assigned.
+  const hudIds = ["hud-fps", "hud-tris", "hud-hands"];
+  const refs = { "hud-fps": "hudFps", "hud-tris": "hudTris", "hud-hands": "hudHands" };
+  const unwritten = hudIds.filter(id => {
+    const domName = refs[id];
+    return !new RegExp(`dom\\.${domName}\\.textContent\\s*=`).test(source);
+  });
+  check("every live HUD counter is assigned in main.js",
+    unwritten.length === 0,
+    unwritten.length ? `never written: ${unwritten.join(", ")}` : `${hudIds.length} counters`);
+
+  check("the hand counter is assigned from tracker state",
+    /dom\.hudHands\.textContent\s*=/.test(source),
+    "hudHands assignment present");
+
+  check("the hand count comes from the tracker, not a constant",
+    /const count = tracking\?\.hands/.test(source));
 }
 
 section("14 · Diagnostics report the truth, not success constants");

@@ -656,6 +656,23 @@ export class ManipulationSolver {
     const both = hands.length >= 2 && hands[0].pinched && hands[1].pinched;
 
     if (!both) {
+      // Two hands are needed to scale, but a single pinched hand must NOT
+      // release the grab: the user pinches with one hand, then brings the
+      // second one in. Releasing here would abort the gesture mid-way and then
+      // snap the scale when the second pinch lands. Wait instead, holding the
+      // frame so the scale starts from the pose the user actually grabbed in.
+      const waiting = hands.some(hand => hand?.pinched);
+      if (waiting) {
+        // Arm the gesture: the first pinch commits us to SCALE, and the frame is
+        // captured from the pose in force when the *second* hand arrives.
+        this._setMode("frame");
+        return {
+          mode: "frame",
+          active: false,
+          intent: "hold",
+          pointer: hands[0]?.indexTip
+        };
+      }
       if (this.mode === "frame") {
         this._release(objectState);
         this.scaleFrame = null;

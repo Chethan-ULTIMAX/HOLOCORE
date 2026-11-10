@@ -440,6 +440,68 @@ section("5b · Render diagnostics panel");
     /\.diag\[data-open="true"\] \.diag-grid/.test(css));
 }
 
+section("5c · Camera mode must not break hand tracking");
+
+{
+  // The tracked <video> lives inside .camera-stage. Any rule that gives that
+  // container display:none also stops the browser decoding frames, which
+  // freezes currentTime and silently disables MediaPipe. That shipped once and
+  // presented as "camera live, tracking —, 0 FPS".
+  const stageRules = [];
+  const clean = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const re = /([^{}]+)\{([^}]*)\}/g;
+  let m;
+  while ((m = re.exec(clean))) {
+    const selectors = m[1].split(",").map(x => x.trim());
+    for (const selector of selectors) {
+      if (!/\.camera-stage/.test(selector)) continue;
+      stageRules.push({ selector, decls: declarations(m[2]) });
+    }
+  }
+
+  // Only the <video> matters. Hiding the overlay canvas is harmless; hiding the
+  // video stops decoding and kills tracking.
+  const killing = stageRules.filter(rule =>
+    rule.decls.display === "none" && !/canvas/.test(rule.selector)
+  );
+  check("no rule hides the tracked video with display:none",
+    killing.length === 0,
+    killing.map(r => r.selector).join(", "));
+
+  // Collapsing must still happen, or the card stays full size.
+  const minimised = stageRules.find(r => /\.is-minimised \.camera-stage/.test(r.selector));
+  check("the preview card still collapses in camera mode",
+    Boolean(minimised) && minimised.decls.height === "0",
+    minimised?.decls.height);
+
+  const hidden = stageRules.find(r => /data-state="hidden"[^>]*\.camera-stage/.test(r.selector));
+  check("a hidden preview card still collapses", Boolean(hidden) && hidden.decls.height === "0");
+
+  // The tracked element must be the one inside the stage that is collapsed.
+  check("the tracked video lives in the collapsed stage",
+    Boolean(document.querySelector("#camera-stage #camera-video")));
+}
+
+section("5d · Defaults for a first visit");
+
+{
+  const { DEFAULT_SETTINGS } = await import(join(root, "store.js"));
+  check("the camera does not take over the workspace by default",
+    DEFAULT_SETTINGS.camera.workspaceView === false,
+    String(DEFAULT_SETTINGS.camera.workspaceView));
+  check("camera mode shows the feed at full brightness",
+    DEFAULT_SETTINGS.camera.scrim === 0, String(DEFAULT_SETTINGS.camera.scrim));
+  check("landmarks are on by default", DEFAULT_SETTINGS.camera.showLandmarks === true);
+  check("the skeleton is on by default", DEFAULT_SETTINGS.camera.showSkeleton === true);
+  check("bloom is off by default (it whited out the models)",
+    DEFAULT_SETTINGS.view.bloom === false);
+
+  // The CSS fallback must agree with the store default, or the wash returns
+  // whenever the variable is unset.
+  check("the scrim fallback matches the default",
+    /vari?\(--scrim-strength,\s*0\)|--scrim-strength,\s*0\)/.test(css));
+}
+
 section("6 · Interaction mode bar");
 
 const modeButtons = [...document.querySelectorAll("#mode-buttons .mode-btn")];

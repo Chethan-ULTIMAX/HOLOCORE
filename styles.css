@@ -540,7 +540,7 @@ kbd, .kbd {
     radial-gradient(ellipse at 50% 42%, rgba(3, 8, 14, 0) 28%, rgba(3, 8, 14, 0.55) 92%),
     linear-gradient(180deg, rgba(3, 8, 14, 0.35), rgba(3, 8, 14, 0.06) 38%, rgba(3, 8, 14, 0.45));
 }
-.workspace-scrim.is-live { opacity: var(--scrim-strength, 0.4); }
+.workspace-scrim.is-live { opacity: var(--scrim-strength, 0); }
 
 .workspace-overlay {
   position: absolute;
@@ -924,13 +924,28 @@ kbd, .kbd {
 .camera-card.is-minimised {
   width: 210px;
 }
-.camera-card.is-minimised .camera-stage { display: none; }
+/* Visually collapse the preview WITHOUT hiding the <video> inside it.
+   #camera-video is the element MediaPipe samples; `display: none` halts frame
+   decoding (currentTime freezes), which silently kills all hand tracking the
+   moment the workspace feed goes live. Clip it instead. */
+.camera-card.is-minimised .camera-stage {
+  height: 0;
+  min-height: 0;
+  overflow: hidden;
+  visibility: hidden;
+}
 .camera-card.is-minimised .camera-foot { display: none; }
 
 .camera-card[data-state="hidden"] {
   width: 190px;
 }
-.camera-card[data-state="hidden"] .camera-stage { display: none; }
+/* Same reasoning as .is-minimised above: never display:none the tracked video. */
+.camera-card[data-state="hidden"] .camera-stage {
+  height: 0;
+  min-height: 0;
+  overflow: hidden;
+  visibility: hidden;
+}
 .camera-card[data-state="hidden"] .camera-foot { display: none; }
 .camera-card[data-state="off"] .camera-foot { display: none; }
 

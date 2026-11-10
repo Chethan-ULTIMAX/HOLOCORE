@@ -94,7 +94,9 @@ export function allowsIntent(modeId, intent) {
   const mode = getMode(modeId);
   if (!intent || intent === "none") return true;
   // Housekeeping intents are always permitted; they do not move the model.
-  if (["release", "tracking-lost", "hover", "blocked"].includes(intent)) return true;
+  // "hold" is the SCALE mode waiting for a second pinched hand; it carries no
+  // transform, so it must pass the gate in any mode that can emit it.
+  if (["release", "tracking-lost", "hover", "blocked", "hold"].includes(intent)) return true;
   return mode.allows.includes(intent);
 }
 
