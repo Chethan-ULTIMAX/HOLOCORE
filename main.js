@@ -1064,6 +1064,9 @@ function syncWorkspaceVideo() {
   if (dom.workspaceScrim) {
     dom.workspaceScrim.classList.toggle("is-live", live);
   }
+  // Fade the ground grid while the camera fills the stage: a 40-unit wireframe
+  // over a live feed buries the person and the model in clutter.
+  workspace?.setGridEmphasis?.(live && state.cameraView === "workspace" ? 0.22 : 1);
   if (dom.workspaceCamNote) {
     dom.workspaceCamNote.hidden = live || state.cameraView !== "workspace";
   }

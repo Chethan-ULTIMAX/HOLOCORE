@@ -234,11 +234,14 @@ export class Workspace {
         })
       );
       ring.rotation.x = -Math.PI / 2;
+      ring.userData.baseOpacity = 0.5;
       rings.add(ring);
     }
     rings.position.y = -3.595;
     this.scene.add(rings);
     this.rings = rings;
+    // Remember the authored strength so setGridEmphasis can fade and restore.
+    if (grid.material) grid.userData.baseOpacity = 0.75;
   }
 
   _initPost() {
@@ -817,6 +820,31 @@ export class Workspace {
     if (settings.grid !== undefined) {
       this.grid.visible = settings.grid;
       this.rings.visible = settings.grid;
+    }
+  }
+
+  /**
+   * How strongly the ground grid draws.
+   *
+   * With the camera filling the stage, a 40-unit wireframe laid over the live
+   * feed reads as clutter and muddies the person on camera. The grid is kept
+   * for spatial reference but faded well back so the model and the hands stay
+   * the subject; over a plain background it draws at full strength.
+   */
+  setGridEmphasis(emphasis = 1) {
+    const opacity = Math.max(0, Math.min(1, emphasis));
+    const apply = (object, base) => {
+      if (!object?.material) return;
+      object.material.transparent = true;
+      object.material.opacity = base * opacity;
+      object.material.depthWrite = opacity > 0.5;
+      object.material.needsUpdate = true;
+    };
+    apply(this.grid, 0.75);
+    if (this.rings) {
+      this.rings.traverse(child => {
+        if (child.material) apply(child, child.userData.baseOpacity ?? 0.5);
+      });
     }
   }
 
