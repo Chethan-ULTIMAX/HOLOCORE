@@ -1009,6 +1009,31 @@ for (const primitive of ["cube", "sphere", "cylinder", "cone", "torus", "torusKn
 }
 cp.clear();
 
+section("5l · Voice and audio preferences round-trip");
+
+const voiceToggle = doc.getElementById("set-voice-enabled");
+const soundToggle = doc.getElementById("set-sound-effects");
+check("a voice-commands toggle exists", Boolean(voiceToggle));
+check("an audio-cues toggle exists", Boolean(soundToggle));
+check("both default to on",
+  voiceToggle?.checked === true && soundToggle?.checked === true);
+
+soundToggle.checked = false;
+soundToggle.dispatchEvent(new window.Event("change", { bubbles: true }));
+check("turning cues off persists", api.getSettings().voice.soundEffects === false);
+check("turning cues off silences the synth", api.getChimes().enabled === false);
+
+soundToggle.checked = true;
+soundToggle.dispatchEvent(new window.Event("change", { bubbles: true }));
+check("turning cues back on persists", api.getSettings().voice.soundEffects === true);
+check("turning cues back on re-enables the synth", api.getChimes().enabled === true);
+
+voiceToggle.checked = false;
+voiceToggle.dispatchEvent(new window.Event("change", { bubbles: true }));
+check("turning voice off persists", api.getSettings().voice.enabled === false);
+voiceToggle.checked = true;
+voiceToggle.dispatchEvent(new window.Event("change", { bubbles: true }));
+
 section("6 · Modes still gate gestures");
 
 const modes = ["select", "move", "rotate", "scale", "explode"];

@@ -356,6 +356,10 @@ function applyNonSceneSettings() {
   dom.viewport?.style.setProperty("--scrim-strength", String(settings.camera.scrim ?? 0));
   const workspaceViewInput = document.getElementById("set-workspace-view");
   if (workspaceViewInput) workspaceViewInput.checked = settings.camera.workspaceView !== false;
+  const voiceEnabledInputSync = document.getElementById("set-voice-enabled");
+  if (voiceEnabledInputSync) voiceEnabledInputSync.checked = settings.voice?.enabled !== false;
+  const soundEffectsInputSync = document.getElementById("set-sound-effects");
+  if (soundEffectsInputSync) soundEffectsInputSync.checked = settings.voice?.soundEffects !== false;
   syncWorkspaceVideo();
   setRightTab(settings.ui.rightTab || "inspector");
   setPanelState({ left: settings.ui.leftOpen, right: settings.ui.rightOpen }, { persist: false });
@@ -2718,6 +2722,28 @@ function setupSettingsUI() {
     });
   }
 
+  // Voice and audio preferences, ported from main's settings panel.
+  const voiceEnabledInput = document.getElementById("set-voice-enabled");
+  if (voiceEnabledInput) {
+    voiceEnabledInput.checked = settings.voice?.enabled !== false;
+    voiceEnabledInput.addEventListener("change", () => {
+      store.update("voice", { enabled: voiceEnabledInput.checked });
+      if (!voiceEnabledInput.checked && voice?.isListening) voice.stop();
+      toast(`Voice commands ${voiceEnabledInput.checked ? "enabled" : "disabled"}`, "", 1800);
+    });
+  }
+
+  const soundEffectsInput = document.getElementById("set-sound-effects");
+  if (soundEffectsInput) {
+    soundEffectsInput.checked = settings.voice?.soundEffects !== false;
+    soundEffectsInput.addEventListener("change", () => {
+      store.update("voice", { soundEffects: soundEffectsInput.checked });
+      chimes().enabled = soundEffectsInput.checked;
+      if (soundEffectsInput.checked) chimes().play("command");
+      toast(`Audio cues ${soundEffectsInput.checked ? "enabled" : "muted"}`, "", 1800);
+    });
+  }
+
   document.getElementById("refresh-devices")?.addEventListener("click", refreshCameraList);
   document.getElementById("calibrate-btn")?.addEventListener("click", calibrate);
   document.getElementById("reset-settings-btn")?.addEventListener("click", () => {
@@ -3256,6 +3282,14 @@ window.HOLOCORE = {
   getWorkspace() {
     return workspace;
   },
+  /** Persisted settings, including the ported voice preferences. */
+  getSettings() {
+    return store.get();
+  },
+  /** The shared chime synth, so tests and the console can inspect it. */
+  getChimes() {
+    return chimes();
+  },
   /** Exposed for the full-stack harness; also handy in the console. */
   handleVoiceIntentForTest: (intent, phrase) => handleVoiceIntent(intent, phrase),
   resetEnvironment,
@@ -3277,6 +3311,7 @@ window.HOLOCORE = {
     pointerTargets: () => ({ target: state.pointerTarget, kind: state.pointerKind }),
     selectProp,
     updateGestureLabels,
+
     // Re-render the inspector so material controls match the current selection.
     refreshInspector: () => {
       const prop = playground?.get?.();
