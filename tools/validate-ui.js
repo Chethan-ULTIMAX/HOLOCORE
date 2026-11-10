@@ -304,10 +304,141 @@ check("the camera image covers and crops", /object-fit:\s*cover/.test(videoRule)
 check("the camera layer cannot swallow clicks", /pointer-events:\s*none/.test(videoRule));
 check("the camera layer is at z-index 0", /z-index:\s*0/.test(videoRule));
 
-const canvasRule = css.slice(css.indexOf("#viewport > canvas"));
-check("the 3D canvas paints above the camera", /z-index:\s*2/.test(canvasRule.slice(0, 200)));
-const overlayRule = css.slice(css.indexOf(".workspace-overlay {"), css.indexOf(".workspace-overlay {") + 260);
-check("the landmark overlay paints above the canvas", /z-index:\s*3/.test(overlayRule));
+// --- a real cascade check, not a substring grep -------------------------
+// A selector like "#viewport > canvas" (specificity 1,0,1) silently beats
+// ".workspace-overlay" (0,1,0). That exact collision once forced the landmark
+// overlay into normal flow, where it became a full-width block sitting ABOVE
+// the renderer canvas and pushed the 3D layer off-screen. So resolve the
+// cascade for each canvas the way a browser would, rather than trusting that
+// a rule exists somewhere in the file.
+function specificity(selector) {
+  const ids = (selector.match(/#[\w-]+/g) || []).length;
+  const classes = (selector.match(/\.[\w-]+/g) || []).length;
+  const types = (selector.match(/(^|[\s>+~])[a-z][\w-]*/gi) || []).length;
+  return ids * 10000 + classes * 100 + types;
+}
+
+function declarations(body) {
+  const out = {};
+  for (const decl of body.split(";")) {
+    const i = decl.indexOf(":");
+    if (i < 0) continue;
+    out[decl.slice(0, i).trim()] = decl.slice(i + 1).trim();
+  }
+  return out;
+}
+
+// Every rule whose selector could match a canvas inside #viewport.
+function canvasRules() {
+  const rules = [];
+  // Comments can contain braces and selector-looking text; strip them first or
+  // the parser happily turns prose into rules.
+  const clean = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const re = /([^{}]+)\{([^}]*)\}/g;
+  let m;
+  while ((m = re.exec(clean))) {
+    const selectors = m[1].split(",").map(x => x.trim());
+    for (const selector of selectors) {
+      // Collect anything that could plausibly style one of the two canvases:
+      // by element type, by the overlay's class, or by the renderer's class.
+      if (!/canvas|workspace-overlay|workspace-canvas/.test(selector)) continue;
+      rules.push({ selector, spec: specificity(selector), decls: declarations(m[2]) });
+    }
+  }
+  return rules;
+}
+
+// Which of those rules actually match the given element identity?
+function matches(selector, el) {
+  if (/#workspace-overlay/.test(selector)) return el.id === "workspace-overlay";
+  if (/\.workspace-overlay/.test(selector)) return el.classes.includes("workspace-overlay");
+  if (/\.workspace-canvas/.test(selector)) return el.classes.includes("workspace-canvas");
+  // A bare "canvas" type selector matches any canvas child.
+  return /canvas\s*$/.test(selector) && !/#|\./.test(selector.replace(/canvas\s*$/, ""));
+}
+
+function resolve(el, property) {
+  const applicable = canvasRules()
+    .filter(rule => matches(rule.selector, el) && rule.decls[property] !== undefined)
+    .sort((a, b) => a.spec - b.spec);
+  const winner = applicable[applicable.length - 1];
+  return winner ? { value: winner.decls[property], selector: winner.selector } : null;
+}
+
+const rendererCanvas = { id: null, classes: ["workspace-canvas"] };
+const overlayCanvas = { id: "workspace-overlay", classes: ["workspace-overlay"] };
+
+const rendererZ = resolve(rendererCanvas, "z-index");
+const overlayZ = resolve(overlayCanvas, "z-index");
+const overlayPos = resolve(overlayCanvas, "position");
+const rendererPos = resolve(rendererCanvas, "position");
+
+check("the 3D canvas is absolutely positioned",
+  rendererPos?.value === "absolute", rendererPos?.value ?? "unset");
+check("the 3D canvas paints above the camera",
+  rendererZ?.value === "2", `${rendererZ?.value} via ${rendererZ?.selector}`);
+check("the landmark overlay stays out of normal flow",
+  overlayPos?.value === "absolute", `${overlayPos?.value} via ${overlayPos?.selector}`);
+check("the landmark overlay paints above the 3D canvas",
+  overlayZ?.value === "3", `${overlayZ?.value} via ${overlayZ?.selector}`);
+
+// The regression itself: no canvas rule may win for BOTH canvases. If a single
+// selector claims both, the renderer rule is almost certainly catching the
+// overlay and overriding its positioning.
+check("no canvas rule steals the overlay's positioning",
+  Boolean(overlayPos) && Boolean(rendererPos) &&
+  overlayPos.value === "absolute" && rendererPos.value === "absolute",
+  `overlay ${overlayPos?.value}, renderer ${rendererPos?.value}`);
+
+// Both canvases must fill the box, or the renderer letterboxes in one axis.
+for (const [label, el] of [["3D canvas", rendererCanvas], ["overlay", overlayCanvas]]) {
+  const w = resolve(el, "width");
+  const h = resolve(el, "height");
+  check(`the ${label} fills the viewport box`,
+    w?.value === "100%" && h?.value === "100%", `${w?.value} x ${h?.value}`);
+}
+
+// The renderer must actually carry the class the stylesheet targets, otherwise
+// the stylesheet assertions above describe a canvas that does not exist.
+const mm = readFileSync(join(root, "modelManager.js"), "utf8");
+check("the renderer tags its canvas with .workspace-canvas",
+  /domElement\.classList\.add\(\s*"workspace-canvas"\s*\)/.test(mm));
+
+section("5b · Render diagnostics panel");
+
+{
+  const diag = document.getElementById("diagnostics");
+  const grid = document.getElementById("diag-grid");
+  check("a diagnostics panel exists", Boolean(diag));
+  check("the panel starts collapsed", diag?.dataset.open === "false", diag?.dataset.open);
+  check("the panel has a toggle", document.getElementById("diag-toggle")?.tagName === "BUTTON");
+
+  // Every field the user asked to see must have a slot.
+  const fields = [
+    "diag-model", "diag-meshes", "diag-visible", "diag-tris", "diag-bounds",
+    "diag-camdist", "diag-attached", "diag-infrustum", "diag-loop", "diag-errors"
+  ];
+  const missing = fields.filter(id => !document.getElementById(id));
+  check("the panel reports model, meshes, visible, triangles, bounds", missing.length === 0,
+    missing.length ? `missing: ${missing.join(", ")}` : `${fields.length} fields`);
+
+  // The readouts must start empty. A hardcoded value here would be exactly the
+  // kind of fake-success indicator this panel exists to replace.
+  const prefilled = fields.filter(id => {
+    const el = document.getElementById(id);
+    return el && el.textContent.trim() && el.textContent.trim() !== "—";
+  });
+  check("no diagnostic value is hardcoded in the markup", prefilled.length === 0,
+    prefilled.join(", "));
+
+  check("the diagnostics grid is inside the panel",
+    grid?.parentElement === diag);
+
+  const diagCss = css.slice(css.indexOf(".diag {"), css.indexOf(".diag {") + 900);
+  check("the panel is a fixed overlay above the scene", /position:\s*absolute/.test(diagCss));
+  check("the panel only expands when opened",
+    /\.diag\[data-open="true"\] \.diag-grid/.test(css));
+}
 
 section("6 · Interaction mode bar");
 

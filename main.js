@@ -76,6 +76,19 @@ const dom = {
   hudFps: $("#hud-fps"),
   hudTris: $("#hud-tris"),
   hudHands: $("#hud-hands"),
+  diagnostics: $("#diagnostics"),
+  diagToggle: $("#diag-toggle"),
+  diagGrid: $("#diag-grid"),
+  diagModel: $("#diag-model"),
+  diagMeshes: $("#diag-meshes"),
+  diagVisible: $("#diag-visible"),
+  diagTris: $("#diag-tris"),
+  diagBounds: $("#diag-bounds"),
+  diagCamdist: $("#diag-camdist"),
+  diagAttached: $("#diag-attached"),
+  diagInFrustum: $("#diag-infrustum"),
+  diagLoop: $("#diag-loop"),
+  diagErrors: $("#diag-errors"),
 
   reticle: $("#reticle"),
   reticleLabel: $("#reticle-label"),
@@ -168,6 +181,7 @@ const state = {
   cameraView: "workspace",
   /** True while the workspace video element is actually showing frames. */
   cameraLive: false,
+  diagnosticsOpen: false,
   /** Per-part transform captured when a MOVE/ROTATE/SCALE gesture begins. */
   gestureTarget: null,
   gestureStart: null,
@@ -372,6 +386,8 @@ function boot() {
     finishBoot();
     return;
   }
+
+  installGlErrorWatch(workspace);
 
   setBoot(55, "Loading assembly…");
 
@@ -1097,6 +1113,22 @@ function initInteraction() {
   if (dom.workspaceCamNote) {
     dom.workspaceCamNote.hidden = state.cameraLive || state.cameraView !== "workspace";
   }
+  setupDiagnostics();
+}
+
+/**
+ * The diagnostic panel is collapsible and starts closed. It is wired here (and
+ * not in the WebGL success path) so it also works when 3D is unavailable and
+ * reports the failure honestly instead of showing a blank panel.
+ */
+function setupDiagnostics() {
+  if (!dom.diagToggle || dom.diagToggle.dataset.wired === "1") return;
+  dom.diagToggle.dataset.wired = "1";
+  dom.diagToggle.addEventListener("click", () => {
+    state.diagnosticsOpen = !state.diagnosticsOpen;
+    updateDiagnostics();
+  });
+  updateDiagnostics();
 }
 
 function startLoop() {
@@ -1461,11 +1493,109 @@ function updateHud(dt) {
       dom.readoutScale.textContent = `${t.scale.toFixed(2)}×`;
     }
 
+    updateDiagnostics();
+
     const tracking = tracker?.getState();
     dom.statusTracking.textContent = tracking?.fps
       ? `${tracking.fps} FPS · ${Number(tracking.inferenceMs || 0).toFixed(0)}MS`
       : "—";
   }
+}
+
+/* ------------------------------------------------------------------------- */
+/* RENDER DIAGNOSTICS                                                        */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Count real WebGL errors raised during the session. This installs a listener
+ * on the renderer's own canvas context, so it reports what the driver actually
+ * logged rather than a guess.
+ */
+let glErrorCount = 0;
+function installGlErrorWatch(ws) {
+  const canvas = ws?.renderer?.domElement;
+  if (!canvas) return;
+  canvas.addEventListener("webglcontextcreationerror", () => { glErrorCount++; });
+  canvas.addEventListener("webglcontextlost", () => { glErrorCount++; });
+}
+
+function setDiagValue(node, value, ok) {
+  if (!node) return;
+  node.textContent = value;
+  node.classList.toggle("is-bad", ok === false);
+}
+
+/**
+ * Push live values into the diagnostic panel. Called from the HUD tick, so the
+ * numbers are sampled from the running app — there is no hardcoded success.
+ */
+function updateDiagnostics() {
+  const panel = dom.diagnostics;
+  if (!panel) return;
+
+  // No renderer (WebGL unavailable, or the Workspace constructor threw): report
+  // that explicitly. An empty panel would be indistinguishable from a panel
+  // whose values are simply stale, and this must never look like success.
+  const d = workspace?.diagnostics?.();
+  const problems = [];
+
+  if (!d) {
+    setDiagValue(dom.diagModel, "renderer unavailable", false);
+    setDiagValue(dom.diagMeshes, "—", false);
+    setDiagValue(dom.diagVisible, "—", false);
+    setDiagValue(dom.diagTris, "—", false);
+    setDiagValue(dom.diagBounds, "—", false);
+    setDiagValue(dom.diagCamdist, "—", false);
+    setDiagValue(dom.diagAttached, "no", false);
+    setDiagValue(dom.diagInFrustum, "no", false);
+    setDiagValue(dom.diagLoop, "stopped", false);
+    setDiagValue(dom.diagErrors, String(glErrorCount), glErrorCount === 0);
+    panel.dataset.ok = "false";
+    panel.dataset.open = state.diagnosticsOpen ? "true" : "false";
+    dom.diagToggle?.setAttribute("aria-expanded", state.diagnosticsOpen ? "true" : "false");
+    return;
+  }
+
+  const modelOk = d.loaded;
+  setDiagValue(dom.diagModel, d.loaded ? `${d.model} · loaded` : "not loaded", modelOk);
+  if (!modelOk) problems.push("model");
+
+  setDiagValue(dom.diagMeshes, String(d.meshes), d.meshes > 0);
+  setDiagValue(dom.diagVisible, String(d.visibleMeshes), d.visibleMeshes > 0);
+  if (d.visibleMeshes === 0) problems.push("visible");
+
+  setDiagValue(dom.diagTris, formatCompact(d.triangles), d.triangles > 0);
+  if (d.triangles === 0) problems.push("triangles");
+
+  setDiagValue(
+    dom.diagBounds,
+    d.bounds
+      ? `${d.bounds.x.toFixed(1)} × ${d.bounds.y.toFixed(1)} × ${d.bounds.z.toFixed(1)}`
+      : "—",
+    Boolean(d.bounds)
+  );
+
+  setDiagValue(
+    dom.diagCamdist,
+    Number.isFinite(d.cameraDistance) ? d.cameraDistance.toFixed(1) : "—",
+    Number.isFinite(d.cameraDistance)
+  );
+
+  setDiagValue(dom.diagAttached, d.attached ? "yes" : "no", d.attached);
+  if (!d.attached) problems.push("attached");
+
+  setDiagValue(dom.diagInFrustum, d.inFrustum ? "yes" : "no", d.inFrustum);
+  if (!d.inFrustum) problems.push("frustum");
+
+  setDiagValue(dom.diagLoop, d.loopRunning ? "running" : "stopped", d.loopRunning);
+  if (!d.loopRunning) problems.push("loop");
+
+  setDiagValue(dom.diagErrors, String(glErrorCount), glErrorCount === 0);
+  if (glErrorCount > 0) problems.push("gl");
+
+  panel.dataset.ok = problems.length === 0 ? "true" : "false";
+  panel.dataset.open = state.diagnosticsOpen ? "true" : "false";
+  dom.diagToggle?.setAttribute("aria-expanded", state.diagnosticsOpen ? "true" : "false");
 }
 
 function formatCompact(value) {

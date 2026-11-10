@@ -110,6 +110,10 @@ export class Workspace {
     this.renderer.shadowMap.enabled = this.settings.shadows;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.domElement.setAttribute("aria-label", "HOLOCORE 3D workspace");
+    // Explicit class rather than relying on a "#viewport > canvas" descendant
+    // selector: the landmark overlay is *also* a <canvas> in this container and
+    // must keep its own absolute/z-index:3 rules.
+    this.renderer.domElement.classList.add("workspace-canvas");
     this.container.appendChild(this.renderer.domElement);
   }
 
@@ -987,6 +991,86 @@ export class Workspace {
 
     if (this.composer) this.composer.render();
     else this.renderer.render(this.scene, this.camera);
+  }
+
+  /**
+   * A real, computed snapshot of the render pipeline — the numbers a support
+   * request needs. Nothing here is cached success state: every field is read
+   * from the live scene graph, camera and renderer at call time.
+   */
+  diagnostics() {
+    const out = {
+      model: this.modelId || null,
+      loaded: Boolean(this.assembly),
+      meshes: 0,
+      visibleMeshes: 0,
+      triangles: 0,
+      bounds: null,
+      attached: false,
+      cameraDistance: null,
+      renderCallCount: 0,
+      trianglesLastFrame: 0,
+      inFrustum: false,
+      loopRunning: false
+    };
+
+    if (!this.assembly) return out;
+
+    const root = this.assembly.group;
+    root.updateMatrixWorld(true);
+
+    root.traverse(object => {
+      if (!object.isMesh) return;
+      out.meshes++;
+      // A mesh is only visible if nothing in its parent chain is hidden.
+      let visible = true;
+      for (let node = object; node; node = node.parent) {
+        if (!node.visible) { visible = false; break; }
+      }
+      if (!visible) return;
+      out.visibleMeshes++;
+      const geometry = object.geometry;
+      const count = geometry?.index
+        ? geometry.index.count
+        : geometry?.attributes?.position?.count || 0;
+      out.triangles += Math.floor(count / 3);
+    });
+
+    // Is the assembly actually reachable from the scene the renderer draws?
+    let node = root;
+    while (node.parent) node = node.parent;
+    out.attached = node === this.scene && this.scene.children.includes(this.manipulator);
+
+    const box = new THREE.Box3().setFromObject(root);
+    if (!box.isEmpty()) {
+      const size = box.getSize(new THREE.Vector3());
+      const centre = box.getCenter(new THREE.Vector3());
+      out.bounds = { x: size.x, y: size.y, z: size.z, centre };
+    }
+
+    this.camera.updateMatrixWorld(true);
+    this.camera.updateProjectionMatrix();
+    out.cameraDistance = this.camera.position.distanceTo(this.controls.target);
+
+    // Frustum test against the assembly's own bounding sphere. This answers
+    // "is the thing I am drawing on screen" without needing a GPU readback.
+    if (out.bounds) {
+      const sphere = box.getBoundingSphere(new THREE.Sphere());
+      this._frustum = this._frustum || new THREE.Frustum();
+      this._projScreen = this._projScreen || new THREE.Matrix4();
+      this._projScreen.multiplyMatrices(
+        this.camera.projectionMatrix,
+        this.camera.matrixWorldInverse
+      );
+      this._frustum.setFromProjectionMatrix(this._projScreen);
+      out.inFrustum = this._frustum.intersectsSphere(sphere);
+    }
+
+    const info = this.renderer.info || { render: {} };
+    out.renderCallCount = info.render?.calls || 0;
+    out.trianglesLastFrame = info.render?.triangles || 0;
+    out.loopRunning = Boolean(this._rafId);
+    return out;
   }
 
   getStats() {
