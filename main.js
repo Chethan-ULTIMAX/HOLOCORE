@@ -3311,12 +3311,14 @@ window.HOLOCORE = {
     pointerTargets: () => ({ target: state.pointerTarget, kind: state.pointerKind }),
     selectProp,
     updateGestureLabels,
+    inspector,
 
     // Re-render the inspector so material controls match the current selection.
+    // The playground reports its own selection, so re-selecting the same part
+    // id is enough; the inspector prefers a selected prop over the part.
     refreshInspector: () => {
-      const prop = playground?.get?.();
       inspector?.setModel?.(state.modelId);
-      inspector?.select?.(prop ? `prop:${prop.id}` : state.partId);
+      inspector?.select?.(state.partId);
     },
     // Drives the real per-frame hand pipeline with supplied landmarks, so the
     // tracking loop can be exercised without a camera.

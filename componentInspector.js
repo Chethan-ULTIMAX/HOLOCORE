@@ -15,6 +15,11 @@ import {
 
 import { COLOR_PALETTE } from "./voiceControl.js";
 
+const deg = radians => (radians * 180) / Math.PI;
+
+const formatVec = v =>
+  `${(v?.x ?? 0).toFixed(2)}, ${(v?.y ?? 0).toFixed(2)}, ${(v?.z ?? 0).toFixed(2)}`;
+
 export class ComponentInspector {
   constructor({ root, onFocus, onIsolate, onShowRelated, onAsk, onClear, getWorkspace, getPlayground }) {
     this.root = root;
@@ -63,12 +68,34 @@ export class ComponentInspector {
    * updates the readouts. Called when a hand gesture moves the object.
    */
   updateProperties() {
-    const material = this._currentMaterial?.();
-    if (!material) return;
-    const readouts = this.root?.querySelectorAll?.(".prop-val") || [];
-    if (readouts.length >= 2) {
-      readouts[0].textContent = Number(material.roughness).toFixed(2);
-      readouts[1].textContent = Number(material.metalness).toFixed(2);
+    if (!this.root) return;
+
+    // Transform rows come first in the overview tab, then the material
+    // sliders, so the readouts are addressed by section rather than by index.
+    const tf = this._currentTransform();
+    const sections = this.root.querySelectorAll(".inspector-section");
+    for (const section of sections) {
+      const title = section.querySelector(".section-title")?.textContent;
+      const values = section.querySelectorAll(".prop-group .prop-val");
+      if (!values.length) continue;
+
+      if (title === "Transform" && tf) {
+        if (values[0]) values[0].textContent = formatVec(tf.position);
+        if (values[1]) {
+          values[1].textContent =
+            `${Math.round(deg(tf.rotationZ))}°, ${Math.round(deg(tf.rotationX))}°, ${Math.round(deg(tf.rotationY))}°`;
+        }
+        if (values[2]) values[2].textContent = `${tf.scale.toFixed(2)}×`;
+      }
+
+      if (title === "Material") {
+        // The slider readouts live in .prop-slider-item rows.
+        const sliderValues = section.querySelectorAll(".prop-slider-item .prop-val");
+        const material = this._currentMaterial();
+        if (!material) continue;
+        if (sliderValues[0]) sliderValues[0].textContent = Number(material.roughness).toFixed(2);
+        if (sliderValues[1]) sliderValues[1].textContent = Number(material.metalness).toFixed(2);
+      }
     }
   }
 
@@ -131,6 +158,7 @@ export class ComponentInspector {
     );
     body.appendChild(geometry);
 
+    this._renderTransform(body);
     this._renderMaterials(body);
   }
 
@@ -166,6 +194,7 @@ export class ComponentInspector {
 
     if (this.tab === "overview") {
       this._renderOverview(body, data);
+      this._renderTransform(body);
       this._renderMaterials(body);
     }
     else if (this.tab === "system") this._renderSystem(body, data);
@@ -286,6 +315,60 @@ export class ComponentInspector {
       for (const fact of data.facts) list.appendChild(this._el("li", "", fact));
       facts.appendChild(list);
     }
+  }
+
+  /**
+   * Live transform readout for the selected part.
+   *
+   * Ported from main, which rendered position/rotation/scale above the
+   * material controls. Read-only on purpose: gestures and the keyboard own
+   * transforms, and duplicating that as text fields invites the two to
+   * disagree. The values are refreshed by updateProperties().
+   */
+  _renderTransform(body) {
+    const tf = this._currentTransform();
+    if (!tf) return;
+
+    const section = this._section(body, "Transform");
+    const grid = this._el("div", "prop-group");
+    const row = (label, value) => {
+      const line = this._el("div", "prop-row");
+      line.appendChild(this._el("span", "prop-label", label));
+      line.appendChild(this._el("span", "prop-val", value));
+      grid.appendChild(line);
+    };
+
+    row("Position", formatVec(tf.position));
+    row("Rotation", `${Math.round(deg(tf.rotationZ))}°, ${Math.round(deg(tf.rotationX))}°, ${Math.round(deg(tf.rotationY))}°`);
+    row("Scale", `${tf.scale.toFixed(2)}×`);
+    section.appendChild(grid);
+  }
+
+  /** Transform of whatever is selected, in a shape both sources share. */
+  _currentTransform() {
+    const playground = this.getPlayground?.();
+    const prop = playground?.selectedId ? playground.byId?.get(playground.selectedId) : null;
+    if (prop) {
+      return {
+        position: prop.group.position,
+        rotationX: prop.group.rotation.x,
+        rotationY: prop.group.rotation.y,
+        rotationZ: prop.group.rotation.z,
+        scale: prop.group.scale.x
+      };
+    }
+
+    const ws = this.getWorkspace?.();
+    if (!ws || !this.partId) return null;
+    const tf = ws.getPartTransform?.(this.partId);
+    if (!tf) return null;
+    return {
+      position: tf.offset,
+      rotationX: tf.rotationX || 0,
+      rotationY: tf.rotationY || 0,
+      rotationZ: tf.rotationZ || 0,
+      scale: tf.scale ?? 1
+    };
   }
 
   /**

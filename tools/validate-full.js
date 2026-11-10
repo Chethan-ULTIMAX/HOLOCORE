@@ -1034,6 +1034,44 @@ check("turning voice off persists", api.getSettings().voice.enabled === false);
 voiceToggle.checked = true;
 voiceToggle.dispatchEvent(new window.Event("change", { bubbles: true }));
 
+section("5m · Inspector transform readout follows the object");
+
+const tp = api.getPlayground();
+tp.clear();
+const tpCube = tp.addPrimitive("cube");
+tp.select(tpCube.id);
+api._internals.refreshInspector();
+
+const tfSections = [...doc.querySelectorAll(".inspector-section")]
+  .filter(sec => sec.querySelector(".section-title")?.textContent === "Transform");
+check("a transform section is rendered", tfSections.length === 1);
+const tfVals = tfSections[0]?.querySelectorAll(".prop-group .prop-val") || [];
+check("it shows position, rotation and scale", tfVals.length === 3, `${tfVals.length}`);
+const tfLabels = [...(tfSections[0]?.querySelectorAll(".prop-label") || [])].map(e => e.textContent);
+check("the rows are labelled", ["Position", "Rotation", "Scale"].every(l => tfLabels.includes(l)),
+  tfLabels.join("/"));
+
+// Move the object the way a gesture would, then refresh: the readout must follow.
+tp.setTransform(tpCube.id, { position: { x: 1.5, y: 0.25, z: -0.75 } });
+api._internals.refreshInspector();
+const movedReadout = [...doc.querySelectorAll(".inspector-section")]
+  .find(sec => sec.querySelector(".section-title")?.textContent === "Transform")
+  ?.querySelector(".prop-group .prop-val")?.textContent;
+check("the position readout follows the object",
+  movedReadout === "1.50, 0.25, -0.75", movedReadout);
+
+// updateProperties() must update in place, without rebuilding the DOM.
+const beforeNode = doc.querySelector(".inspector-section .prop-group .prop-val");
+tp.setTransform(tpCube.id, { position: { x: -2, y: 0, z: 0 } });
+api._internals.inspector?.updateProperties?.();
+check("updateProperties refreshes without re-rendering",
+  beforeNode === doc.querySelector(".inspector-section .prop-group .prop-val"));
+check("the in-place refresh shows the new position",
+  beforeNode?.textContent === "-2.00, 0.00, 0.00", beforeNode?.textContent);
+
+tp.clear();
+api._internals.refreshInspector();
+
 section("6 · Modes still gate gestures");
 
 const modes = ["select", "move", "rotate", "scale", "explode"];
