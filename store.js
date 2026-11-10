@@ -59,8 +59,8 @@ export const DEFAULT_SETTINGS = {
     quality: "balanced"
   },
   ui: {
-    leftOpen: true,
-    rightOpen: true,
+    leftOpen: false,
+    rightOpen: false,
     rightTab: "inspector"
   }
 };

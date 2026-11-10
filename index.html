@@ -81,6 +81,18 @@
   <!-- ===================== WORKSPACE ===================== -->
   <main class="workspace" id="workspace">
 
+    <!-- Drawer toggles: always reachable, even with both drawers closed. -->
+    <button class="drawer-toggle drawer-toggle-left" id="drawer-toggle-left"
+            aria-label="Open model library" aria-expanded="false">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"/></svg>
+      LIBRARY
+    </button>
+    <button class="drawer-toggle drawer-toggle-right" id="drawer-toggle-right"
+            aria-label="Open properties" aria-expanded="false">
+      PROPERTIES
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"/></svg>
+    </button>
+
     <!-- ---------- LEFT: MODEL LIBRARY ---------- -->
     <aside class="panel panel-left" id="panel-left" aria-label="Model library">
       <div class="panel-head">
@@ -186,6 +198,16 @@
           <div class="hud-stat"><span id="hud-fps">—</span><small>FPS</small></div>
           <div class="hud-stat"><span id="hud-tris">—</span><small>TRIS</small></div>
           <div class="hud-stat"><span id="hud-hands">0</span><small>HANDS</small></div>
+          <div class="hud-stat"><span id="hud-objects">0</span><small>OBJECTS</small></div>
+          <div class="hud-stat"><span id="hud-object-name">—</span><small>TARGET</small></div>
+        </div>
+
+        <!-- Voice status: what was heard, and whether we are listening. -->
+        <div class="voice-chip" id="voice-chip">
+          <span class="voice-dot"></span>
+          <span class="voice-label">VOICE</span>
+          <span class="voice-state" id="voice-state">OFF</span>
+          <span class="voice-phrase" id="voice-phrase"></span>
         </div>
 
         <!-- Aiming reticle projected from the index fingertip -->
@@ -222,6 +244,41 @@
             <dt>RENDER LOOP</dt><dd id="diag-loop">—</dd>
             <dt>WEBGL ERRORS</dt><dd id="diag-errors">—</dd>
           </dl>
+        </div>
+
+        <!-- Floating stage toolbar -->
+        <div class="stage-toolbar" id="stage-toolbar" role="toolbar" aria-label="Stage tools">
+          <button class="mini-btn" id="stage-add-object" title="Add a 3D primitive (or press A)"
+                  aria-label="Add object">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10"/></svg>
+          </button>
+          <button class="mini-btn" id="stage-duplicate" title="Duplicate selection"
+                  aria-label="Duplicate selection">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="2.5" width="8" height="8" rx="1.5"/><path d="M10.5 10.5v1a1.5 1.5 0 0 1-1.5 1.5H4a1.5 1.5 0 0 1-1.5-1.5V6A1.5 1.5 0 0 1 4 4.5h1"/></svg>
+          </button>
+          <button class="mini-btn" id="stage-delete" title="Delete selection"
+                  aria-label="Delete selection">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 4.5h9M6.5 4.5V3h3v1.5M5 4.5l.6 8h4.8l.6-8"/></svg>
+          </button>
+          <span class="tool-sep"></span>
+          <button class="mini-btn" id="stage-voice" title="Voice commands (or press V)"
+                  aria-label="Toggle voice commands" aria-pressed="false">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="6" y="2" width="4" height="7" rx="2"/><path d="M4 8a4 4 0 0 0 8 0M8 12v2"/></svg>
+          </button>
+          <span class="tool-sep"></span>
+          <button class="mini-btn" id="stage-reset" title="Reset the environment (or press R)"
+                  aria-label="Reset environment">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8a5 5 0 1 0 1.6-3.7"/><path d="M3 3v3h3"/></svg>
+          </button>
+        </div>
+
+        <!-- Keyboard hints, hidden while interacting -->
+        <div class="stage-keys" id="stage-keys" aria-hidden="true">
+          <span class="k"><span class="kbd">1-5</span> mode</span>
+          <span class="k"><span class="kbd">N</span> add</span>
+          <span class="k"><span class="kbd">M</span> voice</span>
+          <span class="k"><span class="kbd">L</span> library</span>
+          <span class="k"><span class="kbd">P</span> properties</span>
         </div>
 
         <!-- Interaction mode bar -->
@@ -311,6 +368,12 @@
       </div>
 
       <div class="right-pane" id="pane-inspector">
+        <!-- Scene outliner: every object in the playground, with animation
+             clip pickers for imported GLTF models. -->
+        <section class="outliner" aria-label="Scene objects">
+          <h3 class="outliner-title">SCENE</h3>
+          <div class="outliner-list" id="scene-outliner"></div>
+        </section>
         <div class="inspector-scroll" id="inspector-root"></div>
       </div>
 

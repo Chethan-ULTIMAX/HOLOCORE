@@ -76,6 +76,7 @@ export class HandTracker {
     this.deviceId = null;
 
     this.hands = [];
+    this.worldLandmarks = [];
     this.handedness = [];
     this.lastVideoTime = -1;
     this.frameCount = 0;
@@ -323,6 +324,11 @@ export class HandTracker {
 
     const landmarks = result?.landmarks || [];
     this.hands = landmarks;
+    // Metric landmarks (metres, wrist-relative) give the 3D skeleton its real
+    // shape and foreshortening. They are reported alongside the normalised
+    // image landmarks and are what lets a rotating hand read as 3D rather than
+    // as a flat billboard.
+    this.worldLandmarks = result?.worldLandmarks || [];
     this.handedness = (result?.handednesses || []).map(entry => entry?.[0]?.categoryName || "Unknown");
 
     if (landmarks.length > 0) {
@@ -348,6 +354,7 @@ export class HandTracker {
   /** Used by manual calibration: forget all tracking history. */
   resetTracking() {
     this.hands = [];
+    this.worldLandmarks = [];
     this.handedness = [];
     this.lastVideoTime = -1;
     this._fpsSamples = [];
@@ -370,6 +377,7 @@ export class HandTracker {
     }
     this.video.srcObject = null;
     this.hands = [];
+    this.worldLandmarks = [];
     this.handedness = [];
 
     this.deviceId = deviceId;
@@ -415,6 +423,7 @@ export class HandTracker {
     if (this.video) this.video.srcObject = null;
 
     this.hands = [];
+    this.worldLandmarks = [];
     this.handedness = [];
     this.lastVideoTime = -1;
     this.fps = 0;

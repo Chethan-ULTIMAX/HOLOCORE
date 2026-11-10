@@ -197,7 +197,10 @@ export class HandOverlay {
    * canvas space — used to keep the hand visually attached to the component it
    * is moving.
    */
-  draw(hands, handedness, { pinched = [], activity = [], targets = [], tethers = [] } = {}) {
+  draw(hands, handedness, {
+    pinched = [], activity = [], targets = [], tethers = [],
+    depths = [], joints3d = [], viewport = null
+  } = {}) {
     if (!this.available) return;
     this.clear();
     if (!this.width || !this.height) return;
@@ -216,23 +219,57 @@ export class HandOverlay {
       const isPinched = Boolean(pinched[index]);
       const heat = Math.max(0, Math.min(1, activity[index] ?? (isPinched ? 1 : 0)));
 
-      this._drawSkeleton(landmarks, colours, heat, index);
-      this._drawJoints(landmarks, colours, heat, isPinched, index);
+      const depth = depths[index] || null;
+      const bones = joints3d[index] || null;
+
+      // Spray of limb bone volumes in projected 3D, then the 2D connective
+      // tissue and glowing joints. Drawing bones first keeps joints crisp.
+      if (bones && viewport) this._drawBoneVolumes(bones, colours, heat, depth, viewport);
+      this._drawSkeleton(landmarks, colours, heat, index, depth);
+      this._drawJoints(landmarks, colours, heat, isPinched, index, depth);
       this._drawPinch(landmarks, colours, isPinched, heat, index);
       this._drawPointer(landmarks, colours, isPinched, heat, targets[index], tethers[index], index);
       this._drawLabel(landmarks, colours, side, heat, index);
     });
   }
 
-  _drawSkeleton(landmarks, colours, heat, handIndex) {
+  /**
+   * Depth 0..1 where 1 is nearest the camera, derived from MediaPipe's
+   * normalised z (which is roughly wrist-relative and negative toward the lens).
+   */
+  _depthScale(depth) {
+    if (!depth) return 1;
+    return 0.82 + Math.max(0, Math.min(1, depth)) * 0.42;
+  }
+
+  /**
+   * Skeleton with per-bone taper and depth weighting. Each bone is stroked on
+   * its own so width and opacity can differ: thicker at the knuckle, thinner at
+   * the tip, brighter when that segment is closer to the camera. A soft wide
+   * pass underneath gives the glow a bloom-like halo.
+   */
+  _drawSkeleton(landmarks, colours, heat, handIndex, depth) {
     if (!this.settings.showSkeleton) return;
     const ctx = this.ctx;
+    const dScale = this._depthScale(depth);
+
+    // Bone width keyed on the segment's role: the palm arcs are the heaviest,
+    // fingertips the lightest.
+    const widthFor = (a, b) => {
+      const tip = TIP_INDICES.includes(b) || TIP_INDICES.includes(a);
+      const palm = a === 0 || b === 0;
+      const base = palm ? 5.0 : tip ? 2.0 : 3.4;
+      return base * dScale;
+    };
+
     ctx.save();
-    ctx.lineWidth = 2.2 + heat * 1.4;
     ctx.lineCap = "round";
-    ctx.strokeStyle = colours.bone;
-    ctx.shadowColor = colours.bone;
-    ctx.shadowBlur = 6 + heat * 14;
+
+    // Pass 0: a dark backing stroke. Over a bright camera image the cyan alone
+    // washes out; this keeps the skeleton readable against a white wall or a
+    // window without darkening the whole feed.
+    ctx.strokeStyle = "rgba(3, 8, 14, 0.45)";
+    ctx.lineWidth = 8.5 * dScale;
     ctx.beginPath();
     for (const [a, b] of HAND_CONNECTIONS) {
       const p1 = this.smoothed(handIndex, a, landmarks[a]);
@@ -242,28 +279,137 @@ export class HandOverlay {
       ctx.lineTo(p2.x, p2.y);
     }
     ctx.stroke();
+
+    // Pass 1: wide, low-alpha halo.
+    ctx.strokeStyle = `rgba(64, 224, 255, ${0.13 + heat * 0.12})`;
+    ctx.lineWidth = 11 * dScale;
+    ctx.beginPath();
+    for (const [a, b] of HAND_CONNECTIONS) {
+      const p1 = this.smoothed(handIndex, a, landmarks[a]);
+      const p2 = this.smoothed(handIndex, b, landmarks[b]);
+      if (!p1.inside && !p2.inside) continue;
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+    }
+    ctx.stroke();
+
+    // Pass 2: the bones themselves, one stroke each for correct tapering.
+    for (const [a, b] of HAND_CONNECTIONS) {
+      const p1 = this.smoothed(handIndex, a, landmarks[a]);
+      const p2 = this.smoothed(handIndex, b, landmarks[b]);
+      if (!p1.inside && !p2.inside) continue;
+      const w = widthFor(a, b);
+      const gradient = ctx.createLinearGradient(p1.x, p1.y, p2.x, p2.y);
+      gradient.addColorStop(0, `rgba(126, 236, 255, ${0.95})`);
+      gradient.addColorStop(1, `rgba(48, 196, 255, ${0.72 + heat * 0.2})`);
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = w;
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.stroke();
+    }
     ctx.restore();
   }
 
-  _drawJoints(landmarks, colours, heat, isPinched, handIndex) {
+  /**
+   * Limb volumes: draw each bone as a tapered capsule using the projected 3D
+   * endpoints supplied by the caller. This is what gives the skeleton an
+   * unmistakable "hand in space" read rather than a flat line drawing.
+   *
+   * `bones` is an array of { a: {x,y,scale}, b: {x,y,scale} } in canvas pixels.
+   */
+  _drawBoneVolumes(bones, colours, heat, depth, viewport) {
     const ctx = this.ctx;
+    const dScale = this._depthScale(depth);
+    ctx.save();
+    for (const bone of bones) {
+      const { a, b } = bone;
+      if (!a || !b) continue;
+      const wa = Math.max(1.5, a.scale * 0.055 * dScale);
+      const wb = Math.max(1.1, b.scale * 0.042 * dScale);
+      // Direction and normal, so we can build a quad with tapered ends.
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const nx = -dy / len, ny = dx / len;
+
+      ctx.beginPath();
+      ctx.moveTo(a.x + nx * wa, a.y + ny * wa);
+      ctx.lineTo(b.x + nx * wb, b.y + ny * wb);
+      ctx.lineTo(b.x - nx * wb, b.y - ny * wb);
+      ctx.lineTo(a.x - nx * wa, a.y - ny * wa);
+      ctx.closePath();
+
+      const mid = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+      mid.addColorStop(0, `rgba(150, 244, 255, ${0.30 + heat * 0.2})`);
+      mid.addColorStop(1, `rgba(70, 210, 255, ${0.20 + heat * 0.16})`);
+      ctx.fillStyle = mid;
+      ctx.fill();
+
+      // Bright edge on the leading side reads as a highlight.
+      ctx.strokeStyle = `rgba(190, 250, 255, ${0.30 + heat * 0.25})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(a.x + nx * wa, a.y + ny * wa);
+      ctx.lineTo(b.x + nx * wb, b.y + ny * wb);
+      ctx.stroke();
+    }
+    ctx.restore();
+    void colours; void viewport;
+  }
+
+  /**
+   * Glowing joints. Each is a three-layer puck: an outer halo, a coloured ring,
+   * and a bright core with a specular dot, which is what makes them read as
+   * suspended points in space rather than flat circles.
+   */
+  _drawJoints(landmarks, colours, heat, isPinched, handIndex, depth) {
+    const ctx = this.ctx;
+    const dScale = this._depthScale(depth);
     for (let i = 0; i < landmarks.length; i++) {
       const point = this.smoothed(handIndex, i, landmarks[i]);
       if (!point.inside) continue;
       const isTip = TIP_INDICES.includes(i);
-      // Fingertips read as pointers, not dots: bigger, brighter, haloed.
-      const radius = isTip ? 4.4 + heat * 1.8 : 2.4;
+      const isWrist = i === 0;
+      const radius = (isWrist ? 7.5 : isTip ? 6.2 : 4.4) * dScale + heat * 1.4;
+
       ctx.save();
-      if (isTip) {
-        ctx.shadowColor = colours.pointer;
-        ctx.shadowBlur = 10 + heat * 16;
-      }
+
+      // Outer halo.
+      const halo = ctx.createRadialGradient(point.x, point.y, 0, point.x, point.y, radius * 3);
+      halo.addColorStop(0, `rgba(64, 224, 255, ${0.34 + heat * 0.26})`);
+      halo.addColorStop(1, "rgba(64, 224, 255, 0)");
+      ctx.fillStyle = halo;
       ctx.beginPath();
-      ctx.fillStyle = isTip ? colours.tip : colours.joint;
+      ctx.arc(point.x, point.y, radius * 3, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Dark backing disc so the joint separates from a bright background.
+      ctx.beginPath();
+      ctx.fillStyle = "rgba(3, 8, 14, 0.42)";
+      ctx.arc(point.x, point.y, radius + 1.6, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Ring.
+      ctx.beginPath();
+      ctx.fillStyle = isTip ? "rgba(190, 250, 255, 0.95)" : "rgba(120, 226, 255, 0.92)";
       ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
       ctx.fill();
+
+      // Bright core.
+      ctx.beginPath();
+      ctx.fillStyle = isTip || isWrist ? "#ffffff" : "rgba(232, 253, 255, 0.98)";
+      ctx.arc(point.x, point.y, radius * 0.55, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Specular highlight, offset up-left.
+      ctx.beginPath();
+      ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+      ctx.arc(point.x - radius * 0.3, point.y - radius * 0.34, radius * 0.22, 0, Math.PI * 2);
+      ctx.fill();
+
       ctx.restore();
-      void isPinched;
+      void isPinched; void colours;
     }
   }
 
