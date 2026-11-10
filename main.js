@@ -3314,6 +3314,7 @@ window.HOLOCORE = {
     inspector,
     parseCommand,
     COLOR_PALETTE,
+    updateVoiceUi,
 
     // Re-render the inspector so material controls match the current selection.
     // The playground reports its own selection, so re-selecting the same part

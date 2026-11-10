@@ -24,6 +24,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as THREE from "three";
+import { VoiceControl } from "../voiceControl.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -1095,6 +1096,87 @@ const unreachable = paletteNames.filter(
   name => api._internals.parseCommand(`color ${name}`)?.intent !== `color:${name}`
 );
 check("every palette colour is voice-reachable", unreachable.length === 0, unreachable.join(", "));
+
+section("5o · Spoken words drive the same actions as the UI");
+
+// A stub speech engine so the real recognition handlers run. This proves the
+// wiring from a transcript to a scene change; it cannot prove that a real
+// microphone transcribes accurately, which needs a browser and a room.
+const spoken = [];
+class StubRecognition {
+  constructor() {
+    this.continuous = false;
+    this.interimResults = false;
+    this.lang = "";
+    this.onresult = null; this.onerror = null; this.onend = null;
+    this.onstart = null; this.onaudiostart = null;
+    spoken.push(this);
+  }
+  start() { this.onstart?.(); }
+  stop() { this.onend?.(); }
+  abort() { this.onend?.(); }
+}
+window.SpeechRecognition = StubRecognition;
+window.webkitSpeechRecognition = StubRecognition;
+window.speechSynthesis = window.speechSynthesis || { speak() {}, cancel() {} };
+
+// The app's own instance was built at boot, before this stub existed, so it
+// correctly reports itself unsupported. Build a fresh one from the same class
+// with the same wiring the app uses.
+const vox = new VoiceControl({
+  onCommand: (intent, phrase) => api.handleVoiceIntentForTest(intent, phrase),
+  onState: voxState => api._internals.updateVoiceUi(voxState)
+});
+check("the voice class is constructible with a speech engine", vox.supported === true);
+vox.start();
+check("starting voice opens a recognition session", spoken.length >= 1, `${spoken.length}`);
+
+/** Feed a transcript through the real onresult handler. */
+const say = phrase => {
+  const engine = spoken[spoken.length - 1];
+  const result = [{ transcript: phrase }];
+  result.isFinal = true;
+  engine.onresult?.({ resultIndex: 0, results: [result] });
+};
+
+// 1. A spoken spawn creates a real object.
+const beforeSpawn = api.getPlayground().props.length;
+say("add a cube");
+const afterSpawn = api.getPlayground().props.length;
+check("saying 'add a cube' spawns an object", afterSpawn === beforeSpawn + 1,
+  `${beforeSpawn} -> ${afterSpawn}`);
+check("the spoken object is selected", Boolean(api.getPlayground().get()),
+  api.getPlayground().get()?.name);
+
+// 2. A spoken colour reaches that object's material.
+say("make it red");
+const spokenColour = api.getPlayground().getMaterial(api.getPlayground().get().id).color;
+check("saying 'make it red' recolours it", spokenColour.toLowerCase() === "#ef4444", spokenColour);
+
+// 3. A spoken wireframe toggle reaches the material.
+say("wireframe");
+check("saying 'wireframe' switches it on",
+  api.getPlayground().getMaterial(api.getPlayground().get().id).wireframe === true);
+say("solid");
+check("saying 'solid' switches it back off",
+  api.getPlayground().getMaterial(api.getPlayground().get().id).wireframe === false);
+
+// 4. A spoken mode switches the interaction mode.
+say("move mode");
+check("saying 'move mode' switches mode", api.getMode() === "move", api.getMode());
+say("select mode");
+
+// 5. A spoken clear empties the scene.
+say("clear objects");
+check("saying 'clear objects' empties the playground",
+  api.getPlayground().props.length === 0, `${api.getPlayground().props.length}`);
+
+// 6. The chip reports what was heard.
+check("the voice chip shows the heard phrase",
+  (doc.getElementById("voice-phrase")?.textContent || "").length > 0,
+  doc.getElementById("voice-phrase")?.textContent);
+
+vox.stop();
 
 section("6 · Modes still gate gestures");
 
