@@ -132,6 +132,7 @@ const dom = {
   modeDot: $("#mode-dot"),
   modeInstructionText: $("#mode-instruction-text"),
   modeInstructionTarget: $("#mode-instruction-target"),
+  hudGesture: $("#hud-gesture"),
 
   explodeSlider: $("#explode-slider"),
   explodeValue: $("#explode-value"),
@@ -190,6 +191,12 @@ const dom = {
 
 const store = new SettingsStore();
 let settings = store.get();
+
+/**
+ * How far a grabbed playground object may be dragged. Shared with the gesture
+ * solver so the clamp is applied once, at the same limit, in both places.
+ */
+const STAGE_BOUNDS = Object.freeze({ x: 4.2, y: 3.2, z: 3.6 });
 
 const state = {
   modelId: MODEL_LIBRARY[0].id,
@@ -669,6 +676,24 @@ function handleSelect(partId, source) {
 
   // The mode strip names what the next gesture will act on.
   updateModeTargetLabel();
+}
+
+/**
+ * Select a playground object the same way the outliner does: the object is
+ * highlighted, the assembly selection is cleared, and the HUD follows.
+ */
+function selectProp(id, source = "hand") {
+  if (!playground) return null;
+  const prop = id ? playground.byId.get(id) : null;
+  playground.select(prop ? prop.id : null);
+  if (prop) {
+    workspace?.clearSelection?.();
+    handleSelect(null, source);
+    toast(`Selected ${prop.name}`, "accent", 1400);
+  }
+  refreshSceneOutliner();
+  updateObjectHud();
+  return prop;
 }
 
 function updatePartListSelection() {
@@ -1276,7 +1301,10 @@ const solver = new ManipulationSolver({
     moveSensitivity: settings.object.moveSensitivity,
     rotateSensitivity: settings.object.rotateSensitivity,
     scaleSensitivity: settings.object.scaleSensitivity,
-    zSensitivity: settings.object.depthSensitivity
+    zSensitivity: settings.object.depthSensitivity,
+    // Match the stage bounds used when the result is written to the object, so
+    // a drag stops at the visible edge instead of saturating early.
+    limits: STAGE_BOUNDS
   },
   onModeChange: mode => {
     state.gestureMode = mode;
@@ -1401,40 +1429,29 @@ function processHands(now) {
   drawWorkspaceOverlay(hands, handedness, activeStates, activity, targets, tethers);
 
   // ---- run the solver -------------------------------------------------------
-  // A pinch in MOVE/ROTATE grabs what you are pointing at. Promote the hovered
-  // component to the selection on gesture start so the gesture has a target.
-  if ((state.mode === "move" || state.mode === "rotate") && state.pointerTarget &&
-      state.pointerTarget !== state.partId && activeStates.some(hand => hand?.pinched) &&
-      !state.gestureTarget) {
-    workspace.select(state.pointerTarget);
-    handleSelect(state.pointerTarget, "hand");
-    state.gestureTarget = state.pointerTarget;
+  // A pinch in MOVE/ROTATE grabs what you are pointing at. Promote whatever the
+  // reticle resolves to the selection on gesture start so the gesture has a
+  // target. Playground objects and engineering components take different
+  // selection paths: without the prop branch, a pinch over a spawned cube did
+  // nothing at all and the gesture fell through to the assembly.
+  const pinching = activeStates.some(hand => hand?.pinched);
+  if ((state.mode === "move" || state.mode === "rotate") && state.pointerTarget && pinching) {
+    if (state.pointerKind === "prop") {
+      if (playground?.selectedId !== state.pointerTarget) {
+        selectProp(state.pointerTarget, "hand");
+      }
+    } else if (state.pointerTarget !== state.partId && !state.gestureTarget) {
+      workspace.select(state.pointerTarget);
+      handleSelect(state.pointerTarget, "hand");
+      state.gestureTarget = state.pointerTarget;
+    }
   }
-  if (!activeStates.some(hand => hand?.pinched)) state.gestureTarget = null;
-
-  const objectState = {
-    position: { x: 0, y: 0, z: 0 },
-    rotationZ: 0,
-    rotationX: 0,
-    scale: 1,
-    explode: workspace.explodeAmount ?? 0
-  };
+  if (!pinching) state.gestureTarget = null;
 
   // In a real mode the transform applies to the selected component when there
   // is one; EXPLODE and SCALE always act on the assembly.
   const part = getGesturePart();
-  if (part && state.mode !== "explode") {
-    objectState.position = { ...part.offset };
-    objectState.rotationZ = part.rotationZ;
-    objectState.rotationX = part.rotationX;
-    objectState.scale = part.scale;
-  } else {
-    const t = workspace.transform;
-    objectState.position = { x: t.position.x, y: t.position.y, z: t.position.z };
-    objectState.rotationZ = t.rotationZ;
-    objectState.rotationX = t.rotationX;
-    objectState.scale = t.scale;
-  }
+  const objectState = gestureObjectState(part);
 
   const result = solver.update(activeStates, objectState, now);
   state.gestureMode = result.mode;
@@ -1449,12 +1466,159 @@ function processHands(now) {
   updateGestureLabels(activeStates, result);
 }
 
+/**
+ * Settings handed to each per-hand analyzer.
+ *
+ * Referenced by the tracking loop and the settings panel but never defined, so
+ * the first frame with a hand threw and took the whole pipeline with it.
+ */
+function analyzerSettings() {
+  return {
+    pinchThreshold: settings.gesture.pinchThreshold,
+    pinchRelease: settings.gesture.pinchRelease,
+    smoothing: settings.gesture.smoothing
+  };
+}
+
+/**
+ * Choose which hand drives the reticle and manipulation.
+ *
+ * Both hands used to be reduced to `states[0]` implicitly, which is whatever
+ * order MediaPipe happened to return. Prefer a pinching hand (you are actively
+ * manipulating), then a fully visible one, then the first tracked hand.
+ */
+function pickPointer(states) {
+  if (!Array.isArray(states) || !states.length) return null;
+
+  let best = null;
+  let bestScore = -Infinity;
+  for (const hand of states) {
+    if (!hand) continue;
+    let score = 0;
+    if (hand.pinched) score += 10;
+    // A hand with a complete landmark set is likelier to be in frame.
+    const points = hand.landmarks?.length || 0;
+    score += Math.min(points, 21) / 21;
+    if (hand.present === false) score -= 5;
+    if (score > bestScore) {
+      bestScore = score;
+      best = hand;
+    }
+  }
+
+  if (!best) return null;
+  const tip = best.landmarks?.[8] || best.indexTip || best.pinch || null;
+  return {
+    hand: { ...best, indexTip: tip, pinched: Boolean(best.pinched) },
+    state: best
+  };
+}
+
+/**
+ * Report which engineering component the hand is hovering.
+ *
+ * Called from updatePointer() but never defined. Hover is a purely visual
+ * affordance, so this stays cheap and never touches selection.
+ */
+function hoverFromHand(hand, partId) {
+  if (!workspace || !partId) return;
+  if (state.hoverId === partId) return;
+  state.hoverId = partId;
+  workspace.setHover?.(partId);
+}
+
+/**
+ * Report the live gesture for each tracked hand.
+ *
+ * This is called from the tracking loop and from the solver's mode-change
+ * callback. It used to be referenced but never defined, which threw
+ * `ReferenceError: updateGestureLabels is not defined` on the first tracked
+ * frame and killed the rest of processHands() — including depth cues and the
+ * solver — so the stage looked frozen the moment a hand appeared.
+ */
+function updateGestureLabels(states, result) {
+  const hands = Array.isArray(states) ? states.filter(Boolean) : [];
+  const primary = hands[0] || null;
+  state.activePinches = hands.map(hand => Boolean(hand.pinched));
+
+  const gesture = !hands.length
+    ? null
+    : primary.pinched
+      ? (result?.intent && result.intent !== "none" ? result.intent : "grab")
+      : primary.gesture || primary.pose || "tracking";
+
+  state.gestureName = gesture;
+
+  if (dom.hudGesture) {
+    const label = gesture ? String(gesture).toUpperCase() : "—";
+    if (dom.hudGesture.textContent !== label) dom.hudGesture.textContent = label;
+  }
+
+  // The instruction strip keeps the mode's guidance, but the target chip also
+  // reports an active grab so the user can see the pinch was recognised.
+  if (dom.modeInstructionTarget && gesture === "translate") {
+    dom.modeInstructionTarget.textContent = "GRABBED";
+  }
+
+  if (dom.viewport) {
+    dom.viewport.classList.toggle("is-gesturing", Boolean(gesture));
+    dom.viewport.classList.toggle("is-pinching", hands.some(hand => hand.pinched));
+  }
+}
+
 /** The component a gesture should transform, or null for the whole assembly. */
 function getGesturePart() {
   if (!state.partId || !workspace) return null;
   const transform = workspace.getPartTransform(state.partId);
   if (!transform) return null;
   return { partId: state.partId, ...transform };
+}
+
+/**
+ * The transform the solver should treat as "current" for this frame.
+ *
+ * The solver captures its reference frame from this state, so it must describe
+ * the thing actually being grabbed. Seeding it from the assembly while a
+ * playground object is selected made the object jump by the assembly's offset
+ * the instant the pinch closed — this is the fix for that.
+ */
+function gestureObjectState(part) {
+  const objectState = {
+    position: { x: 0, y: 0, z: 0 },
+    rotationZ: 0,
+    rotationX: 0,
+    scale: 1,
+    explode: workspace?.explodeAmount ?? 0
+  };
+
+  const selected = playground?.get?.();
+  const grabbed = selected ? playground.getTransform(selected.id) : null;
+
+  if (grabbed) {
+    objectState.position = { ...grabbed.position };
+    // The playground yaws around Y; the solver reports yaw in rotationZ.
+    objectState.rotationZ = grabbed.rotationY;
+    objectState.rotationX = grabbed.rotationX;
+    objectState.scale = grabbed.scale;
+    return objectState;
+  }
+
+  if (part && state.mode !== "explode") {
+    objectState.position = { ...part.offset };
+    objectState.rotationZ = part.rotationZ;
+    objectState.rotationX = part.rotationX;
+    objectState.scale = part.scale;
+    return objectState;
+  }
+
+  const t = workspace?.transform;
+  if (t) {
+    objectState.position = { x: t.position.x, y: t.position.y, z: t.position.z };
+    objectState.rotationZ = t.rotationZ;
+    objectState.rotationX = t.rotationX;
+    objectState.scale = t.scale;
+  }
+  return objectState;
 }
 
 /**
@@ -1534,9 +1698,9 @@ function applyGestureToProp(result, prop) {
   if (result.intent === "translate" && result.position) {
     playground.setTransform(prop.id, {
       position: {
-        x: clamp(result.position.x, -9, 9),
-        y: clamp(result.position.y, -7, 7),
-        z: clamp(result.position.z, -9, 9)
+        x: clamp(result.position.x, -STAGE_BOUNDS.x, STAGE_BOUNDS.x),
+        y: clamp(result.position.y, -STAGE_BOUNDS.y, STAGE_BOUNDS.y),
+        z: clamp(result.position.z, -STAGE_BOUNDS.z, STAGE_BOUNDS.z)
       }
     });
     playground.highlight(prop.id);
@@ -1560,9 +1724,18 @@ function applyGestureToProp(result, prop) {
   }
 }
 
-/** Confirm the component under the pointer as the selection. */
+/** Confirm whatever is under the pointer as the selection. */
 function handleHandSelect() {
   if (!state.pointerTarget) return;
+  if (state.pointerKind === "prop") {
+    if (playground?.selectedId === state.pointerTarget) {
+      flash(dom.inspectorRoot, "flash");
+      return;
+    }
+    selectProp(state.pointerTarget, "hand");
+    flash(dom.inspectorRoot, "flash");
+    return;
+  }
   if (state.partId === state.pointerTarget) {
     flash(dom.inspectorRoot, "flash");
     return;
@@ -2948,5 +3121,17 @@ window.HOLOCORE = {
   setCameraView,
   syncWorkspaceVideo,
   // Deliberately exposed for automated verification (see tools/).
-  _internals: { store, animator, analyzers, LM }
+  _internals: {
+    store, animator, analyzers, LM,
+    gestureObjectState,
+    applyGestureResult,
+    // Resolve what the reticle is pointing at, so selection can be exercised
+    // without a camera.
+    pointerTargets: () => ({ target: state.pointerTarget, kind: state.pointerKind }),
+    selectProp,
+    updateGestureLabels,
+    // Drives the real per-frame hand pipeline with supplied landmarks, so the
+    // tracking loop can be exercised without a camera.
+    processHands
+  }
 };

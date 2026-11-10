@@ -346,6 +346,162 @@ input.click = realClick;
 
 for (const prop of [...api.getPlayground().props]) api.getPlayground().remove(prop.id);
 
+section("5c · A grabbed object does not jump");
+
+const pg = api.getPlayground();
+pg.clear();
+const cube = pg.addPrimitive("cube");
+// Place it far from the origin so an assembly-seeded reference frame would
+// produce an obvious jump.
+pg.setTransform(cube.id, { position: { x: 2.4, y: 1.1, z: -1.3 } });
+pg.select(cube.id);
+
+const seed = api._internals.gestureObjectState(null);
+check("the solver is seeded from the grabbed object", seed.position.x === 2.4 &&
+  seed.position.y === 1.1 && seed.position.z === -1.3,
+  JSON.stringify(seed.position));
+
+// Feed the solver a grab that opens exactly where the object currently is:
+// the result must equal the object's existing transform, not the assembly's.
+const solver = api.solver;
+solver.updateSettings({ mode: "move" });
+solver.mode = "idle";
+const openHand = {
+  pinch: { x: 0.0, y: 0.0, z: 0.0 },
+  pinched: false,
+  present: true
+};
+const pinchedHand = {
+  pinch: { x: 0.0, y: 0.0, z: 0.0 },
+  pinched: true,
+  present: true
+};
+solver.update([openHand], seed, 0);
+const grabbed = solver.update([pinchedHand], seed, 16);
+check("the grab reports a translation", grabbed.intent === "translate",
+  `${grabbed.intent}`);
+check("the object stays put when the hand has not moved",
+  grabbed.position &&
+    Math.abs(grabbed.position.x - 2.4) < 0.02 &&
+    Math.abs(grabbed.position.y - 1.1) < 0.02,
+  JSON.stringify(grabbed.position));
+
+// Moving the hand must move the object by the same delta, not teleport it.
+const movedHand = { pinch: { x: 0.08, y: 0.04, z: 0.0 }, pinched: true, present: true };
+const moved = solver.update([movedHand], seed, 32);
+check("dragging translates relative to the grab point",
+  moved.position && moved.position.x > grabbed.position.x &&
+    moved.position.x - grabbed.position.x < 1.2,
+  `${grabbed.position?.x?.toFixed(2)} -> ${moved.position?.x?.toFixed(2)}`);
+
+// The stage bounds must be the single shared limit.
+check("the solver uses the stage bounds",
+  solver.limits.x === 4.2 && solver.limits.y === 3.2, JSON.stringify(solver.limits));
+
+// Applying a result writes to the playground object, not the assembly.
+api._internals.applyGestureResult({ active: true, intent: "translate",
+  position: { x: 3.0, y: 1.5, z: 0 } }, null);
+const afterApply = pg.getTransform(cube.id);
+check("the result lands on the playground object",
+  Math.abs(afterApply.position.x - 3.0) < 1e-6 &&
+    Math.abs(afterApply.position.y - 1.5) < 1e-6,
+  JSON.stringify(afterApply.position));
+
+// A pinch over a prop selects that prop rather than silently doing nothing.
+pg.select(null);
+api.toast = api.toast || (() => {});
+const chosen = api._internals.selectProp(cube.id, "hand");
+check("selecting a prop works from the gesture path", chosen && pg.selectedId === cube.id);
+check("the object HUD names the selection",
+  doc.getElementById("hud-object-name")?.textContent === "CUBE",
+  doc.getElementById("hud-object-name")?.textContent);
+
+// updateGestureLabels is called every tracked frame; it used to be undefined.
+let labelError = null;
+try {
+  api._internals.updateGestureLabels([{ pinched: true, gesture: "pinch" }],
+    { intent: "translate", active: true });
+} catch (error) {
+  labelError = error;
+}
+check("the gesture label updater exists and runs", labelError === null,
+  labelError ? String(labelError.message) : "");
+check("an active grab is reported to the HUD",
+  doc.getElementById("hud-gesture")?.textContent === "TRANSLATE",
+  doc.getElementById("hud-gesture")?.textContent);
+
+try {
+  api._internals.updateGestureLabels([], {});
+} catch (error) {
+  labelError = error;
+}
+check("no hands clears the gesture label",
+  labelError === null && doc.getElementById("hud-gesture")?.textContent === "—",
+  doc.getElementById("hud-gesture")?.textContent);
+
+pg.clear();
+
+section("5d · The live tracking loop survives real landmarks");
+
+// 21 MediaPipe-shaped landmarks: a plausible open right hand, normalised.
+function syntheticHand(pinch = false) {
+  const points = [];
+  const add = (x, y, z = 0) => points.push({ x, y, z, visibility: 1 });
+  add(0.5, 0.72, 0);            // 0 wrist
+  add(0.42, 0.66, 0); add(0.38, 0.60, 0); add(0.35, 0.55, 0); add(0.32, 0.51, 0); // thumb
+  add(0.45, 0.55, 0); add(0.44, 0.46, 0); add(0.44, 0.41, 0); add(0.44, 0.37, 0); // index
+  add(0.50, 0.54, 0); add(0.50, 0.44, 0); add(0.50, 0.39, 0); add(0.50, 0.35, 0); // middle
+  add(0.55, 0.55, 0); add(0.56, 0.46, 0); add(0.57, 0.41, 0); add(0.57, 0.37, 0); // ring
+  add(0.60, 0.58, 0); add(0.62, 0.50, 0); add(0.63, 0.46, 0); add(0.64, 0.42, 0); // pinky
+  if (pinch) {
+    // Bring the thumb tip onto the index tip.
+    points[4] = { x: 0.44, y: 0.37, z: 0, visibility: 1 };
+  }
+  return points;
+}
+
+const trackingBefore = pg.props.length;
+let loopError = null;
+try {
+  const analyserHand = syntheticHand(false);
+  for (let frame = 0; frame < 6; frame++) {
+    api._internals.processHands(performance.now() + frame * 16);
+  }
+} catch (error) {
+  loopError = error;
+}
+check("processHands runs without throwing", loopError === null,
+  loopError ? `${loopError.name}: ${loopError.message}` : "");
+
+// Feed the tracker itself, so skeletons and the pointer path see hands.
+let injectedError = null;
+try {
+  api.tracker.hands = [syntheticHand(true)];
+  api.tracker.handedness = ["Right"];
+  api.tracker.worldLandmarks = [syntheticHand(true)];
+  api.setMode("move");
+  for (let frame = 0; frame < 10; frame++) {
+    api._internals.processHands(performance.now() + 100 + frame * 16);
+  }
+} catch (error) {
+  injectedError = error;
+}
+check("tracked hands drive the loop without throwing", injectedError === null,
+  injectedError ? `${injectedError.name}: ${injectedError.message}` : "");
+const rigs = api.getHandSkeleton()?.rigs;
+const rigList = rigs instanceof Map ? [...rigs.values()] : (rigs || []);
+check("a skeleton rig received the landmarks", rigList.length >= 1 &&
+  rigList.some(rig => rig.visible !== false), `${rigList.length} rig(s)`);
+
+// Selection must never invent objects.
+check("the tracking loop added no stray objects", pg.props.length === trackingBefore,
+  `${trackingBefore} -> ${pg.props.length}`);
+
+api.tracker.hands = [];
+api.tracker.handedness = [];
+api.tracker.worldLandmarks = [];
+pg.clear();
+
 section("6 · Modes still gate gestures");
 
 const modes = ["select", "move", "rotate", "scale", "explode"];
