@@ -579,7 +579,86 @@ check("select never transforms the scene",
   !sel.position && sel.scale === undefined && sel.rotationZ === undefined,
   sel.intent);
 
-section("5f · Pinch recognition curve");
+section("5f · 3D and 2D skeletons agree on screen");
+
+// The 2D overlay compensates for object-fit: cover cropping; the 3D rigs used
+// to ignore it, so on any stage whose aspect ratio differs from the camera the
+// scene skeletons drifted off the real hands. This compares the two mapping
+// paths in projected stage pixels.
+const { landmarkToWorld } = await import("../handSkeleton3d.js");
+const { landmarkToStage, coverFit } = await import("../handGeometry.js");
+
+const alignCases = [
+  { name: "4:3 camera on a 16:9 stage", vw: 640, vh: 480, bw: 1280, bh: 720 },
+  { name: "16:9 camera on a portrait stage", vw: 1280, vh: 720, bw: 420, bh: 860 },
+  { name: "matching aspect ratios", vw: 1280, vh: 720, bw: 1280, bh: 720 }
+];
+
+for (const spec of alignCases) {
+  const cam = new THREE.PerspectiveCamera(55, spec.bw / spec.bh, 0.1, 100);
+  cam.position.set(0, 0, 6);
+  cam.lookAt(0, 0, 0);
+  cam.updateMatrixWorld(true);
+  cam.updateProjectionMatrix();
+
+  const fit = {
+    ...coverFit(spec.vw, spec.vh, spec.bw, spec.bh),
+    videoWidth: spec.vw, videoHeight: spec.vh,
+    boxWidth: spec.bw, boxHeight: spec.bh
+  };
+
+  let worst = 0;
+  for (const [x, y] of [[0.5, 0.5], [0.25, 0.35], [0.75, 0.65], [0.4, 0.6]]) {
+    const stage = landmarkToStage({ x, y },
+      { videoWidth: spec.vw, videoHeight: spec.vh, boxWidth: spec.bw, boxHeight: spec.bh },
+      { mirror: true });
+    const projected = landmarkToWorld({ x, y }, cam, { mirror: true, fit }).project(cam);
+    const px = {
+      x: (projected.x * 0.5 + 0.5) * spec.bw,
+      y: (-projected.y * 0.5 + 0.5) * spec.bh
+    };
+    worst = Math.max(worst, Math.hypot(px.x - stage.x, px.y - stage.y));
+  }
+  check(`2D and 3D agree · ${spec.name}`, worst < 1, `${worst.toFixed(2)}px`);
+}
+
+{
+  // The rig must be drawn at the size the video shows, not a fixed guess: a
+  // hand near the lens is bigger on screen and the 3D skeleton has to match.
+  const cam = new THREE.PerspectiveCamera(55, 16 / 9, 0.1, 100);
+  cam.position.set(0, 0, 6); cam.lookAt(0, 0, 0);
+  cam.updateMatrixWorld(true); cam.updateProjectionMatrix();
+  const scene = new THREE.Scene();
+
+  const makeHand = (size, cx = 0.5, cy = 0.5) => {
+    const pts = [];
+    for (let i = 0; i < 21; i++) {
+      const a = (i / 21) * Math.PI * 2;
+      pts.push({ x: cx + Math.cos(a) * size, y: cy + Math.sin(a) * size, z: 0 });
+    }
+    return pts;
+  };
+
+  const measure = size => {
+    const sk = new (api.getHandSkeleton().constructor)({ scene, camera: cam, mirror: true });
+    const landmarks = makeHand(size);
+    const metric = makeHand(size).map(p => ({ x: p.x * 0.2, y: p.y * 0.2, z: 0 }));
+    sk.update([landmarks], [metric], ["Right"], {});
+    const rig = [...sk.rigs.values()][0];
+    let span = 0;
+    const pts = rig.joints.map(j => j.position);
+    for (let i = 1; i < pts.length; i++) span = Math.max(span, pts[i].distanceTo(pts[0]));
+    sk.root.parent?.remove(sk.root);
+    return span;
+  };
+
+  const small = measure(0.04);
+  const large = measure(0.12);
+  check("a hand twice the size in frame is drawn twice as large",
+    Math.abs(large / small - 3) < 0.35, `${(large / small).toFixed(2)}x`);
+}
+
+section("5g · Pinch recognition curve");
 
 // A hand whose palm scale is normalised to 1, with the thumb tip placed at a
 // known distance from the index tip. Distances follow the measured values the

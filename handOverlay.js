@@ -199,7 +199,15 @@ export class HandOverlay {
    */
   draw(hands, handedness, {
     pinched = [], activity = [], targets = [], tethers = [],
-    depths = [], joints3d = [], viewport = null
+    depths = [], joints3d = [], viewport = null,
+    /**
+     * True when the scene-space 3D rigs are drawing the hands. The 2D layer
+     * then supplies only what real geometry cannot: the pointer reticle, the
+     * pinch burst and the hand labels. Without this, every hand was drawn
+     * twice — once in the scene and once on top of it — which doubled both the
+     * glow and the CPU cost of the overlay.
+     */
+    sceneSkeletons = false
   } = {}) {
     if (!this.available) return;
     this.clear();
@@ -225,8 +233,10 @@ export class HandOverlay {
       // Spray of limb bone volumes in projected 3D, then the 2D connective
       // tissue and glowing joints. Drawing bones first keeps joints crisp.
       if (bones && viewport) this._drawBoneVolumes(bones, colours, heat, depth, viewport);
-      this._drawSkeleton(landmarks, colours, heat, index, depth);
-      this._drawJoints(landmarks, colours, heat, isPinched, index, depth);
+      if (!sceneSkeletons) {
+        this._drawSkeleton(landmarks, colours, heat, index, depth);
+        this._drawJoints(landmarks, colours, heat, isPinched, index, depth);
+      }
       this._drawPinch(landmarks, colours, isPinched, heat, index);
       this._drawPointer(landmarks, colours, isPinched, heat, targets[index], tethers[index], index);
       this._drawLabel(landmarks, colours, side, heat, index);

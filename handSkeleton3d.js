@@ -70,14 +70,37 @@ function paletteFor(side) {
  * @param {number}  [options.offsetY=0]
  */
 export function landmarkToWorld(point, camera, {
-  mirror = true, depth = HAND_DEPTH, offsetX = 0, offsetY = 0
+  mirror = true, depth = HAND_DEPTH, offsetX = 0, offsetY = 0, fit = null
 } = {}) {
+  // The <video> is displayed with object-fit: cover, so on a stage whose aspect
+  // ratio differs from the camera the image is centre-cropped. The 2D overlay
+  // has always compensated for that; the 3D rigs did not, so on a non-16:9
+  // stage the scene skeletons drifted away from the real hands. `fit` carries
+  // the cover rectangle (from handGeometry.coverFit) and is applied here in
+  // normalised space, exactly like the 2D path.
+  let u = point.x;
+  let v = point.y;
+  if (fit) {
+    const boxWidth = Math.max(1, fit.boxWidth);
+    const boxHeight = Math.max(1, fit.boxHeight);
+    // Source pixels for this landmark, relative to the visible crop.
+    const sourceX = point.x * fit.videoWidth - fit.offsetX;
+    const sourceY = point.y * fit.videoHeight - fit.offsetY;
+    u = (sourceX * fit.scale) / boxWidth;
+    v = (sourceY * fit.scale) / boxHeight;
+    if (!Number.isFinite(u) || !Number.isFinite(v)) {
+      u = point.x;
+      v = point.y;
+    }
+  }
+
   // Mirroring has to happen exactly once, in normalised space, to match the
-  // CSS-mirrored video the user is looking at.
-  const nx = mirror ? 1 - point.x : point.x;
+  // CSS-mirrored video the user is looking at. This happens *after* cropping,
+  // because the video is flipped as a whole.
+  const nx = mirror ? 1 - u : u;
   // NDC: x right, y up. MediaPipe y runs downward.
   const ndcX = nx * 2 - 1;
-  const ndcY = -(point.y * 2 - 1);
+  const ndcY = -(v * 2 - 1);
 
   // Half-extents of the visible frustum at the hand plane.
   const halfHeight = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * depth;
@@ -283,7 +306,9 @@ export class HandSkeleton3D {
    * @param {string[]} handedness
    * @param {object} options { pinched: boolean[], activity: number[] }
    */
-  update(landmarks, worldLandmarks, handedness, { pinched = [], activity = [] } = {}) {
+  update(landmarks, worldLandmarks, handedness, {
+    pinched = [], activity = [], fit = null
+  } = {}) {
     if (!this.visible) return;
     this.camera.updateMatrixWorld();
 
@@ -307,18 +332,42 @@ export class HandSkeleton3D {
 
       // Anchor the hand at its wrist, so the whole skeleton is positioned by
       // the wrist landmark and shaped by the rest.
-      const wristAnchor = landmarkToWorld(points[0], this.camera, { mirror: this.mirror });
+      const wristAnchor = landmarkToWorld(points[0], this.camera, {
+        mirror: this.mirror,
+        fit
+      });
 
-      // Scale metric offsets from worldLandmarks into our world units. A hand
-      // is roughly 0.19 m across; on the hand plane we want it to read at
-      // about 1.6 world units wide.
-      const METRIC_TO_WORLD = 8.6;
+      // Place every joint on the hand plane first. This is always correct, and
+      // it is all we need when MediaPipe gives no metric landmarks.
+      const planePositions = points.map(point =>
+        landmarkToWorld(point, this.camera, { mirror: this.mirror, fit })
+      );
+
+      // Derive the hand's size from those plane positions rather than assuming
+      // a fixed size. The 2D overlay has always drawn the hand at whatever size
+      // the video shows; sizing the 3D rig from a constant made the two layers
+      // disagree whenever the hand moved nearer or further from the camera.
+      let spread = 0;
+      for (let i = 1; i < planePositions.length; i++) {
+        spread = Math.max(spread, planePositions[i].distanceTo(planePositions[0]));
+      }
+      const metricSpread = world && world.length >= 21
+        ? Math.max(
+            ...world.slice(1).map(w => Math.hypot(
+              w.x - world[0].x, w.y - world[0].y, w.z - world[0].z
+            ))
+          )
+        : 0;
+      // worldLandmarks are in metres, so this converts a metric offset into the
+      // same world units the plane mapping produced.
+      // Both spreads must be usable: identical landmarks give a zero spread and
+      // would collapse every joint onto one point (and hide every bone).
+      const METRIC_TO_WORLD =
+        metricSpread > 1e-4 && spread > 1e-4 ? spread / metricSpread : 8.6;
 
       const positions = points.map((point, i) => {
         if (!world || !world[i]) {
-          // No metric data: fall back to the flat plane mapping, which is
-          // still correctly positioned, just flat.
-          return landmarkToWorld(point, this.camera, { mirror: this.mirror });
+          return planePositions[i].clone();
         }
         const w0 = world[0] || { x: 0, y: 0, z: 0 };
         const dx = (world[i].x - w0.x) * METRIC_TO_WORLD;

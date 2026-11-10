@@ -24,7 +24,7 @@ import { HandSkeleton3D } from "./handSkeleton3d.js";
 import { Playground, PRIMITIVES } from "./playground.js";
 import { VoiceControl, VOICE_STATUS } from "./voiceControl.js";
 import { MODES, getMode, isMode, instructionFor } from "./interactionModes.js";
-import { landmarkToNdc, landmarkToStage } from "./handGeometry.js";
+import { landmarkToNdc, landmarkToStage, coverFit } from "./handGeometry.js";
 import { ComponentInspector } from "./componentInspector.js";
 import { createAssistant } from "./assistant.js";
 import { SettingsStore } from "./store.js";
@@ -1407,11 +1407,26 @@ function processHands(now) {
   // The 3D hands are the primary representation; the 2D overlay is kept for the
   // corner preview card and as a fallback when WebGL is unavailable.
   if (skeleton3d) {
+    // The video is object-fit: cover, so hand the rigs the same crop rectangle
+    // the 2D overlay uses; otherwise the scene skeletons drift off the real
+    // hands whenever the stage aspect ratio differs from the camera's.
+    const video = videoSize();
+    const box = cameraDisplayBox();
+    const fit = video.videoWidth && box.width
+      ? {
+          ...coverFit(video.videoWidth, video.videoHeight, box.width, box.height),
+          videoWidth: video.videoWidth,
+          videoHeight: video.videoHeight,
+          boxWidth: box.width,
+          boxHeight: box.height
+        }
+      : null;
+
     skeleton3d.update(
       hands,
       tracker.worldLandmarks || [],
       handedness,
-      { pinched: overlayPinched, activity }
+      { pinched: overlayPinched, activity, fit }
     );
   }
 
@@ -1749,11 +1764,18 @@ function handleHandSelect() {
 /** Draw the landmark skeleton onto the full-workspace overlay. */
 function drawWorkspaceOverlay(hands, handedness, states, activity, targets, tethers) {
   if (!overlayWorkspace || state.cameraView !== "workspace") return;
+
+  // The scene-space rigs are the primary skeleton. When they are live, the 2D
+  // layer only adds the reticle, the pinch burst and the labels — otherwise
+  // both layers draw the same bones and hands look doubled and smeared.
+  const sceneSkeletons = Boolean(skeleton3d?.rigs?.size);
+
   overlayWorkspace.draw(hands, handedness, {
     pinched: states.map(hand => hand.pinched),
     activity,
     targets,
-    tethers
+    tethers,
+    sceneSkeletons
   });
 }
 
