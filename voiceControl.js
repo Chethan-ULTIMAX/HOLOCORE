@@ -18,6 +18,23 @@
  *   is useless when the cause is an unsupported browser or a denied mic.
  */
 
+/**
+ * Named colours for the "color …" voice command and the inspector swatches.
+ * Ported from the main branch so voice, swatches and the colour input all agree.
+ */
+export const COLOR_PALETTE = {
+  red: "#ef4444",
+  orange: "#f97316",
+  gold: "#eab308",
+  green: "#22c55e",
+  cyan: "#06b6d4",
+  blue: "#3b82f6",
+  purple: "#a855f7",
+  pink: "#ec4899",
+  white: "#f8fafc",
+  dark: "#1e293b"
+};
+
 /** Command grammar: each entry is [patterns, intent, example]. */
 const COMMAND_TABLE = [
   // ---- pick a specific object (before the mode verbs, so "select the cube"
@@ -30,6 +47,11 @@ const COMMAND_TABLE = [
   [/\b(select|grab|pick|choose)\b.*\b(knot)\b/, "select:torusKnot", "select the knot"],
   [/\b(select|grab|pick|choose)\b.*\b(crystal|gem|icosahedron)\b/, "select:icosahedron", "select the crystal"],
 
+
+  // A numeric amount and "assemble" must come before the mode verbs: the
+  // explode mode rule would otherwise swallow "explode 40 percent".
+  [/\b(explode|disassemble|separate)\b.*?\b(\d{1,3})\s*(percent|%)/, "explode", "explode 40 percent"],
+  [/\b(assemble|collapse|put together|reassemble)\b/, "transform:assemble", "assemble"],
 
   // ---- modes -------------------------------------------------------------
   // "select" only means SELECT mode when it is not naming an object to pick.
@@ -74,6 +96,35 @@ const COMMAND_TABLE = [
   [/\b(back|backward|further|away)\b/, "transform:back", "back"],
   [/\b(reset|recenter|centre|center)\b/, "transform:reset", "reset"],
 
+  // ---- material / colour (ported from the main branch) -------------------
+  // A colour name only counts as a command when the user says what to do with
+  // it, so "make it red" is a colour but a stray "red" in other speech is not.
+  [/\b(color|colour|paint|make|turn)\b.*\b(red|crimson)\b/, "color:red", "color red"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(orange|amber)\b/, "color:orange", "color orange"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(gold|yellow)\b/, "color:gold", "color gold"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(green|emerald)\b/, "color:green", "color green"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(cyan|teal)\b/, "color:cyan", "color cyan"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(blue|azure)\b/, "color:blue", "color blue"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(purple|violet)\b/, "color:purple", "color purple"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(pink|rose)\b/, "color:pink", "color pink"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(white|silver)\b/, "color:white", "color white"],
+  [/\b(color|colour|paint|make|turn)\b.*\b(dark|graphite|black)\b/, "color:dark", "color dark"],
+  [/\b(wireframe|wire frame)\b/, "material:wireframe", "wireframe"],
+  [/\b(solid|shaded)\b/, "material:solid", "solid"],
+  [/\b(rough|matt|matte)\b/, "material:rough", "make it matte"],
+  [/\b(shine|shiny|metal|metallic|glossy)\b/, "material:metal", "make it metallic"],
+
+  // ---- view / environment (ported from the main branch) ------------------
+  [/\b(grid)\b/, "view:grid", "grid"],
+  [/\b(shadow|shadows)\b/, "view:shadows", "shadows"],
+  [/\b(auto rotate|auto-rotate|orbit|stop orbit)\b/, "view:orbit", "orbit"],
+  [/\b(isolate|solo)\b/, "view:isolate", "isolate"],
+  [/\b(focus|center on|centre on)\b/, "view:focus", "focus"],
+  [/\b(clear selection|deselect)\b/, "view:deselect", "deselect"],
+  [/\b(panels|sidebars|toggle panels)\b/, "view:panels", "panels"],
+  [/\b(fullscreen|full screen)\b/, "view:fullscreen", "fullscreen"],
+
+
   // ---- models / animation -----------------------------------------------
   [/\b(play|start|resume)\b.*\b(animation|clip)\b/, "anim:play", "play animation"],
   [/\b(pause|stop)\b.*\b(animation|clip)\b/, "anim:pause", "pause animation"],
@@ -93,6 +144,9 @@ const COMMAND_TABLE = [
 function normalise(text) {
   return String(text || "")
     .toLowerCase()
+    // Turn "40%" into "40 percent" before stripping punctuation, otherwise the
+    // percentage form of the explode command loses its unit and stops matching.
+    .replace(/(\d)\s*%/g, "$1 percent")
     .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();

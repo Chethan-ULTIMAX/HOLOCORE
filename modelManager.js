@@ -851,6 +851,105 @@ export class Workspace {
   }
 
   /* ===================================================================== */
+  /* MATERIALS                                                             */
+  /* ===================================================================== */
+
+  /**
+   * Apply material changes to a part.
+   *
+   * Ported from the `main` branch, which grew this for its voice colour
+   * commands and inspector sliders. It walks every mesh under the part because
+   * a part can be a Group, and tolerates multi-material meshes.
+   *
+   * Playground objects live in the playground module rather than the assembly,
+   * so they are resolved first by id.
+   */
+  setPartMaterial(partId, options = {}) {
+    const target = this.getPart(partId) || this.getAnyMesh(partId);
+    if (!target) return false;
+
+    target.traverse(child => {
+      if (!child.isMesh || !child.material) return;
+      const materials = Array.isArray(child.material) ? child.material : [child.material];
+      for (const material of materials) {
+        if (options.color !== undefined &&
+            (typeof options.color === "string" || typeof options.color === "number")) {
+          material.color?.set(options.color);
+        }
+        if (options.roughness !== undefined && "roughness" in material) {
+          material.roughness = THREE.MathUtils.clamp(options.roughness, 0, 1);
+        }
+        if (options.metalness !== undefined && "metalness" in material) {
+          material.metalness = THREE.MathUtils.clamp(options.metalness, 0, 1);
+        }
+        if (options.wireframe !== undefined && "wireframe" in material) {
+          material.wireframe = Boolean(options.wireframe);
+        }
+        if (options.opacity !== undefined) {
+          material.opacity = THREE.MathUtils.clamp(options.opacity, 0.1, 1);
+          material.transparent = material.opacity < 1;
+        }
+        material.needsUpdate = true;
+      }
+    });
+    return true;
+  }
+
+  /**
+   * Resolve any mesh in the scene by id, not just documented assembly parts.
+   * Playground objects are attached by main.js, so this keeps material edits
+   * working for them without the renderer knowing about the playground.
+   */
+  getAnyMesh(partId) {
+    if (!partId) return null;
+    let found = null;
+    this.scene.traverse(object => {
+      if (found || !object.isMesh) return;
+      if (object.userData?.partId === partId) found = object;
+    });
+    return found;
+  }
+
+  /** Toggle wireframe for one part, or the whole scene when no id is given. */
+  toggleWireframe(partId = null) {
+    if (partId) {
+      const current = this.getPartMaterial(partId);
+      if (!current) return false;
+      const next = !current.wireframe;
+      this.setPartMaterial(partId, { wireframe: next });
+      return next;
+    }
+    let anyWire = false;
+    this.scene.traverse(child => {
+      if (child.isMesh && child.material?.wireframe) anyWire = true;
+    });
+    const target = !anyWire;
+    for (const part of this.parts) {
+      this.setPartMaterial(part.userData?.partId, { wireframe: target });
+    }
+    return target;
+  }
+
+  /** Read back the first material found on a part, for the inspector. */
+  getPartMaterial(partId) {
+    const target = this.getPart(partId) || this.getAnyMesh(partId);
+    if (!target) return null;
+    let found = null;
+    target.traverse(child => {
+      if (found || !child.isMesh || !child.material) return;
+      found = Array.isArray(child.material) ? child.material[0] : child.material;
+    });
+    if (!found) return null;
+    return {
+      color: `#${found.color?.getHexString?.() ?? "ffffff"}`,
+      roughness: found.roughness ?? 0.5,
+      metalness: found.metalness ?? 0.5,
+      wireframe: Boolean(found.wireframe),
+      opacity: found.opacity ?? 1
+    };
+  }
+
+  /* ===================================================================== */
   /* EXTERNAL GLB / GLTF                                                   */
   /* ===================================================================== */
 

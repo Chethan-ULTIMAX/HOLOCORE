@@ -22,7 +22,8 @@ import {
 import { HandOverlay } from "./handOverlay.js";
 import { HandSkeleton3D } from "./handSkeleton3d.js";
 import { Playground, PRIMITIVES } from "./playground.js";
-import { VoiceControl, VOICE_STATUS } from "./voiceControl.js";
+import { chimes } from "./chimes.js";
+import { VoiceControl, VOICE_STATUS, COLOR_PALETTE } from "./voiceControl.js";
 import { MODES, getMode, isMode, instructionFor } from "./interactionModes.js";
 import { landmarkToNdc, landmarkToStage, coverFit } from "./handGeometry.js";
 import { ComponentInspector } from "./componentInspector.js";
@@ -1457,6 +1458,13 @@ function processHands(now) {
   // selection paths: without the prop branch, a pinch over a spawned cube did
   // nothing at all and the gesture fell through to the assembly.
   const pinching = activeStates.some(hand => hand?.pinched);
+
+  // A short latch on grab and a soft lift on release. This is the audio half of
+  // the gesture feedback, ported from main, and it is what makes a pinch feel
+  // like it landed rather than merely registering.
+  if (pinching && !state.wasPinching) chimes().play("grab");
+  else if (!pinching && state.wasPinching) chimes().play("release");
+  state.wasPinching = pinching;
   if ((state.mode === "move" || state.mode === "rotate") && state.pointerTarget && pinching) {
     if (state.pointerKind === "prop") {
       if (playground?.selectedId !== state.pointerTarget) {
@@ -1933,6 +1941,7 @@ function addPlaygroundPrimitive(kind) {
   if (!scene3d) return null;
   const prop = scene3d.addPrimitive(kind);
   if (!prop) return null;
+  chimes().play("spawn");
   refreshSceneOutliner();
   updateObjectHud();
   return prop;
@@ -2174,6 +2183,7 @@ function handleVoiceIntent(intent, phrase) {
       return;
 
     case "transform":
+      if (value === "assemble") setExplodeAmount(0);
       applyVoiceTransform(value);
       return;
 
@@ -2195,6 +2205,66 @@ function handleVoiceIntent(intent, phrase) {
     case "model":
       switchModel(value);
       return;
+
+    case "color": {
+      const hex = COLOR_PALETTE[value];
+      if (!hex) return;
+      const prop = playground?.get?.();
+      const partId = state.partId;
+      if (prop) {
+        playground.setColor(prop.id, hex);
+      } else if (partId) {
+        workspace?.setPartMaterial?.(partId, { color: hex });
+      } else if (workspace) {
+        // Nothing selected: recolour the whole assembly, as `main` did.
+        for (const part of workspace.parts) {
+          workspace.setPartMaterial?.(part.partId ?? part.userData?.partId, { color: hex });
+        }
+      }
+      inspector?.updateProperties?.();
+      toast(`Colour: ${value.toUpperCase()}`, "accent", 1600);
+      return;
+    }
+
+    case "material": {
+      const prop = playground?.get?.();
+      if (value === "wireframe" || value === "solid") {
+        const target = value === "wireframe";
+        const next = workspace?.toggleWireframe?.(state.partId || null);
+        if (prop) playground.setWireframe(prop.id, target);
+        toast(`Wireframe ${(next ?? target) ? "ON" : "OFF"}`, "accent", 1600);
+      }
+      if (value === "rough" || value === "metal") {
+        const options = value === "rough"
+          ? { roughness: 0.95, metalness: 0.05 }
+          : { roughness: 0.15, metalness: 0.95 };
+        if (prop) playground.setMaterial(prop.id, options);
+        else if (state.partId) workspace?.setPartMaterial?.(state.partId, options);
+        toast(value === "rough" ? "Matte finish" : "Metallic finish", "accent", 1600);
+      }
+      inspector?.updateProperties?.();
+      return;
+    }
+
+    case "view":
+      if (value === "grid") store.update("view", { grid: !settings.view.grid });
+      if (value === "shadows") store.update("view", { shadows: !settings.view.shadows });
+      if (value === "orbit") store.update("view", { autoRotate: !settings.view.autoRotate });
+      if (value === "isolate") toggleIsolate();
+      if (value === "focus") workspace?.focusSelected();
+      if (value === "deselect") { playground?.select(null); workspace?.clearSelection(); }
+      if (value === "panels") {
+        setPanelState({ left: !settings.ui.leftOpen, right: !settings.ui.rightOpen });
+      }
+      if (value === "fullscreen") toggleFullscreen();
+      return;
+
+    case "explode": {
+      const amount = Number(String(phrase).match(/(\d{1,3})\s*(?:percent|%)?/)?.[1] ?? 0);
+      setExplodeAmount(amount);
+      toast(`Explode ${amount}%`, "accent", 1600);
+      return;
+    }
 
     case "env":
       if (value === "reset") resetEnvironment();
@@ -2709,6 +2779,13 @@ function applySettings({ section, keys } = {}) {
   const changed = key => all || !keys || keys.includes(key);
 
   if (!workspace) return;
+
+  // ---- Voice & audio cues ----
+  // Ported from main: both are user-controllable and persisted.
+  if (all || section === "voice") {
+    chimes().enabled = settings.voice?.soundEffects !== false;
+    if (settings.voice?.enabled === false && voice?.isListening) voice.stop();
+  }
 
   // ---- View ----
   if (all || section === "view" || section === "all") {

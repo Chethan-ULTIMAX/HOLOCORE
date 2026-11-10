@@ -62,6 +62,12 @@ export const DEFAULT_SETTINGS = {
     leftOpen: false,
     rightOpen: false,
     rightTab: "inspector"
+  },
+  // Ported from the `main` branch: voice recognition and its audio cues are
+  // user-controllable, and the preferences persist.
+  voice: {
+    enabled: true,
+    soundEffects: true
   }
 };
 

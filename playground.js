@@ -314,6 +314,72 @@ export class Playground {
   }
 
   /* --------------------------------------------------------------------- */
+  /* MATERIALS (voice colour commands, inspector controls)                 */
+  /* --------------------------------------------------------------------- */
+
+  /**
+   * Apply material options to one object.
+   *
+   * Ported from the main branch's workspace `setPartMaterial`, retargeted at
+   * playground props. Kept here rather than in the renderer because the props
+   * belong to this module and it owns their materials.
+   */
+  setMaterial(id, { color, roughness, metalness, wireframe, opacity } = {}) {
+    const prop = this.byId.get(id);
+    if (!prop) return false;
+    prop.group.traverse(child => {
+      if (!child.isMesh || !child.material) return;
+      const materials = Array.isArray(child.material) ? child.material : [child.material];
+      for (const material of materials) {
+        if (color !== undefined && material.color) material.color.set(color);
+        if (roughness !== undefined && "roughness" in material) {
+          material.roughness = Math.max(0, Math.min(1, roughness));
+        }
+        if (metalness !== undefined && "metalness" in material) {
+          material.metalness = Math.max(0, Math.min(1, metalness));
+        }
+        if (wireframe !== undefined && "wireframe" in material) {
+          material.wireframe = Boolean(wireframe);
+        }
+        if (opacity !== undefined) {
+          material.opacity = Math.max(0.1, Math.min(1, opacity));
+          material.transparent = material.opacity < 1;
+        }
+        material.needsUpdate = true;
+      }
+    });
+    return true;
+  }
+
+  /** Convenience wrapper used by the "color …" voice command. */
+  setColor(id, color) {
+    return this.setMaterial(id, { color });
+  }
+
+  setWireframe(id, wireframe) {
+    return this.setMaterial(id, { wireframe });
+  }
+
+  /** Read back the first material, so the inspector can show live values. */
+  getMaterial(id) {
+    const prop = this.byId.get(id);
+    if (!prop) return null;
+    let found = null;
+    prop.group.traverse(child => {
+      if (found || !child.isMesh || !child.material) return;
+      found = Array.isArray(child.material) ? child.material[0] : child.material;
+    });
+    if (!found) return null;
+    return {
+      color: `#${found.color?.getHexString?.() ?? "ffffff"}`,
+      roughness: found.roughness ?? 0.5,
+      metalness: found.metalness ?? 0.5,
+      wireframe: Boolean(found.wireframe),
+      opacity: found.opacity ?? 1
+    };
+  }
+
+  /* --------------------------------------------------------------------- */
   /* TRANSFORMS (driven by hand gestures and keyboard)                     */
   /* --------------------------------------------------------------------- */
 
