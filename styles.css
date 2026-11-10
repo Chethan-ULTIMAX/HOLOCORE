@@ -2602,3 +2602,112 @@ body.is-interacting .stage-keys { opacity: 0; }
   opacity: 0.95;
   transform: scale(1.18);
 }
+
+/* ==========================================================================
+   MATERIAL CONTROLS (inspector)
+   Ported from the main branch's .prop-* block, retuned to the glass theme.
+   ========================================================================== */
+
+.prop-color-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 10px;
+}
+
+.prop-color-input {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid rgba(120, 210, 255, 0.28);
+  border-radius: 9px;
+  background: transparent;
+  cursor: pointer;
+  flex: none;
+}
+
+.prop-color-input::-webkit-color-swatch-wrapper { padding: 2px; }
+.prop-color-input::-webkit-color-swatch {
+  border: none;
+  border-radius: 6px;
+}
+
+.prop-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.prop-swatch {
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 5px;
+  cursor: pointer;
+  transition: transform 0.14s ease, box-shadow 0.14s ease;
+}
+
+.prop-swatch:hover {
+  transform: scale(1.18);
+  box-shadow: 0 0 10px -1px currentColor;
+}
+
+.prop-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.prop-switch-label {
+  padding: 5px 0;
+  cursor: pointer;
+}
+
+.prop-switch-label input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: #38d6ff;
+  cursor: pointer;
+}
+
+.prop-sliders { margin-top: 8px; display: grid; gap: 9px; }
+
+.prop-slider-item { display: grid; gap: 3px; }
+
+.prop-label {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 8.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: rgba(190, 220, 240, 0.6);
+}
+
+.prop-val {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 9px;
+  color: #8ce9ff;
+}
+
+.prop-slider-input {
+  width: 100%;
+  height: 3px;
+  accent-color: #38d6ff;
+  cursor: pointer;
+}
+
+/* Object panel header for selections with no engineering entry (playground
+   props, imported meshes). Matches the documented-part header. */
+.inspector-kind {
+  display: inline-block;
+  margin-top: 3px;
+  padding: 2px 7px;
+  border: 1px solid rgba(120, 210, 255, 0.28);
+  border-radius: 999px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 7.5px;
+  letter-spacing: 0.11em;
+  color: rgba(150, 225, 255, 0.85);
+  background: rgba(56, 189, 248, 0.1);
+}

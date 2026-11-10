@@ -303,6 +303,7 @@ function setupChrome() {
   inspector = new ComponentInspector({
     root: dom.inspectorRoot,
     getWorkspace: () => workspace,
+    getPlayground: () => playground,
     onFocus: () => {
       workspace?.focusSelected();
       if (workspace) toast("Camera focused on the selected component", "accent", 2000);
@@ -3264,6 +3265,12 @@ window.HOLOCORE = {
     pointerTargets: () => ({ target: state.pointerTarget, kind: state.pointerKind }),
     selectProp,
     updateGestureLabels,
+    // Re-render the inspector so material controls match the current selection.
+    refreshInspector: () => {
+      const prop = playground?.get?.();
+      inspector?.setModel?.(state.modelId);
+      inspector?.select?.(prop ? `prop:${prop.id}` : state.partId);
+    },
     // Drives the real per-frame hand pipeline with supplied landmarks, so the
     // tracking loop can be exercised without a camera.
     processHands

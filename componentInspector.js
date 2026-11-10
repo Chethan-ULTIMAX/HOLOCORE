@@ -13,8 +13,10 @@ import {
   DATA_PROVENANCE
 } from "./engineeringData.js";
 
+import { COLOR_PALETTE } from "./voiceControl.js";
+
 export class ComponentInspector {
-  constructor({ root, onFocus, onIsolate, onShowRelated, onAsk, onClear, getWorkspace }) {
+  constructor({ root, onFocus, onIsolate, onShowRelated, onAsk, onClear, getWorkspace, getPlayground }) {
     this.root = root;
     this.onFocus = onFocus || (() => {});
     this.onIsolate = onIsolate || (() => {});
@@ -22,6 +24,9 @@ export class ComponentInspector {
     this.onAsk = onAsk || (() => {});
     this.onClear = onClear || (() => {});
     this.getWorkspace = getWorkspace || (() => null);
+    // The playground is optional: the inspector works without it, it just has
+    // no prop materials to edit.
+    this.getPlayground = getPlayground || (() => null);
 
     this.modelId = null;
     this.partId = null;
@@ -51,6 +56,22 @@ export class ComponentInspector {
     this._render();
   }
 
+  /**
+   * Refresh live values after the scene changed underneath us.
+   *
+   * A full re-render would steal focus from a slider mid-drag, so this only
+   * updates the readouts. Called when a hand gesture moves the object.
+   */
+  updateProperties() {
+    const material = this._currentMaterial?.();
+    if (!material) return;
+    const readouts = this.root?.querySelectorAll?.(".prop-val") || [];
+    if (readouts.length >= 2) {
+      readouts[0].textContent = Number(material.roughness).toFixed(2);
+      readouts[1].textContent = Number(material.metalness).toFixed(2);
+    }
+  }
+
   /** Called after isolation toggles so buttons stay in sync. */
   setState({ isolated = false } = {}) {
     this._isolated = isolated;
@@ -62,6 +83,55 @@ export class ComponentInspector {
   _data() {
     if (!this.partId || !this.modelId) return null;
     return getComponentData(this.modelId, this.partId);
+  }
+
+  /** The playground object behind the current selection, if any. */
+  _selectedObject() {
+    const playground = this.getPlayground?.();
+    const propId = playground?.selectedId;
+    if (propId) return playground.byId?.get(propId) || null;
+    // An imported or spawn id that is not a documented assembly part.
+    if (!this.partId) return null;
+    if (this.modelId && getComponentData(this.modelId, this.partId)) return null;
+    const material = this.getWorkspace()?.getPartMaterial?.(this.partId);
+    return material ? { id: this.partId, name: this.partId, material } : null;
+  }
+
+  /** Panel for a selected object that has no engineering knowledge entry. */
+  _renderObjectPanel() {
+    const object = this._selectedObject();
+    if (!object) {
+      this._renderEmpty();
+      return;
+    }
+
+    const name = object.name || object.id;
+    const header = this._el("div", "inspector-header");
+    header.appendChild(this._el("h2", "inspector-title", String(name).toUpperCase()));
+    const kind = object.primitive ? "PRIMITIVE" : "OBJECT";
+    header.appendChild(this._el("span", "inspector-kind", kind));
+    this.root.appendChild(header);
+
+    const body = this._el("div", "inspector-body");
+    this.root.appendChild(body);
+
+    const geometry = this._el("section", "inspector-section");
+    geometry.appendChild(this._el("h3", "section-title", "Object"));
+    const grid = this._el("dl", "spec-grid");
+    grid.appendChild(this._el("dt", "", "Id"));
+    grid.appendChild(this._el("dd", "", object.id));
+    if (object.primitive) {
+      grid.appendChild(this._el("dt", "", "Type"));
+      grid.appendChild(this._el("dd", "", object.primitive));
+    }
+    geometry.appendChild(grid);
+    geometry.appendChild(
+      this._el("p", "provenance",
+        "Spawned object — no engineering knowledge entry. Material changes apply immediately.")
+    );
+    body.appendChild(geometry);
+
+    this._renderMaterials(body);
   }
 
   _el(tag, className, text) {
@@ -76,7 +146,15 @@ export class ComponentInspector {
     this.root.replaceChildren();
     const data = this._data();
 
+    // A selected object with no engineering entry (a playground prop, or an
+    // imported mesh) still gets a real panel: name, measured geometry and the
+    // material controls. Previously the inspector bailed out to the empty state,
+    // which is why the material section never appeared.
     if (!data) {
+      if (this._selectedObject()) {
+        this._renderObjectPanel();
+        return;
+      }
       this._renderEmpty();
       return;
     }
@@ -86,7 +164,10 @@ export class ComponentInspector {
     const body = this._el("div", "inspector-body");
     this.root.appendChild(body);
 
-    if (this.tab === "overview") this._renderOverview(body, data);
+    if (this.tab === "overview") {
+      this._renderOverview(body, data);
+      this._renderMaterials(body);
+    }
     else if (this.tab === "system") this._renderSystem(body, data);
     else if (this.tab === "learn") this._renderLearn(body, data);
 
@@ -205,6 +286,113 @@ export class ComponentInspector {
       for (const fact of data.facts) list.appendChild(this._el("li", "", fact));
       facts.appendChild(list);
     }
+  }
+
+  /**
+   * Live material controls for the selected object.
+   *
+   * Ported from the main branch: colour input, palette swatches, wireframe
+   * switch and roughness/metalness sliders. main applied these only to
+   * documented assembly parts; here the same panel drives a playground object
+   * when one is selected, because that is where users actually edit materials.
+   */
+  _renderMaterials(body) {
+    const ws = this.getWorkspace();
+    if (!ws) return;
+
+    const playground = this.getPlayground?.();
+    const propId = playground?.selectedId;
+    const material = propId
+      ? playground.getMaterial?.(propId)
+      : ws.getPartMaterial?.(this.partId);
+    if (!material) return;
+
+    const section = this._section(body, "Material");
+
+    // ---- colour ---------------------------------------------------------
+    const colourRow = this._el("div", "prop-color-row");
+    const colourInput = this._el("input", "prop-color-input");
+    colourInput.type = "color";
+    colourInput.value = material.color?.startsWith("#") ? material.color : "#3fd0ff";
+    colourInput.title = "Object colour";
+    colourInput.setAttribute("aria-label", "Object colour");
+    colourInput.addEventListener("input", () => {
+      this._applyMaterial({ color: colourInput.value });
+    });
+
+    const swatches = this._el("div", "prop-swatches");
+    for (const [name, hex] of Object.entries(COLOR_PALETTE)) {
+      const swatch = this._el("button", "prop-swatch");
+      swatch.type = "button";
+      swatch.style.background = hex;
+      swatch.title = name;
+      swatch.setAttribute("aria-label", `Colour: ${name}`);
+      swatch.addEventListener("click", () => {
+        colourInput.value = hex;
+        this._applyMaterial({ color: hex });
+      });
+      swatches.appendChild(swatch);
+    }
+    colourRow.append(colourInput, swatches);
+    section.appendChild(colourRow);
+
+    // ---- wireframe ------------------------------------------------------
+    const wireRow = this._el("label", "prop-row prop-switch-label");
+    wireRow.appendChild(this._el("span", "prop-label", "Wireframe"));
+    const wireInput = this._el("input", "");
+    wireInput.type = "checkbox";
+    wireInput.checked = Boolean(material.wireframe);
+    wireInput.addEventListener("change", () => {
+      this._applyMaterial({ wireframe: wireInput.checked });
+    });
+    wireRow.appendChild(wireInput);
+    section.appendChild(wireRow);
+
+    // ---- roughness / metalness ------------------------------------------
+    const sliders = this._el("div", "prop-sliders");
+    const addSlider = (label, key, value) => {
+      const item = this._el("div", "prop-slider-item");
+      const labelRow = this._el("div", "prop-row");
+      labelRow.appendChild(this._el("span", "prop-label", label));
+      const readout = this._el("span", "prop-val", Number(value).toFixed(2));
+      labelRow.appendChild(readout);
+
+      const input = this._el("input", "prop-slider-input");
+      input.type = "range";
+      input.min = "0";
+      input.max = "1";
+      input.step = "0.01";
+      input.value = String(value);
+      input.setAttribute("aria-label", label);
+      input.addEventListener("input", () => {
+        readout.textContent = Number(input.value).toFixed(2);
+        this._applyMaterial({ [key]: Number(input.value) });
+      });
+
+      item.append(labelRow, input);
+      sliders.appendChild(item);
+    };
+    addSlider("Roughness", "roughness", material.roughness);
+    addSlider("Metalness", "metalness", material.metalness);
+    section.appendChild(sliders);
+  }
+
+  /** The material of whatever is currently selected, or null. */
+  _currentMaterial() {
+    const playground = this.getPlayground?.();
+    const propId = playground?.selectedId;
+    if (propId) return playground.getMaterial?.(propId) || null;
+    if (!this.partId) return null;
+    return this.getWorkspace()?.getPartMaterial?.(this.partId) || null;
+  }
+
+  /** Route a material change to whichever thing is actually selected. */
+  _applyMaterial(options) {
+    const playground = this.getPlayground?.();
+    const propId = playground?.selectedId;
+    if (propId && playground.setMaterial?.(propId, options)) return true;
+    if (this.partId) return Boolean(this.getWorkspace()?.setPartMaterial?.(this.partId, options));
+    return false;
   }
 
   _renderSystem(body, data) {

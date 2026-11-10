@@ -928,6 +928,61 @@ api.tracker.worldLandmarks = [];
 api.setMode("select");
 gs.clear();
 
+section("5j · Material controls render and act on the selection");
+
+const inspPg = api.getPlayground();
+inspPg.clear();
+const inspCube = inspPg.addPrimitive("cube");
+inspPg.select(inspCube.id);
+api._internals.refreshInspector?.();
+
+const inspRoot = doc.getElementById("inspector-root") || doc.querySelector(".inspector");
+const swatches = doc.querySelectorAll(".prop-swatch");
+const colourInput = doc.querySelector(".prop-color-input");
+const sliders = doc.querySelectorAll(".prop-slider-input");
+const wireToggle = doc.querySelector(".prop-switch-label input[type=checkbox]");
+
+check("colour swatches are rendered", swatches.length >= 8, `${swatches.length}`);
+check("a colour picker is rendered", Boolean(colourInput));
+check("roughness and metalness sliders are rendered", sliders.length === 2,
+  `${sliders.length}`);
+check("a wireframe switch is rendered", Boolean(wireToggle));
+
+// Clicking a swatch must change the object's real material.
+const beforeColour = inspPg.getMaterial(inspCube.id).color;
+swatches[3]?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+const afterColour = inspPg.getMaterial(inspCube.id).color;
+check("a swatch recolours the selected object", afterColour !== beforeColour,
+  `${beforeColour} -> ${afterColour}`);
+
+// The roughness slider must reach the material.
+const roughSlider = [...sliders].find(sl => sl.getAttribute("aria-label") === "Roughness");
+if (roughSlider) {
+  roughSlider.value = "0.9";
+  roughSlider.dispatchEvent(new window.Event("input", { bubbles: true }));
+}
+check("the roughness slider reaches the material",
+  Math.abs(inspPg.getMaterial(inspCube.id).roughness - 0.9) < 0.01,
+  String(inspPg.getMaterial(inspCube.id).roughness));
+
+// The wireframe switch must reach the material.
+if (wireToggle) {
+  wireToggle.checked = true;
+  wireToggle.dispatchEvent(new window.Event("change", { bubbles: true }));
+}
+check("the wireframe switch reaches the material",
+  inspPg.getMaterial(inspCube.id).wireframe === true);
+
+// Voice colour must land on the same object.
+api.handleVoiceIntentForTest("color:red");
+check("the colour voice command recolours the selection",
+  inspPg.getMaterial(inspCube.id).color.toLowerCase().includes("ef4444") ||
+  inspPg.getMaterial(inspCube.id).color.toLowerCase() === "#ef4444",
+  inspPg.getMaterial(inspCube.id).color);
+
+inspPg.clear();
+api._internals.refreshInspector?.();
+
 section("6 · Modes still gate gestures");
 
 const modes = ["select", "move", "rotate", "scale", "explode"];
