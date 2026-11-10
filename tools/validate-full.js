@@ -728,6 +728,23 @@ for (const spec of alignCases) {
 
   const small = measure(0.04);
   const large = measure(0.12);
+  // The workspace tone-maps with ACES, which drags these overlay colours
+  // towards grey (#1ad1ff authored -> #5cbac4 out). The rig must opt out.
+  const probeRig = [...new (api.getHandSkeleton().constructor)({
+    scene: new THREE.Scene(), camera: cam, mirror: true
+  }).rigs.values()];
+  check("rig materials are created with a rig", probeRig.length === 0);
+
+  const sk2 = new (api.getHandSkeleton().constructor)({ scene, camera: cam, mirror: true });
+  sk2.update([[{ x: 0.5, y: 0.5, z: 0 }].concat(
+    Array.from({ length: 20 }, (_, i) => ({ x: 0.5 + i * 0.002, y: 0.5 + i * 0.002, z: 0 }))
+  )], [], ["Right"], {});
+  const rig2 = [...sk2.rigs.values()][0];
+  const rigMaterials = [rig2.jointMaterial, rig2.coreMaterial, rig2.boneMaterial, rig2.palmMaterial];
+  check("every skeleton material bypasses tone mapping",
+    rigMaterials.every(m => m.toneMapped === false),
+    rigMaterials.map(m => m.toneMapped).join(","));
+
   check("a hand twice the size in frame is drawn twice as large",
     Math.abs(large / small - 3) < 0.35, `${(large / small).toFixed(2)}x`);
 }

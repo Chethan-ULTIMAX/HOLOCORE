@@ -129,6 +129,12 @@ class HandRig {
     this.jointGeometry = new THREE.SphereGeometry(1, 14, 12);
     this.tipGeometry = new THREE.SphereGeometry(1, 16, 14);
 
+    // The workspace renders with ACES filmic tone mapping. Applied to these
+    // overlays it drags the authored cyan towards grey: #1ad1ff (saturation
+    // 0.90) comes out as #5cbac4 (0.53), and the hot cores flatten to
+    // near-white. The hands are a UI overlay, not scene-lit geometry, so they
+    // opt out of tone mapping and keep the colour that was authored — which is
+    // what makes the skeleton read as vivid rather than muted.
     this.jointMaterial = new THREE.MeshStandardMaterial({
       color: colours.ring,
       emissive: colours.emissive,
@@ -142,15 +148,21 @@ class HandRig {
     this.boneMaterial = new THREE.MeshBasicMaterial({
       color: colours.bone,
       transparent: true,
-      opacity: 0.62
+      opacity: 0.78
     });
     this.palmMaterial = new THREE.MeshBasicMaterial({
       color: colours.bone,
       transparent: true,
-      opacity: 0.14,
+      opacity: 0.16,
       side: THREE.DoubleSide,
       depthWrite: false
     });
+
+    for (const material of [
+      this.jointMaterial, this.coreMaterial, this.boneMaterial, this.palmMaterial
+    ]) {
+      material.toneMapped = false;
+    }
 
     this.joints = [];
     for (let i = 0; i < 21; i++) {

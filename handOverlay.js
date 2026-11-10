@@ -35,11 +35,15 @@ export const TIP_INDICES = [4, 8, 12, 16, 20];
  * glance without breaking that single-colour look.
  */
 const CYAN = {
-  bone: "rgba(64, 224, 255, 0.92)",
-  joint: "#8ef0ff",
+  // Kept at full authored vividness: this canvas is composited over the video
+  // by the browser, not through the WebGL renderer, so nothing tone-maps it.
+  // The 3D rigs are set to the same strength (toneMapped = false) so the two
+  // layers, when both are visible, read as one instrument.
+  bone: "rgba(34, 214, 255, 0.95)",
+  joint: "#7ceaff",
   tip: "#eafdff",
-  pointer: [64, 224, 255],
-  label: "#9beeff"
+  pointer: [34, 214, 255],
+  label: "#8ce9ff"
 };
 
 const HANDS = {
@@ -47,9 +51,9 @@ const HANDS = {
   Right: {
     ...CYAN,
     // A touch warmer so two hands are still distinguishable while grabbed.
-    bone: "rgba(96, 208, 255, 0.92)",
-    joint: "#a8e6ff",
-    label: "#b3ecff"
+    bone: "rgba(70, 200, 255, 0.95)",
+    joint: "#9cdfff",
+    label: "#a6e4ff"
   },
   Unknown: CYAN
 };
