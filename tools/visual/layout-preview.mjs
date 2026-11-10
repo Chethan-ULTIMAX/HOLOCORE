@@ -333,6 +333,19 @@ function drawLibraryBody(x, y, width) {
   ctx.fillStyle = "rgba(200,230,245,0.8)";
   ctx.textAlign = "center";
   ctx.fillText("IMPORT GLB / GLTF", inner + innerW / 2, cursor + 18);
+  cursor += 42;
+
+  // Clear-all sits directly under import, so the preview has to draw it too.
+  ctx.fillStyle = "rgba(16, 27, 39, 0.85)";
+  roundRect(inner, cursor, innerW, 36, 9);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(120, 210, 255, 0.24)";
+  roundRect(inner, cursor, innerW, 36, 9);
+  ctx.stroke();
+  ctx.fillStyle = "rgba(226, 244, 255, 0.9)";
+  ctx.font = "600 8.5px ui-monospace, monospace";
+  ctx.textAlign = "center";
+  ctx.fillText("CLEAR OBJECTS", inner + innerW / 2, cursor + 18);
   ctx.textAlign = "left";
   cursor += 42;
 
@@ -497,9 +510,13 @@ checks.push({
   ok: true,
   detail: "panels are absolutely positioned"
 });
+// Only a claim about the default rendering. With --drawers the panels are open
+// on purpose, and asserting they were closed made the flag always exit 1.
 checks.push({
-  name: "drawers default closed",
-  ok: workspaceEl.classList.contains("hide-left"),
+  name: wantDrawersOpen ? "drawers open on request" : "drawers default closed",
+  ok: wantDrawersOpen
+    ? !workspaceEl.classList.contains("hide-left") && !workspaceEl.classList.contains("hide-right")
+    : workspaceEl.classList.contains("hide-left") && workspaceEl.classList.contains("hide-right"),
   detail: workspaceEl.className
 });
 
@@ -521,8 +538,13 @@ checks.push({
   detail: overlayRule?.decls.position
 });
 
-writeFileSync(join(here, "layout-preview.png"), canvas.toBuffer("image/png"));
-console.log("wrote tools/visual/layout-preview.png");
+// One file per mode. Previously every mode wrote layout-preview.png, so
+// layout-drawers.png and layout-camera.png were whatever an old run left behind.
+const outName = cameraMode ? "layout-camera.png"
+  : wantDrawersOpen ? "layout-drawers.png"
+  : "layout-preview.png";
+writeFileSync(join(here, outName), canvas.toBuffer("image/png"));
+console.log(`wrote tools/visual/${outName}`);
 for (const c of checks) {
   console.log(`  ${c.ok ? "ok  " : "FAIL"}  ${c.name}${c.detail ? `  (${c.detail})` : ""}`);
 }
