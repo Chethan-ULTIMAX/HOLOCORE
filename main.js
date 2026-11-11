@@ -23,6 +23,7 @@ import { HandOverlay } from "./handOverlay.js";
 import { HandSkeleton3D } from "./handSkeleton3d.js";
 import { Playground, PRIMITIVES } from "./playground.js";
 import { chimes } from "./chimes.js";
+import { VIEW_LABELS } from "./cameraViews.js";
 import { VoiceControl, VOICE_STATUS, COLOR_PALETTE, parseCommand } from "./voiceControl.js";
 import { MODES, getMode, isMode, instructionFor } from "./interactionModes.js";
 import { landmarkToNdc, landmarkToStage, coverFit } from "./handGeometry.js";
@@ -98,6 +99,8 @@ const dom = {
   hudObjects: $("#hud-objects"),
   hudObjectName: $("#hud-object-name"),
   voiceChip: $("#voice-chip"),
+  viewCube: $("#view-cube"),
+  viewCubeLabel: $("#view-cube-label"),
   voiceState: $("#voice-state"),
   voicePhrase: $("#voice-phrase"),
   sceneOutliner: $("#scene-outliner"),
@@ -457,9 +460,16 @@ function boot() {
   }
 
   installGlErrorWatch(workspace);
+  // Standard-view controller. Safe to call here: it only touches the DOM and
+  // the workspace's camera API.
+  setupViewCube();
 
   // Scene-space hand skeletons: real geometry so hands can be occluded by the
   // model and share its lighting, which a 2D overlay can never do.
+  // Let the workspace frame a selected playground object: switching to Front
+  // with a prop at x=4 must centre the prop, not the model behind it.
+  workspace.onFramingTarget = () => playground?.get?.()?.group || null;
+
   skeleton3d = new HandSkeleton3D({
     scene: workspace.scene,
     camera: workspace.camera,
@@ -898,6 +908,59 @@ function renderImportedPartList() {
     });
     dom.partList.appendChild(button);
   });
+}
+
+/**
+ * Standard-view controller.
+ *
+ * Wires the seven faces, keyboard shortcuts and the active indicator. The
+ * workspace owns the maths; this only decides what the user asked for.
+ */
+function setupViewCube() {
+  if (!dom.viewCube || !workspace) return;
+
+  const faces = [...dom.viewCube.querySelectorAll("[data-view]")];
+  for (const face of faces) {
+    face.addEventListener("click", event => {
+      event.preventDefault();
+      setStandardView(face.dataset.view);
+    });
+  }
+
+  // Reflect whatever the camera is doing, including orbits the user performs
+  // by hand, so the indicator never lies about the current orientation.
+  workspace.onCameraChange = () => updateViewCube();
+
+  const shortcuts = { 1: "front", 2: "top", 3: "iso" };
+  dom.viewCube.dataset.shortcuts = JSON.stringify(shortcuts);
+  updateViewCube();
+}
+
+/** Switch to a standard view and keep the indicator in step. */
+function setStandardView(id) {
+  if (!workspace) return;
+  // If the pointer is over something, frame that; otherwise the model. The
+  // workspace resolves the same way, and this keeps the two in agreement.
+  const framed = workspace.setView(id, { animate: true, preferSelection: true });
+  if (!framed) return;
+  updateViewCube(framed);
+  const label = VIEW_LABELS[framed] || framed;
+  toast(`${label} view`, "", 1200);
+}
+
+/** Light the face matching the camera, or show FREE when orbiting. */
+function updateViewCube(pending = null) {
+  if (!dom.viewCube) return;
+  const active = pending || workspace?.activeView || null;
+  for (const face of dom.viewCube.querySelectorAll("[data-view]")) {
+    face.classList.toggle("is-active", face.dataset.view === active);
+    face.setAttribute("aria-pressed", String(face.dataset.view === active));
+  }
+  if (dom.viewCubeLabel) {
+    const label = active ? (VIEW_LABELS[active] || active).toUpperCase() : "FREE";
+    dom.viewCubeLabel.textContent = label;
+    dom.viewCubeLabel.classList.toggle("is-free", !active);
+  }
 }
 
 function toggleIsolate() {
@@ -3189,6 +3252,20 @@ function setupShortcuts() {
       case "v":
         event.preventDefault();
         toggleCameraView();
+        break;
+      // Standard views. Digits are taken by the interaction modes, so the
+      // view shortcuts are Shift+digit.
+      case "!":
+        event.preventDefault();
+        setStandardView("front");
+        break;
+      case "@":
+        event.preventDefault();
+        setStandardView("top");
+        break;
+      case "#":
+        event.preventDefault();
+        setStandardView("iso");
         break;
       case "m":
         // Voice: M for microphone, leaving V for the camera view.

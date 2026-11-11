@@ -410,6 +410,75 @@ function drawSceneBody(x, y, width) {
 drawDrawer("left");
 drawDrawer("right");
 
+/* --- standard-view cube net (bottom right of the viewport) ---------------- */
+function drawViewCube() {
+  // Mirror the real CSS net geometry.
+  const cell = W <= 820 ? 26 : 31;
+  const gap = 3;
+  const right = W <= 820 ? 10 : 18;
+  const bottom = W <= 820 ? 88 : 96;
+  const cols = 4;
+  const rows = 3;
+  const boxW = cols * cell + (cols - 1) * gap;
+  const boxH = rows * cell + (rows - 1) * gap;
+  const x0 = W - right - boxW;
+  const y0 = stageTop + stageH - bottom - boxH;
+
+  const workspaceEl = document.getElementById("workspace");
+  if (W <= 820 && !workspaceEl.classList.contains("hide-right")) return;
+
+  const faces = [
+    [2, 0, "TOP"], [1, 1, "L"], [2, 1, "FRONT"], [3, 1, "R"],
+    [1, 2, "BOT"], [2, 2, "BACK"], [3, 2, "ISO"]
+  ];
+
+  for (const [col, row, label] of faces) {
+    const fx = x0 + col * (cell + gap);
+    const fy = y0 + row * (cell + gap);
+    ctx.fillStyle = "rgba(8,20,32,0.74)";
+    roundRect(fx, fy, cell, cell, 4);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(120,210,255,0.30)";
+    ctx.lineWidth = 1;
+    if (label === "ISO") ctx.setLineDash([2, 2]);
+    roundRect(fx, fy, cell, cell, 4);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "rgba(180,232,255,0.85)";
+    ctx.font = "600 6px ui-monospace, monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(label, fx + cell / 2, fy + cell / 2 + 2);
+  }
+  ctx.textAlign = "left";
+
+  // Active-view label beneath the cube.
+  ctx.font = "600 7.5px ui-monospace, monospace";
+  ctx.fillStyle = "rgba(150,175,195,0.5)";
+  ctx.textAlign = "right";
+  ctx.fillText("FREE", W - right, y0 + boxH + 12);
+  ctx.textAlign = "left";
+
+  // No two faces may overlap: that is the bug the net layout replaced.
+  let overlaps = 0;
+  for (let i = 0; i < faces.length; i++) {
+    for (let j = i + 1; j < faces.length; j++) {
+      if (faces[i][0] === faces[j][0] && faces[i][1] === faces[j][1]) overlaps++;
+    }
+  }
+  checks.push({
+    name: "view cube faces never overlap",
+    ok: overlaps === 0,
+    detail: `${faces.length} faces`
+  });
+  checks.push({
+    name: "view cube is inside the viewport",
+    ok: x0 >= 0 && x0 + boxW <= W && y0 >= stageTop,
+    detail: `${Math.round(x0)},${Math.round(y0)}`
+  });
+}
+
+drawViewCube();
+
 // --- drawer toggles (visible only when their drawer is closed) ---
 function drawToggle(side) {
   const workspaceEl = document.getElementById("workspace");

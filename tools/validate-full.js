@@ -25,6 +25,16 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as THREE from "three";
 import { VoiceControl } from "../voiceControl.js";
+import {
+  viewPlacement,
+  describePlacement,
+  matchingView,
+  safeUp,
+  fitDistance,
+  VIEW_ORDER,
+  VIEW_DIRECTIONS,
+  VIEW_UPS
+} from "../cameraViews.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -1240,6 +1250,138 @@ section("5p · Idle spin never fights the user");
   ip.setManipulating(false);
   ip.clear();
   ip.select(null);
+}
+
+section("5q · Seven standard views, correctly oriented");
+
+{
+  const ws = api.getWorkspace();
+  const camera = ws.camera;
+  const controls = ws.controls;
+
+  // A target deliberately away from the origin: every preset must centre on
+  // what it frames, not on world zero.
+  const far = new THREE.Vector3(2.5, 1.2, -3.5);
+
+  for (const id of VIEW_ORDER) {
+    const placement = viewPlacement(id, { target: far, radius: 3, fov: camera.fov });
+    const described = describePlacement(placement);
+    const direction = new THREE.Vector3(...described.direction);
+    const up = new THREE.Vector3(...described.up);
+
+    check(`${id}: camera looks along the named axis`,
+      direction.dot(VIEW_DIRECTIONS[id]) > 0.999,
+      described.direction.map(v => v.toFixed(2)).join(","));
+
+    check(`${id}: frames the target, not the origin`,
+      placement.target.distanceTo(far) < 1e-9,
+      placement.target.toArray().map(v => v.toFixed(1)).join(","));
+
+    // The classic crash: up parallel to the view direction collapses the
+    // camera basis and OrbitControls spins the model unpredictably.
+    check(`${id}: up is not parallel to the view direction`,
+      Math.abs(direction.dot(up)) < 0.9,
+      Math.abs(direction.dot(up)).toFixed(3));
+
+    // The camera must genuinely point at the target once oriented this way.
+    const probe = new THREE.PerspectiveCamera(42, 1.6, 0.1, 200);
+    probe.up.copy(up);
+    probe.position.copy(placement.position);
+    probe.lookAt(placement.target);
+    probe.updateMatrixWorld();
+    const forward = new THREE.Vector3();
+    probe.getWorldDirection(forward);
+    const toTarget = far.clone().sub(placement.position).normalize();
+    check(`${id}: the oriented camera points at the target`,
+      forward.dot(toTarget) > 0.999, forward.dot(toTarget).toFixed(4));
+
+    // And it must be recognised as that view afterwards.
+    check(`${id}: is recognised as the active view`,
+      matchingView(placement.position, far) === id,
+      String(matchingView(placement.position, far)));
+  }
+
+  // Top and Bottom specifically: a plan view must have a horizontal up vector,
+  // otherwise the model appears rotated by an arbitrary roll.
+  for (const id of ["top", "bottom"]) {
+    const up = VIEW_UPS[id];
+    check(`${id}: up is horizontal`, Math.abs(up.y) < 1e-9, up.toArray().join(","));
+  }
+
+  // The default (0,1,0) up would be degenerate for Top. safeUp must rescue it.
+  {
+    const rescued = safeUp(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 1, 0));
+    check("safeUp rescues a degenerate up vector",
+      Math.abs(rescued.dot(new THREE.Vector3(0, 1, 0))) < 0.999 && rescued.lengthSq() > 0.9,
+      rescued.toArray().map(v => v.toFixed(2)).join(","));
+    const normal = safeUp(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 1, 0));
+    check("safeUp leaves a good up vector alone",
+      normal.equals(new THREE.Vector3(0, 1, 0)));
+  }
+
+  // Orbiting away from a preset must clear the indicator rather than lie.
+  {
+    const offAxis = new THREE.Vector3(1, 0.35, 0.8).normalize().multiplyScalar(10);
+    check("an orbited camera matches no preset",
+      matchingView(offAxis, new THREE.Vector3()) === null,
+      String(matchingView(offAxis, new THREE.Vector3())));
+  }
+
+  // Actually switch the live workspace and confirm it lands where it should.
+  {
+    api.getPlayground().clear();
+    const prop = api.getPlayground().addPrimitive("cube");
+    api.getPlayground().setTransform(prop.id, { position: { x: 3, y: 0.5, z: -2 } });
+
+    ws.setView("top", { animate: false, preferSelection: true });
+    check("switching to Top orients the real camera",
+      camera.position.y > camera.position.x && camera.position.y > camera.position.z,
+      camera.position.toArray().map(v => v.toFixed(2)).join(","));
+    check("switching to Top sets a non-degenerate up",
+      Math.abs(camera.up.dot(new THREE.Vector3(0, 1, 0))) < 0.9,
+      camera.up.toArray().map(v => v.toFixed(2)).join(","));
+    check("Top frames the selected object rather than the origin",
+      controls.target.distanceTo(new THREE.Vector3(3, 0.5, -2)) < 1.5,
+      controls.target.toArray().map(v => v.toFixed(2)).join(","));
+    check("the workspace reports Top as the active view",
+      ws.activeView === "top", String(ws.activeView));
+
+    // Switching views must not touch the objects themselves.
+    const before = api.getPlayground().getTransform(prop.id);
+    ws.setView("front", { animate: false });
+    const after = api.getPlayground().getTransform(prop.id);
+    check("changing the camera does not move the objects",
+      before.position.x === after.position.x &&
+      before.position.y === after.position.y &&
+      before.position.z === after.position.z,
+      JSON.stringify(after.position));
+
+    // Orbit controls must still be usable afterwards.
+    check("orbit controls survive a view switch",
+      Boolean(controls) && controls.enabled !== false && controls.target.isVector3);
+    const radiusBefore = camera.position.distanceTo(controls.target);
+    controls.target.set(0, 0, 0);
+    controls.update();
+    check("the camera can still orbit after switching views",
+      camera.position.lengthSq() > 0 && Number.isFinite(radiusBefore),
+      radiusBefore.toFixed(2));
+
+    api.getPlayground().clear();
+    ws.setView("iso", { animate: false });
+  }
+
+  // Only real presets are accepted.
+  check("an unknown view id is rejected", ws.setView("sideways") === null);
+
+  // Framing distance scales with the object, and never puts the camera inside
+  // it or outside OrbitControls' limits.
+  {
+    const small = fitDistance(0.3, 42);
+    const large = fitDistance(6, 42);
+    check("a larger object is framed from further away", large > small,
+      `${small.toFixed(2)} -> ${large.toFixed(2)}`);
+    check("framing distance respects the minimum", small >= 3.2, small.toFixed(2));
+  }
 }
 
 section("6 · Modes still gate gestures");

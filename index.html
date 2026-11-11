@@ -241,6 +241,28 @@
           <span class="reticle-label" id="reticle-label"></span>
         </div>
 
+        <!-- Standard-view controller: a compact cube net. Clicking a face puts
+             the camera on that axis. Laid out as a cross so every face is its
+             own hit target — an overlaid 3D cube put buttons on top of each
+             other. -->
+        <div class="view-cube" id="view-cube" role="group" aria-label="Standard camera views">
+          <button class="view-face is-top" data-view="top" title="Top view · Shift+2"
+                  aria-label="Top view" aria-pressed="false">TOP</button>
+          <button class="view-face is-left" data-view="left" title="Left view"
+                  aria-label="Left view" aria-pressed="false">L</button>
+          <button class="view-face is-front" data-view="front" title="Front view · Shift+1"
+                  aria-label="Front view" aria-pressed="false">FRONT</button>
+          <button class="view-face is-right" data-view="right" title="Right view"
+                  aria-label="Right view" aria-pressed="false">R</button>
+          <button class="view-face is-bottom" data-view="bottom" title="Bottom view"
+                  aria-label="Bottom view" aria-pressed="false">BOT</button>
+          <button class="view-face is-back" data-view="back" title="Back view"
+                  aria-label="Back view" aria-pressed="false">BACK</button>
+          <button class="view-face is-iso" data-view="iso" title="Isometric view · Shift+3"
+                  aria-label="Isometric view" aria-pressed="false">ISO</button>
+        </div>
+        <div class="view-cube-label is-free" id="view-cube-label" aria-live="polite">FREE</div>
+
         <!-- Click-to-select hint shown when nothing has been selected yet -->
         <div class="viewport-hint" id="viewport-hint">
           <span class="kbd">DRAG</span> orbit
