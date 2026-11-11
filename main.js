@@ -24,6 +24,8 @@ import { HandSkeleton3D } from "./handSkeleton3d.js";
 import { Playground, PRIMITIVES } from "./playground.js";
 import { chimes } from "./chimes.js";
 import { VIEW_LABELS } from "./cameraViews.js";
+import { HandDepthRegistry } from "./handDepth.js";
+import { OneEuroFilter } from "./gestures.js";
 import { VoiceControl, VOICE_STATUS, COLOR_PALETTE, parseCommand } from "./voiceControl.js";
 import { MODES, getMode, isMode, instructionFor } from "./interactionModes.js";
 import { landmarkToNdc, landmarkToStage, coverFit } from "./handGeometry.js";
@@ -217,6 +219,9 @@ const state = {
   gizmoDrag: false,
   handGizmo: null,
   gizmoHintShown: false,
+  /** Hands-free depth: latest reading, and the Z the gesture started from. */
+  depth: null,
+  depthStart: null,
   /** Full-workspace camera vs. small preview card. */
   cameraView: "workspace",
   /** True while the workspace video element is actually showing frames. */
@@ -1506,6 +1511,14 @@ const solver = new ManipulationSolver({
 });
 
 /**
+ * Per-hand depth state. Two hands must not share a reference size, so this is a
+ * registry keyed by hand rather than a single value.
+ */
+const depthRegistry = new HandDepthRegistry({
+  makeFilter: () => new OneEuroFilter({ minCutoff: 1.1, beta: 0.02 })
+});
+
+/**
  * The rectangle the camera image is displayed in. In workspace mode that is the
  * viewport itself; in preview mode it is the small card. This is the box the
  * landmark mapping must use, and it must match the CSS exactly.
@@ -1726,6 +1739,10 @@ function processHands(now) {
   const solverPointer = pointerHand
     ? landmarkNdc(pointerHand.indexTip || pointerHand.pinch)
     : null;
+
+  // ---- hands-free depth --------------------------------------------------
+  // Runs after the gizmo so the Z handle exists before travel is applied.
+  updateHandDepth(now / 1000);
 
   // A pinch that lands on a gizmo handle drags that handle, and only that
   // handle: doing this before the solver is what stops a handle grab from also
@@ -2087,6 +2104,71 @@ function projectedTarget() {
  * then reports a cumulative world delta, which is applied to the transform
  * captured at pinch time.
  */
+/**
+ * Hands-free depth.
+ *
+ * Two things have to hold for this to be safe:
+ *   - a handle exists to move along (the Z handle of the gizmo), so depth travel
+ *     is expressed as a normal gizmo delta and cannot drift off-axis; and
+ *   - the pose is held deliberately (see handDepth.js), so it cannot fire while
+ *     the user is pinching or pointing at something.
+ *
+ * The palm-size ratio is smoothed, dead-zoned and clamped, so slow drift of the
+ * hand and noise in the size estimate do not push the object around.
+ */
+function updateHandDepth(now) {
+  if (!workspace?.gizmo || !playground?.selectedId) {
+    depthRegistry.reset();
+    state.depth = null;
+    return null;
+  }
+
+  const hand = overlayHands?.[0]?.state;
+  if (!hand) {
+    depthRegistry.reset();
+    state.depth = null;
+    return null;
+  }
+
+  const settings = store.get?.() || {};
+  const result = depthRegistry.update(hand.key || "hand-0", hand, now, {
+    sensitivity: settings.object?.depthSensitivity ?? 1,
+    invert: Boolean(settings.object?.depthInvert)
+  });
+  state.depth = result;
+
+  // Capture the starting Z the first frame travel begins, so depth is applied to
+  // a fixed reference rather than accumulating frame by frame.
+  if (result.active) {
+    if (!state.depthStart) {
+      const prop = playground.byId.get(playground.selectedId);
+      const pos = prop ? playground.getTransform(prop.id).position : null;
+      if (pos) state.depthStart = { x: pos.x, y: pos.y, z: pos.z };
+    }
+  } else {
+    state.depthStart = null;
+  }
+
+  if (!result?.active || !result.engaged) return result;
+
+  // Apply the travel as a Z-handle drag. The gizmo's drag machinery already
+  // converts a delta into a constrained one, so depth stays on Z.
+  const prop = playground.byId.get(playground.selectedId);
+  if (!prop) return result;
+
+  const base = state.depthStart;
+  if (!base) return result;
+
+  const position = {
+    x: base.x,
+    y: base.y,
+    z: clamp(base.z + result.travel, -STAGE_BOUNDS.z, STAGE_BOUNDS.z)
+  };
+  playground.setTransform(prop.id, { position });
+  updateObjectHud?.();
+  return result;
+}
+
 function handleHandGizmo(pinching, ndc) {
   if (!workspace?.beginGizmoDrag || !ndc) {
     if (state.handGizmo) {

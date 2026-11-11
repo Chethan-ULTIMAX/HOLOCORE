@@ -1,3 +1,7 @@
+import * as THREE from "three";
+import { DragPlane } from "./dragPlane.js";
+import { palmSpan } from "./handCoordinates.js";
+
 /**
  * HOLOCORE — gestures.js
  * -----------------------------------------------------------------------------
@@ -360,6 +364,9 @@ export class HandAnalyzer {
       indexTip: tip,
       palm,
       axis: handAxis(landmarks),
+      // Apparent palm span. Used as a *relative* depth signal by handDepth.js:
+      // a hand held closer appears larger. Never treated as an absolute distance.
+      size: palmSpan(landmarks),
       scale: palmScale(landmarks),
       extensions: ext,
       pointing: pointingConfidence(landmarks),
@@ -392,8 +399,6 @@ export function describeGesture(hand, handsCount) {
   return "Tracking";
 }
 
-import * as THREE from "three";
-import { DragPlane } from "./dragPlane.js";
 
 /* ------------------------------------------------------------------------- */
 /* MANIPULATION SOLVER                                                       */

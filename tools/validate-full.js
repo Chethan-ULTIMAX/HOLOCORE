@@ -27,6 +27,12 @@ import * as THREE from "three";
 import { VoiceControl } from "../voiceControl.js";
 import { ManipulationSolver } from "../gestures.js";
 import {
+  ratioToTravel,
+  HandDepthTracker,
+  HandDepthRegistry,
+  DEPTH_MODE
+} from "../handDepth.js";
+import {
   constrainDelta,
   axisParameter,
   AXIS_VECTORS,
@@ -1729,6 +1735,139 @@ section("5s · Translation gizmo");
     check("the gizmo lives at the scene root, not inside the model", count === 1, String(count));
     gs.clear();
     ws.setGizmo(null);
+  }
+}
+
+section("5t · Depth is calibrated, not guessed");
+
+{
+  // ---- the transfer function --------------------------------------------
+  check("no size change means no depth travel",
+    ratioToTravel(1).travel === 0 && ratioToTravel(1).engaged === false);
+
+  // The dead zone must be a plateau, not a step: sitting just inside it and just
+  // outside must not produce a visible jump.
+  {
+    const inside = ratioToTravel(1 + DEPTH_MODE.deadZone * 0.9);
+    const edge = ratioToTravel(1 + DEPTH_MODE.deadZone * 1.01);
+    check("the dead zone absorbs jitter", inside.travel === 0 && inside.engaged === false);
+    check("leaving the dead zone does not jump",
+      Math.abs(edge.travel) < 0.3,
+      edge.travel.toFixed(3));
+  }
+
+  // Monotonic in both directions, and symmetric about 1.
+  {
+    const near = ratioToTravel(1.3).travel;
+    const nearer = ratioToTravel(1.6).travel;
+    const far = ratioToTravel(0.7).travel;
+    const farther = ratioToTravel(0.4).travel;
+    check("a larger hand moves the object one way, monotonically",
+      near > 0 && nearer > near, `${near.toFixed(2)} -> ${nearer.toFixed(2)}`);
+    check("a smaller hand moves it the other way, monotonically",
+      far < 0 && farther < far, `${far.toFixed(2)} -> ${farther.toFixed(2)}`);
+    check("depth is symmetric about the reference",
+      Math.abs(ratioToTravel(0.75).travel + ratioToTravel(1.25).travel) < 1e-9);
+  }
+
+  check("depth travel is clamped",
+    Math.abs(ratioToTravel(50).travel) <= DEPTH_MODE.maxTravel + 1e-9,
+    String(ratioToTravel(50).travel));
+  check("depth sensitivity scales travel",
+    Math.abs(ratioToTravel(1.3, { sensitivity: 2 }).travel -
+      2 * ratioToTravel(1.3).travel) < 1e-9);
+  check("depth can be inverted", ratioToTravel(1.3, { invert: true }).travel < 0);
+
+  // ---- activation is deliberate -----------------------------------------
+  {
+    const openHand = { openPalm: 0.9, pinched: false, pointing: 0.1, size: 0.11 };
+
+    const quick = new HandDepthTracker();
+    quick.update(openHand, 0);
+    check("one frame of the depth pose does not engage", quick.active === false);
+
+    const held = new HandDepthTracker();
+    for (let i = 0; i < DEPTH_MODE.activationFrames - 1; i++) held.update(openHand, i * 0.033);
+    check("holding short of the threshold does not engage", held.active === false);
+    const engaged = held.update(openHand, 1);
+    check("holding the pose engages depth", engaged.active === true);
+    check("engagement captures a reference size",
+      Math.abs(engaged.reference - 0.11) < 1e-9, String(engaged.reference));
+    check("engagement does not move the object", engaged.travel === 0);
+
+    // A pinch must never arm depth: that would fight the drag.
+    const pinch = new HandDepthTracker();
+    for (let i = 0; i < 30; i++) {
+      pinch.update({ ...openHand, pinched: true }, i * 0.033);
+    }
+    check("pinching never arms depth", pinch.active === false);
+
+    // Nor may a pointing hand.
+    const point = new HandDepthTracker();
+    for (let i = 0; i < 30; i++) {
+      point.update({ ...openHand, pointing: 0.9 }, i * 0.033);
+    }
+    check("pointing never arms depth", point.active === false);
+
+    // A partial openPalm is not the pose either.
+    const half = new HandDepthTracker();
+    for (let i = 0; i < 30; i++) {
+      half.update({ ...openHand, openPalm: 0.55 }, i * 0.033);
+    }
+    check("a half-open hand does not arm depth", half.active === false);
+  }
+
+  // ---- tracking loss resets the reference -------------------------------
+  {
+    const tracker = new HandDepthTracker();
+    const openHand = { openPalm: 0.9, pinched: false, pointing: 0.1, size: 0.1 };
+    for (let i = 0; i < DEPTH_MODE.activationFrames + 1; i++) {
+      tracker.update(openHand, i * 0.033);
+    }
+    check("depth is active before tracking is lost", tracker.active === true);
+    tracker.update(null, 1);
+    check("losing the hand resets depth", tracker.active === false && tracker.reference === null);
+  }
+
+  // ---- two hands keep separate references -------------------------------
+  {
+    const registry = new HandDepthRegistry();
+    const openHand = (size) => ({ openPalm: 0.9, pinched: false, pointing: 0.1, size });
+    // Left hand is close to the camera, right hand is far: different apparent
+    // sizes. Each must calibrate against its own.
+    for (let i = 0; i < DEPTH_MODE.activationFrames; i++) {
+      registry.update("left", openHand(0.20), i * 0.033);
+      registry.update("right", openHand(0.08), i * 0.033);
+    }
+    const left = registry.update("left", openHand(0.20), 1);
+    const right = registry.update("right", openHand(0.08), 1);
+    check("each hand keeps its own depth reference",
+      Math.abs(left.reference - 0.20) < 0.01 && Math.abs(right.reference - 0.08) < 0.01,
+      `${left.reference?.toFixed(3)} vs ${right.reference?.toFixed(3)}`);
+    check("two different-sized hands at rest produce no travel",
+      Math.abs(left.travel) < 0.05 && Math.abs(right.travel) < 0.05,
+      `${left.travel.toFixed(3)}, ${right.travel.toFixed(3)}`);
+    check("the registry tracks both hands", registry.size === 2);
+    registry.forget("left");
+    check("forgetting a hand drops its state", registry.size === 1);
+  }
+
+  // ---- depth never depends on landmark z --------------------------------
+  {
+    // Identical hands with wildly different reported z must produce identical
+    // depth: z is what the old code wrongly trusted.
+    const base = { openPalm: 0.9, pinched: false, pointing: 0.1, size: 0.1 };
+    const a = new HandDepthTracker();
+    const b = new HandDepthTracker();
+    for (let i = 0; i < DEPTH_MODE.activationFrames; i++) {
+      a.update({ ...base, z: -0.9 }, i * 0.033);
+      b.update({ ...base, z: 0.9 }, i * 0.033);
+    }
+    const ra = a.update({ ...base, z: -0.9 }, 1);
+    const rb = b.update({ ...base, z: 0.9 }, 1);
+    check("landmark z has no influence on depth",
+      Math.abs(ra.travel - rb.travel) < 1e-9 && ra.reference === rb.reference,
+      `${ra.travel} vs ${rb.travel}`);
   }
 }
 
