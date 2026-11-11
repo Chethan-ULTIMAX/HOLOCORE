@@ -54,9 +54,7 @@ import * as THREE from "three";
 export class DragPlane {
   constructor() {
     // Reused every frame; a drag allocates nothing after construction.
-    this._hit = new THREE.Vector3();
     this._hitStart = new THREE.Vector3();
-    this._normal = new THREE.Vector3();
     // The camera basis, frozen at grab time.
     this._right = new THREE.Vector3(1, 0, 0);
     this._up = new THREE.Vector3(0, 1, 0);
@@ -66,9 +64,7 @@ export class DragPlane {
     this._depth = 1;
     this._worldPerNdcX = 1;
     this._worldPerNdcY = 1;
-    this.plane = new THREE.Plane();
     this.active = false;
-    this.origin = new THREE.Vector3();
   }
 
   /**
@@ -79,8 +75,6 @@ export class DragPlane {
    * @param {{x:number,y:number}} options.ndc pointer in normalised device
    *        coordinates (-1..1, y up), which is what the reticle already uses
    * @param {THREE.Vector3} options.grabPoint world position of the object
-   * @param {number} [options.maxTilt=0.94] how far the plane may tilt away from
-   *        facing the camera before a more forgiving normal is used
    * @returns {boolean} whether a usable plane was found
    */
   begin({ camera, ndc, grabPoint }) {
@@ -109,10 +103,6 @@ export class DragPlane {
     const halfHeight = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * this._depth;
     this._worldPerNdcY = halfHeight;
     this._worldPerNdcX = halfHeight * camera.aspect;
-
-    this._normal.copy(this._forward);
-    this.plane.setFromNormalAndCoplanarPoint(this._normal, grabPoint);
-    this.origin.copy(grabPoint);
 
     this._startNdc.set(ndc.x, ndc.y);
     this.active = true;
@@ -156,7 +146,6 @@ export class DragPlane {
   release() {
     this.active = false;
     this._hitStart.set(0, 0, 0);
-    this.origin.set(0, 0, 0);
   }
 }
 
