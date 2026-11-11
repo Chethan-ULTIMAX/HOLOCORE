@@ -1434,10 +1434,17 @@ function cameraDisplayBox() {
 
 function videoSize() {
   const video = dom.workspaceVideo?.videoWidth ? dom.workspaceVideo : dom.cameraVideo;
-  return {
-    videoWidth: video?.videoWidth || 0,
-    videoHeight: video?.videoHeight || 0
-  };
+  const videoWidth = video?.videoWidth || 0;
+  const videoHeight = video?.videoHeight || 0;
+  // Before the first frame (and in headless runs) a <video> reports 0x0, which
+  // collapses the cover-fit and maps every landmark to the same corner of the
+  // screen. Assume the usual 16:9 webcam frame instead: during startup this only
+  // affects where the reticle is drawn, whereas a degenerate box would silently
+  // freeze the pointer for the whole session.
+  if (videoWidth < 2 || videoHeight < 2) {
+    return { videoWidth: 1280, videoHeight: 720 };
+  }
+  return { videoWidth, videoHeight };
 }
 
 /** Map a landmark to viewport NDC using the exact display box + mirror. */
@@ -1445,10 +1452,17 @@ function landmarkNdc(landmark) {
   const video = videoSize();
   const box = cameraDisplayBox();
   const viewRect = dom.viewport.getBoundingClientRect();
+  // A zero-sized viewport (headless harness, or a frame before layout) would
+  // collapse every pointer to (-1, -1) and silently freeze camera-relative
+  // dragging. Fall back to mapping through the camera box itself, which is
+  // exactly the same thing in workspace mode.
+  const viewport = viewRect.width > 1 && viewRect.height > 1
+    ? { width: viewRect.width, height: viewRect.height }
+    : null;
   return landmarkToNdc(
     landmark,
     { ...video, boxWidth: box.width, boxHeight: box.height },
-    { width: viewRect.width, height: viewRect.height },
+    viewport,
     { mirror: settings.camera.mirror !== false }
   );
 }
@@ -1602,6 +1616,21 @@ function processHands(now) {
   // is one; EXPLODE and SCALE always act on the assembly.
   const part = getGesturePart();
   const objectState = gestureObjectState(part);
+
+  // Give the solver the camera and the current pointer, so translation is
+  // camera-relative rather than locked to world X/Y. Without this a drag in Top
+  // view moved the object towards the viewer, where it appeared not to move.
+  // The pointer belongs to the controlling hand, not simply the first one:
+  // with both hands up, measuring the drag with the non-controlling hand would
+  // move the object by the wrong amount.
+  const pointerHand = solver.activeHand ||
+    activeStates.find(hand => hand?.pinched) ||
+    activeStates[0] ||
+    null;
+  const solverPointer = pointerHand
+    ? landmarkNdc(pointerHand.indexTip || pointerHand.pinch)
+    : null;
+  solver.setViewContext({ camera: workspace?.camera || null, ndc: solverPointer });
 
   const result = solver.update(activeStates, objectState, now);
   state.gestureMode = result.mode;

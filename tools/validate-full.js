@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as THREE from "three";
 import { VoiceControl } from "../voiceControl.js";
+import { ManipulationSolver } from "../gestures.js";
 import {
   viewPlacement,
   describePlacement,
@@ -81,6 +82,29 @@ global.ResizeObserver = window.ResizeObserver = class {
   unobserve() {}
   disconnect() {}
 };
+// jsdom performs no layout, so every getBoundingClientRect() is 0x0. Real
+// browsers do not behave that way, and a zero-sized viewport makes the pointer
+// mapping degenerate. Give elements a deterministic 16:9 layout so the tests
+// exercise the same geometry the browser provides.
+const VIEWPORT_SIZE = { width: 1280, height: 720 };
+window.Element.prototype.getBoundingClientRect = function getBoundingClientRect() {
+  const isViewport = this.id === "viewport";
+  const rect = isViewport
+    ? { x: 0, y: 0, ...VIEWPORT_SIZE }
+    : { x: 0, y: 0, width: VIEWPORT_SIZE.width, height: VIEWPORT_SIZE.height };
+  return {
+    ...rect, left: rect.x, top: rect.y, right: rect.x + rect.width,
+    bottom: rect.y + rect.height,
+    toJSON() { return this; }
+  };
+};
+Object.defineProperty(window.Element.prototype, "clientWidth", {
+  get() { return VIEWPORT_SIZE.width; }, configurable: true
+});
+Object.defineProperty(window.Element.prototype, "clientHeight", {
+  get() { return VIEWPORT_SIZE.height; }, configurable: true
+});
+
 global.requestAnimationFrame = window.requestAnimationFrame = () => 1;
 global.cancelAnimationFrame = window.cancelAnimationFrame = () => {};
 
@@ -1381,6 +1405,181 @@ section("5q · Seven standard views, correctly oriented");
     check("a larger object is framed from further away", large > small,
       `${small.toFixed(2)} -> ${large.toFixed(2)}`);
     check("framing distance respects the minimum", small >= 3.2, small.toFixed(2));
+  }
+}
+
+section("5r · Pinch-drag is camera-relative");
+
+{
+  const cam = new THREE.PerspectiveCamera(42, 1.6, 0.1, 200);
+  const hand = (pinched = true) => ({
+    pinched,
+    pinch: { x: 0.5, y: 0.5, z: 0 },
+    indexTip: { x: 0.5, y: 0.4, inside: true },
+    palm: { x: 0.5, y: 0.55 },
+    openPalm: 0.2,
+    pointing: 0.9,
+    landmarks: Array.from({ length: 21 }, () => ({ x: 0.5, y: 0.5, z: 0 }))
+  });
+  const at = (x = 0, y = 0, z = 0) => ({
+    position: { x, y, z }, rotationZ: 0, rotationX: 0, scale: 1
+  });
+
+  // Orient a camera at a standard view, the same way the workspace does.
+  const aim = view => {
+    const p = viewPlacement(view, { target: new THREE.Vector3(), radius: 3, fov: 42 });
+    cam.position.copy(p.position);
+    cam.up.copy(p.up);
+    cam.lookAt(p.target);
+    cam.updateMatrixWorld();
+  };
+
+  /** Grab at NDC (0,0) then move the pointer, returning the world delta. */
+  const drag = (view, ndc, startAt = at()) => {
+    aim(view);
+    const solver = new ManipulationSolver({
+      settings: { mode: "move", limits: { x: 40, y: 40, z: 40 } }
+    });
+    solver.setViewContext({ camera: cam, ndc: { x: 0, y: 0 } });
+    solver.update([hand()], startAt, 0);
+    solver.setViewContext({ camera: cam, ndc });
+    const result = solver.update([hand()], startAt, 0.1);
+    return {
+      x: result.position.x - startAt.position.x,
+      y: result.position.y - startAt.position.y,
+      z: result.position.z - startAt.position.z
+    };
+  };
+
+  // The expectations from the brief, stated as their own cases.
+  const cases = [
+    ["front", { x: 0.2, y: 0 }, { axis: "x", sign: 1, label: "right -> +X" }],
+    ["front", { x: 0, y: 0.2 }, { axis: "y", sign: 1, label: "up -> +Y" }],
+    ["front", { x: -0.2, y: 0 }, { axis: "x", sign: -1, label: "left -> -X" }],
+    ["front", { x: 0, y: -0.2 }, { axis: "y", sign: -1, label: "down -> -Y" }],
+    ["top", { x: 0.2, y: 0 }, { axis: "x", sign: 1, label: "right -> +X" }],
+    ["top", { x: 0, y: 0.2 }, { axis: "z", sign: -1, label: "up -> -Z" }],
+    ["top", { x: 0, y: -0.2 }, { axis: "z", sign: 1, label: "down -> +Z" }],
+    ["left", { x: 0.2, y: 0 }, { axis: "z", sign: 1, label: "right -> +Z" }],
+    ["left", { x: 0, y: 0.2 }, { axis: "y", sign: 1, label: "up -> +Y" }],
+    ["right", { x: 0.2, y: 0 }, { axis: "z", sign: -1, label: "right -> -Z" }],
+    ["back", { x: 0.2, y: 0 }, { axis: "x", sign: -1, label: "right -> -X" }],
+    ["bottom", { x: 0, y: 0.2 }, { axis: "z", sign: 1, label: "up -> +Z" }]
+  ];
+
+  for (const [view, ndc, want] of cases) {
+    const d = drag(view, ndc);
+    const value = d[want.axis];
+    const other = ["x", "y", "z"].filter(a => a !== want.axis);
+    const leakage = Math.max(Math.abs(d[other[0]]), Math.abs(d[other[1]]));
+    check(`${view}: drag ${want.label}`,
+      Math.sign(value) === want.sign && Math.abs(value) > 0.2,
+      `(${d.x.toFixed(2)}, ${d.y.toFixed(2)}, ${d.z.toFixed(2)})`);
+    // Camera-relative movement must stay in the view plane, not drift along the
+    // view axis.
+    check(`${view}: drag ${want.label} does not leak into other axes`,
+      leakage < Math.abs(value) * 0.25,
+      `leak ${leakage.toFixed(3)}`);
+  }
+
+  // The same screen movement must produce different world movement in different
+  // views. This is the whole point: fixed world axes would make these equal.
+  {
+    const front = drag("front", { x: 0.2, y: 0 });
+    const top = drag("top", { x: 0.2, y: 0 });
+    const left = drag("left", { x: 0.2, y: 0 });
+    // Same screen drag, different world axis: that is what "camera-relative"
+    // means. A fixed world-axis solver would have moved both along X.
+    check("the same drag moves a different world axis in different views",
+      Math.abs(front.x) > 0.2 && Math.abs(front.z) < 1e-6 &&
+      Math.abs(left.z) > 0.2 && Math.abs(left.x) < 1e-6,
+      `front=(${front.x.toFixed(2)},${front.z.toFixed(2)}) left=(${left.x.toFixed(2)},${left.z.toFixed(2)})`);
+    check("Top and Front agree on horizontal movement",
+      Math.abs(front.x - top.x) < 1e-6,
+      `${front.x.toFixed(3)} vs ${top.x.toFixed(3)}`);
+    check("Front and Left disagree on horizontal movement",
+      Math.abs(front.x) > 0.2 && Math.abs(front.z) < 1e-6,
+      `front=(${front.x.toFixed(2)},${front.z.toFixed(2)}) left=(${left.x.toFixed(2)},${left.z.toFixed(2)})`);
+  }
+
+  // A grab must not move the object on its first frame.
+  {
+    aim("front");
+    const solver = new ManipulationSolver({
+      settings: { mode: "move", limits: { x: 40, y: 40, z: 40 } }
+    });
+    solver.setViewContext({ camera: cam, ndc: { x: 0.1, y: -0.05 } });
+    const start = at(1, 2, 3);
+    const result = solver.update([hand()], start, 0);
+    check("grabbing does not jump the object",
+      result.position.x === 1 && result.position.y === 2 && result.position.z === 3,
+      `(${result.position.x}, ${result.position.y}, ${result.position.z})`);
+  }
+
+  // A camera change mid-drag must not shift the object: the plane is captured
+  // once and held for the whole grab.
+  {
+    aim("front");
+    const solver = new ManipulationSolver({
+      settings: { mode: "move", limits: { x: 40, y: 40, z: 40 } }
+    });
+    const start = at();
+    solver.setViewContext({ camera: cam, ndc: { x: 0, y: 0 } });
+    solver.update([hand()], start, 0);
+    solver.setViewContext({ camera: cam, ndc: { x: 0.1, y: 0 } });
+    const before = solver.update([hand()], start, 0.1).position.x;
+
+    // Re-aim the camera at a completely different view, without releasing.
+    aim("top");
+    solver.setViewContext({ camera: cam, ndc: { x: 0.1, y: 0 } });
+    const after = solver.update([hand()], start, 0.2).position.x;
+
+    check("a camera change mid-drag does not shift the object",
+      Math.abs(after - before) < 0.35,
+      `${before.toFixed(2)} -> ${after.toFixed(2)}`);
+  }
+
+  // Releasing must drop the plane so the next grab starts fresh.
+  {
+    aim("front");
+    const solver = new ManipulationSolver({
+      settings: { mode: "move", limits: { x: 40, y: 40, z: 40 } }
+    });
+    solver.setViewContext({ camera: cam, ndc: { x: 0, y: 0 } });
+    solver.update([hand()], at(), 0);
+    check("a drag plane is active during a grab", solver.dragPlane.active === true);
+    solver.update([hand(false)], at(), 0.1);
+    check("releasing drops the drag plane", solver.dragPlane.active === false);
+  }
+
+  // Movement is bounded by the stage limits.
+  {
+    aim("front");
+    const solver = new ManipulationSolver({
+      settings: { mode: "move", limits: { x: 2, y: 2, z: 2 } }
+    });
+    solver.setViewContext({ camera: cam, ndc: { x: 0, y: 0 } });
+    solver.update([hand()], at(), 0);
+    solver.setViewContext({ camera: cam, ndc: { x: 1, y: 1 } });
+    const result = solver.update([hand()], at(), 0.1);
+    check("camera-relative movement respects the stage limits",
+      Math.abs(result.position.x) <= 2 && Math.abs(result.position.y) <= 2,
+      `(${result.position.x.toFixed(2)}, ${result.position.y.toFixed(2)})`);
+  }
+
+  // With no camera supplied, the old behaviour must still work, so headless
+  // callers and existing tests are not broken.
+  {
+    const solver = new ManipulationSolver({
+      settings: { mode: "move", limits: { x: 40, y: 40, z: 40 } }
+    });
+    solver.update([hand()], at(), 0);
+    const moved = solver.update(
+      [{ ...hand(), pinch: { x: 0.7, y: 0.5, z: 0 } }], at(), 0.1
+    );
+    check("without a camera the solver still translates",
+      moved.intent === "translate" && moved.position.x > 0,
+      String(moved.position.x));
   }
 }
 

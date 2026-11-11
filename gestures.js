@@ -392,6 +392,9 @@ export function describeGesture(hand, handsCount) {
   return "Tracking";
 }
 
+import * as THREE from "three";
+import { DragPlane } from "./dragPlane.js";
+
 /* ------------------------------------------------------------------------- */
 /* MANIPULATION SOLVER                                                       */
 /* ------------------------------------------------------------------------- */
@@ -531,11 +534,28 @@ export class ManipulationSolver {
     // gesture cannot migrate to the other hand mid-drag.
     this.activeKey = null;
     this.activeHand = null;
+    // Camera-relative translation. The plane is captured once per grab and held
+    // for its duration, so a camera nudge mid-drag cannot move the object.
+    this.dragPlane = new DragPlane();
+    this._dragOut = { x: 0, y: 0, z: 0 };
   }
 
   updateSettings(settings = {}) {
     Object.assign(this.settings, settings);
     this._syncLimits();
+  }
+
+  /**
+   * Supply the camera and pointer needed for camera-relative translation.
+   *
+   * @param {object} context
+   * @param {THREE.Camera} context.camera
+   * @param {{x:number,y:number}} context.ndc pointer in NDC, or null
+   * @param {THREE.Vector3} [context.grabPoint] world position of the grab
+   */
+  setViewContext({ camera = null, ndc = null } = {}) {
+    this.camera = camera || null;
+    this.pointerNdc = ndc || null;
   }
 
   /** `limits` is nested, so a partial override must not drop the other axes. */
@@ -547,6 +567,7 @@ export class ManipulationSolver {
     this.mode = "idle";
     this.activeKey = null;
     this.activeHand = null;
+    this.dragPlane.release();
     this.grab = null;
     this.frame = null;
     this.rotationFrame = null;
@@ -670,6 +691,55 @@ export class ManipulationSolver {
     }
   }
 
+  /**
+   * Camera-relative translation for the current pointer.
+   *
+   * Falls back to the old axis mapping only when there is no camera or no
+   * pointer (headless callers and the first frame before the reticle exists).
+   * The fallback is honest about being a fallback: it maps to world X/Y, which
+   * is right for the default three-quarter view and only for that.
+   *
+   * @returns {{position: object, delta: object, mode: string}}
+   */
+  _translateTo(hand, objectState) {
+    const start = this.grab.objectStart.position;
+    const limits = this.limits;
+
+    if (this.camera && this.pointerNdc) {
+      // Begin the drag plane on the first frame of the grab, through the point
+      // where the object actually is.
+      if (!this.dragPlane.active) {
+        const grabPoint = new THREE.Vector3(start.x, start.y, start.z);
+        this.dragPlane.begin({
+          camera: this.camera,
+          ndc: this.pointerNdc,
+          grabPoint
+        });
+      }
+      const delta = this.dragPlane.delta(this.camera, this.pointerNdc, this._dragTmp ||
+        (this._dragTmp = new THREE.Vector3()));
+      if (delta) {
+        const position = {
+          x: clamp(start.x + delta.x, -limits.x, limits.x),
+          y: clamp(start.y + delta.y, -limits.y, limits.y),
+          z: clamp(start.z + delta.z, -limits.z, limits.z)
+        };
+        return { position, delta: { x: delta.x, y: delta.y, z: delta.z } };
+      }
+    }
+
+    // Fallback: fixed world axes, exactly as before.
+    const sensitivity = 6.2 * this.settings.moveSensitivity;
+    const dx = (hand.pinch.x - this.grab.handStart.x) * sensitivity;
+    const dy = -(hand.pinch.y - this.grab.handStart.y) * sensitivity;
+    const position = {
+      x: clamp(start.x + dx, -limits.x, limits.x),
+      y: clamp(start.y + dy, -limits.y, limits.y),
+      z: clamp(start.z, -limits.z, limits.z)
+    };
+    return { position, delta: { x: dx, y: dy, z: 0 }, fallback: true };
+  }
+
   /* ---- SELECT ---------------------------------------------------------- */
   _modeSelect(hands, objectState) {
     const hand = hands[0];
@@ -716,19 +786,11 @@ export class ManipulationSolver {
     }
     this._setMode("grab");
 
-    const sensitivity = 6.2 * this.settings.moveSensitivity;
-    const dx = (hand.pinch.x - this.grab.handStart.x) * sensitivity;
-    const dy = -(hand.pinch.y - this.grab.handStart.y) * sensitivity;
-    const dz = -(hand.pinch.z - this.grab.handStart.z) * sensitivity * 6 * this.settings.zSensitivity;
-
-    const position = {
-      x: clamp(this.grab.objectStart.position.x + dx, -6, 6),
-      y: clamp(this.grab.objectStart.position.y + dy, -5, 5),
-      z: clamp((this.grab.objectStart.position.z || 0) + dz, -5, 5)
-    };
+    const { position } = this._translateTo(hand, objectState);
 
     this.velocity.x = position.x - objectState.position.x;
     this.velocity.y = position.y - objectState.position.y;
+    this.velocity.z = position.z - (objectState.position.z || 0);
 
     return { mode: "grab", active: true, intent: "translate", position, pointer: hand.indexTip };
   }
@@ -918,20 +980,12 @@ export class ManipulationSolver {
       }
 
       this._setMode("grab");
-      const sensitivity = 6.2 * this.settings.moveSensitivity;
-      const dx = (hand.pinch.x - this.grab.handStart.x) * sensitivity;
-      const dy = -(hand.pinch.y - this.grab.handStart.y) * sensitivity;
-      const dz = -(hand.pinch.z - this.grab.handStart.z) * sensitivity * 6 * this.settings.zSensitivity;
-
-      const target = {
-        x: clamp(this.grab.objectStart.position.x + dx, -this.limits.x, this.limits.x),
-        y: clamp(this.grab.objectStart.position.y + dy, -this.limits.y, this.limits.y),
-        z: clamp(this.grab.objectStart.position.z + dz, -this.limits.z, this.limits.z)
-      };
+      const { position: target } = this._translateTo(hand, objectState);
 
       // Track velocity for release inertia (units per second).
       this.velocity.x = target.x - objectState.position.x;
       this.velocity.y = target.y - objectState.position.y;
+      this.velocity.z = target.z - (objectState.position.z || 0);
 
       result.position = target;
       result.active = true;
@@ -1050,6 +1104,7 @@ export class ManipulationSolver {
   }
 
   _release() {
+    this.dragPlane.release();
     this.grab = null;
     this.frame = null;
     this.rotationFrame = null;
