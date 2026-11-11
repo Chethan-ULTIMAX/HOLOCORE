@@ -212,6 +212,11 @@ const state = {
   intent: "none",
   /** Active interaction mode id (select | move | rotate | scale | explode). */
   mode: "select",
+  /** Gizmo handles: the transform a drag started from, and an in-flight drag. */
+  gizmoStart: null,
+  gizmoDrag: false,
+  handGizmo: null,
+  gizmoHintShown: false,
   /** Full-workspace camera vs. small preview card. */
   cameraView: "workspace",
   /** True while the workspace video element is actually showing frames. */
@@ -466,6 +471,64 @@ function boot() {
 
   // Scene-space hand skeletons: real geometry so hands can be occluded by the
   // model and share its lighting, which a 2D overlay can never do.
+  // A mouse drag on a gizmo handle moves the selection. Hand input goes through
+  // the same solver path (see processHands), so both devices share one
+  // constraint implementation.
+  // Capture the transform the drag starts from. The gizmo reports a cumulative
+  // delta, so applying it to a moving reference would run away.
+  workspace.onGizmoBegin = () => {
+    if (playground?.selectedId) {
+      const prop = playground.byId.get(playground.selectedId);
+      const pos = prop ? playground.getTransform(prop.id).position : null;
+      state.gizmoStart = pos ? { x: pos.x, y: pos.y, z: pos.z } : null;
+    } else if (state.partId) {
+      const record = workspace.partTransforms?.get?.(workspace.getPart?.(state.partId));
+      const offset = record?.offset;
+      state.gizmoStart = offset
+        ? { x: offset.x, y: offset.y, z: offset.z }
+        : { x: 0, y: 0, z: 0 };
+    } else {
+      state.gizmoStart = null;
+    }
+    state.gizmoDrag = true;
+  };
+
+  workspace.onGizmoEnd = () => {
+    state.gizmoDrag = false;
+    state.gizmoStart = null;
+  };
+
+  workspace.onGizmoChange = (delta, handle) => {
+    if (!delta) return;
+    if (playground?.selectedId) {
+      const prop = playground.byId.get(playground.selectedId);
+      if (!prop) return;
+      // The delta is measured from the drag start, so apply it to the transform
+      // captured when the drag began rather than accumulating per frame.
+      const start = state.gizmoStart || playground.getTransform(prop.id).position;
+      const position = {
+        x: clamp(start.x + delta.x, -STAGE_BOUNDS.x, STAGE_BOUNDS.x),
+        y: clamp(start.y + delta.y, -STAGE_BOUNDS.y, STAGE_BOUNDS.y),
+        z: clamp(start.z + delta.z, -STAGE_BOUNDS.z, STAGE_BOUNDS.z)
+      };
+      playground.setTransform(prop.id, { position });
+      updateObjectHud?.();
+    } else if (state.partId) {
+      // Components carry an offset from their exploded/home position, so the
+      // gizmo delta is applied to that offset rather than to - and the delta is
+      // cumulative from the drag start, not per frame.
+      const start = state.gizmoStart;
+      if (!start) return;
+      workspace.setPartTransform(state.partId, {
+        offset: {
+          x: start.x + delta.x,
+          y: start.y + delta.y,
+          z: start.z + delta.z
+        }
+      });
+    }
+  };
+
   // Let the workspace frame a selected playground object: switching to Front
   // with a prop at x=4 must centre the prop, not the model behind it.
   workspace.onFramingTarget = () => playground?.get?.()?.group || null;
@@ -722,7 +785,40 @@ function selectProp(id, source = "hand") {
   }
   refreshSceneOutliner();
   updateObjectHud();
+  syncGizmo();
   return prop;
+}
+
+/**
+ * Attach the translation gizmo to the current selection.
+ *
+ * A selected playground prop gets handles; a selected model component gets
+ * handles too. Nothing selected means no gizmo: a permanent gizmo floating at
+ * the origin would be exactly the kind of clutter the brief warns about.
+ */
+function syncGizmo() {
+  if (!workspace?.setGizmo) return;
+  // Never swap the target out from under an in-flight drag: the handles would
+  // jump and the object would keep moving without a pointer on it.
+  if (state.gizmoDrag) return;
+
+  let target = null;
+  const prop = playground?.selectedId ? playground.byId.get(playground.selectedId) : null;
+  if (prop?.group) {
+    target = prop.group;
+  } else if (state.partId) {
+    const part = workspace.getPart?.(state.partId);
+    if (part) target = part.mesh || part.object3D || part;
+  }
+  workspace.setGizmo(target || null);
+
+  // Tell the user, once, that the handles exist. Without it the gizmo is only
+  // discoverable by accident.
+  if (target && !state.gizmoHintShown) {
+    state.gizmoHintShown = true;
+    toast("Drag a coloured arrow to move along one axis · pinch it to do the same by hand",
+      "accent", 3600);
+  }
 }
 
 function updatePartListSelection() {
@@ -1630,6 +1726,11 @@ function processHands(now) {
   const solverPointer = pointerHand
     ? landmarkNdc(pointerHand.indexTip || pointerHand.pinch)
     : null;
+
+  // A pinch that lands on a gizmo handle drags that handle, and only that
+  // handle: doing this before the solver is what stops a handle grab from also
+  // dragging the object behind it. Both devices share the same constraint code.
+  handleHandGizmo(pinching, solverPointer);
   solver.setViewContext({ camera: workspace?.camera || null, ndc: solverPointer });
 
   const result = solver.update(activeStates, objectState, now);
@@ -1979,6 +2080,50 @@ function projectedTarget() {
 }
 
 /** Place the reticle and resolve what it is pointing at. */
+/**
+ * Drive a gizmo drag from the hand pointer.
+ *
+ * A pinch that lands on a handle grabs the handle and nothing else. The drag
+ * then reports a cumulative world delta, which is applied to the transform
+ * captured at pinch time.
+ */
+function handleHandGizmo(pinching, ndc) {
+  if (!workspace?.beginGizmoDrag || !ndc) {
+    if (state.handGizmo) {
+      workspace?.endGizmoDrag?.();
+      workspace.onGizmoEnd?.();
+      state.handGizmo = null;
+    }
+    return;
+  }
+
+  if (pinching && !state.handGizmo) {
+    // Hover the handle first so the user can see what a pinch would grab.
+    const hovered = workspace.pickGizmo?.({ x: ndc.x, y: ndc.y });
+    if (!hovered) return;
+    const handle = workspace.beginGizmoDrag({ x: ndc.x, y: ndc.y }, hovered);
+    if (!handle) return;
+    state.handGizmo = handle;
+    workspace.onGizmoBegin?.(handle);
+    chimes().play("grab");
+    return;
+  }
+
+  if (pinching && state.handGizmo) {
+    const delta = workspace.dragGizmo?.({ x: ndc.x, y: ndc.y });
+    if (delta) workspace.onGizmoChange?.(delta, state.handGizmo);
+    return;
+  }
+
+  // Released.
+  if (!pinching && state.handGizmo) {
+    workspace.endGizmoDrag?.();
+    workspace.onGizmoEnd?.();
+    state.handGizmo = null;
+    chimes().play("release");
+  }
+}
+
 function updatePointer(pointer, states, result) {
   if (!pointer || state.cameraView !== "workspace") {
     if (pointer && state.cameraView === "preview") {

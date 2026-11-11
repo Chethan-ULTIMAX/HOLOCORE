@@ -16,6 +16,7 @@ import {
   VIEW_LABELS,
   safeUp
 } from "./cameraViews.js";
+import { TranslationGizmo } from "./gizmo.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { buildAssembly, disposeAssembly } from "./modelFactory.js";
@@ -69,6 +70,10 @@ export class Workspace {
     this._hoverPending = null;
     /** Group composited after the main pass (the hand skeletons). */
     this.lateLayer = null;
+
+    // Translation gizmo. Created lazily by setGizmo so headless callers and the
+    // camera preview never pay for six meshes they cannot see.
+    this.gizmo = null;
 
     this._initRenderer();
     this._initScene();
@@ -315,12 +320,58 @@ export class Workspace {
     const dom = this.renderer.domElement;
 
     this._pointerStart = null;
+
+    /** Pointer position in NDC, measured against the canvas. */
+    const toNdc = event => {
+      const rect = dom.getBoundingClientRect();
+      return new THREE.Vector2(
+        ((event.clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1,
+        -((event.clientY - rect.top) / Math.max(1, rect.height)) * 2 + 1
+      );
+    };
+
+    // The gizmo takes precedence over everything else. Without capturing the
+    // pointer here, OrbitControls would also orbit while a handle was being
+    // dragged, because both listen on the same canvas.
+    this.onGizmoChange = null;
+    let gizmoHandle = null;
+
     dom.addEventListener("pointerdown", event => {
       this._pointerStart = { x: event.clientX, y: event.clientY, time: performance.now() };
-    });
+      if (!this.gizmo?.root.visible || event.button !== 0) return;
+      gizmoHandle = this.beginGizmoDrag(toNdc(event));
+      if (gizmoHandle) {
+        dom.setPointerCapture?.(event.pointerId);
+        this.controls.enabled = false;
+        event.stopPropagation();
+        event.preventDefault();
+        // Tell the app what the drag started from, so it can apply the
+        // cumulative delta to a fixed reference instead of accumulating.
+        this.onGizmoBegin?.(gizmoHandle);
+      }
+    }, { capture: true });
+
+    dom.addEventListener("pointermove", event => {
+      if (!gizmoHandle) return;
+      const delta = this.dragGizmo(toNdc(event));
+      if (delta) this.onGizmoChange?.(delta, gizmoHandle);
+    }, { capture: true });
+
+    const endGizmo = event => {
+      if (!gizmoHandle) return;
+      gizmoHandle = null;
+      this.endGizmoDrag();
+      this.controls.enabled = true;
+      dom.releasePointerCapture?.(event.pointerId);
+      this.onGizmoEnd?.();
+    };
+    dom.addEventListener("pointerup", endGizmo, { capture: true });
+    dom.addEventListener("pointercancel", endGizmo, { capture: true });
 
     dom.addEventListener("pointerup", event => {
       if (!this._pointerStart) return;
+      // A gizmo drag is not a click: do not reselect on release.
+      if (event.target === dom && gizmoHandle) return;
       const dx = event.clientX - this._pointerStart.x;
       const dy = event.clientY - this._pointerStart.y;
       const moved = Math.hypot(dx, dy);
@@ -430,7 +481,63 @@ export class Workspace {
     return this.assembly?.byId.get(partId) || null;
   }
 
-  /** Raycast a screen NDC point. Returns the part id or null. */
+  /* ---- translation gizmo ------------------------------------------------- */
+
+  /**
+   * Attach the gizmo to an object (or detach with null).
+   *
+   * The gizmo is added to the scene root, not to the object, so a rotated or
+   * scaled object cannot skew the handles and the handles can never be saved as
+   * part of the model.
+   */
+  setGizmo(object3D) {
+    if (!this.gizmo && object3D) {
+      this.gizmo = new TranslationGizmo();
+      this.scene.add(this.gizmo.root);
+      this.gizmoColors = true;
+    }
+    this.gizmo?.setTarget(object3D);
+    return this.gizmo;
+  }
+
+  /** True when a pointer ray is hovering a gizmo handle. */
+  pickGizmo(ndc) {
+    if (!this.gizmo?.root.visible) return null;
+    this._gizmoRaycaster ||= new THREE.Raycaster();
+    this._gizmoRaycaster.setFromCamera(ndc, this.camera);
+    const handle = this.gizmo.pick(this._gizmoRaycaster);
+    this.gizmo.setHovered(handle);
+    return handle;
+  }
+
+  /**
+   * Begin a gizmo drag from a normalised pointer position.
+   *
+   * Returns the handle name so the caller can route subsequent motion, or null
+   * if the pointer missed or the handle is unusable from this angle (an axis
+   * pointing straight at the camera has no detectable movement).
+   */
+  beginGizmoDrag(ndc, handle = null) {
+    if (!this.gizmo?.root.visible) return null;
+    this._gizmoRaycaster ||= new THREE.Raycaster();
+    this._gizmoRaycaster.setFromCamera(ndc, this.camera);
+    const target = handle || this.gizmo.pick(this._gizmoRaycaster);
+    if (!target) return null;
+    return this.gizmo.beginDrag(this._gizmoRaycaster.ray, target) ? target : null;
+  }
+
+  /** Move the gizmo drag; returns the world delta since the drag started. */
+  dragGizmo(ndc) {
+    if (!this.gizmo?.dragging) return null;
+    this._gizmoRaycaster ||= new THREE.Raycaster();
+    this._gizmoRaycaster.setFromCamera(ndc, this.camera);
+    return this.gizmo.drag(this._gizmoRaycaster.ray);
+  }
+
+  endGizmoDrag() {
+    this.gizmo?.endDrag();
+  }
+
   raycast(ndc) {
     if (!this.assembly) return null;
     this._raycaster = this._raycaster || new THREE.Raycaster();
@@ -1185,6 +1292,9 @@ export class Workspace {
    */
   update(dt) {
     this.time = (this.time || 0) + dt;
+
+    // Keep the gizmo a constant size on screen and glued to its target.
+    this.gizmo?.update(this.camera);
 
     // Hover raycast is throttled to once per frame from the latest pointer.
     if (this._hoverPending) {

@@ -27,6 +27,14 @@ import * as THREE from "three";
 import { VoiceControl } from "../voiceControl.js";
 import { ManipulationSolver } from "../gestures.js";
 import {
+  constrainDelta,
+  axisParameter,
+  AXIS_VECTORS,
+  AXIS_HANDLES,
+  PLANE_HANDLES,
+  PLANE_AXES
+} from "../gizmo.js";
+import {
   viewPlacement,
   describePlacement,
   matchingView,
@@ -1580,6 +1588,147 @@ section("5r · Pinch-drag is camera-relative");
     check("without a camera the solver still translates",
       moved.intent === "translate" && moved.position.x > 0,
       String(moved.position.x));
+  }
+}
+
+section("5s · Translation gizmo");
+
+{
+  const ws = api.getWorkspace();
+  const gs = api.getPlayground();
+
+  // ---- pure constraint rules ---------------------------------------------
+  for (const axis of AXIS_HANDLES) {
+    const out = constrainDelta(axis, { x: 3, y: 5, z: 7 });
+    const others = ["x", "y", "z"].filter(a => a !== axis);
+    check(`axis ${axis} handle moves only ${axis.toUpperCase()}`,
+      out[axis] === { x: 3, y: 5, z: 7 }[axis] &&
+      others.every(a => out[a] === 0),
+      JSON.stringify(out));
+  }
+  for (const plane of PLANE_HANDLES) {
+    const out = constrainDelta(plane, { x: 3, y: 5, z: 7 });
+    const blocked = ["x", "y", "z"].find(a => !PLANE_AXES[plane].includes(a));
+    check(`plane ${plane} handle blocks ${blocked.toUpperCase()}`,
+      out[blocked] === 0 &&
+      PLANE_AXES[plane].every(a => out[a] === { x: 3, y: 5, z: 7 }[a]),
+      JSON.stringify(out));
+  }
+
+  // A ray crossing the axis at a known point must report that distance.
+  {
+    const ray = new THREE.Ray(new THREE.Vector3(2, 5, 0), new THREE.Vector3(0, -1, 0));
+    const t = axisParameter(new THREE.Vector3(), AXIS_VECTORS.x, ray);
+    check("closest-approach finds the crossing point", Math.abs(t - 2) < 1e-9, String(t));
+  }
+  // A ray parallel to the axis cannot define a position: refuse, do not produce
+  // a huge number.
+  {
+    const ray = new THREE.Ray(new THREE.Vector3(5, 0, 0), new THREE.Vector3(1, 0, 0));
+    check("a ray parallel to the axis is refused",
+      axisParameter(new THREE.Vector3(), AXIS_VECTORS.x, ray) === null);
+  }
+
+  // ---- visibility rules ---------------------------------------------------
+  {
+    gs.clear();
+    ws.setGizmo(null);
+    check("no selection means no gizmo", ws.gizmo?.root.visible === false ||
+      ws.gizmo === null, String(ws.gizmo?.root.visible));
+
+    const prop = gs.addPrimitive("cube");
+    gs.setTransform(prop.id, { position: { x: 2, y: 1.5, z: -1 } });
+    gs.select(prop.id);
+    api._internals.selectProp?.(prop.id);
+    check("selecting a prop shows the gizmo", ws.gizmo?.root.visible === true);
+    check("the gizmo sits on the selection",
+      ws.gizmo.root.position.distanceTo(prop.group.position) < 1e-6,
+      ws.gizmo.root.position.toArray().map(v => v.toFixed(2)).join(","));
+
+    // It must follow the object when the object moves.
+    gs.setTransform(prop.id, { position: { x: -1, y: 0.5, z: 2 } });
+    ws.gizmo.update(ws.camera);
+    check("the gizmo follows the object",
+      ws.gizmo.root.position.distanceTo(new THREE.Vector3(-1, 0.5, 2)) < 1e-6,
+      ws.gizmo.root.position.toArray().map(v => v.toFixed(2)).join(","));
+
+    gs.select(null);
+    api._internals.selectProp?.(null);
+    check("clearing the selection hides the gizmo", ws.gizmo?.root.visible === false);
+  }
+
+  // ---- constant on-screen size -------------------------------------------
+  {
+    gs.clear();
+    const prop = gs.addPrimitive("cube");
+    ws.setGizmo(prop.group);
+    ws.camera.position.set(0, 3, 8);
+    ws.camera.lookAt(0, 0, 0);
+    ws.camera.updateMatrixWorld();
+    ws.gizmo.update(ws.camera);
+    const near = ws.gizmo.root.scale.x;
+    ws.camera.position.set(0, 12, 32);
+    ws.camera.lookAt(0, 0, 0);
+    ws.camera.updateMatrixWorld();
+    ws.gizmo.update(ws.camera);
+    const far = ws.gizmo.root.scale.x;
+    check("the gizmo grows with distance to stay legible", far > near,
+      `${near.toFixed(3)} -> ${far.toFixed(3)}`);
+    check("the gizmo stays within sane bounds", far <= 6 && near >= 0.08,
+      `${near.toFixed(3)}, ${far.toFixed(3)}`);
+  }
+
+  // ---- an axis drag moves the object along exactly one axis --------------
+  {
+    gs.clear();
+    const prop = gs.addPrimitive("cube");
+    gs.setTransform(prop.id, { position: { x: 0, y: 0, z: 0 } });
+    ws.setGizmo(prop.group);
+    ws.camera.position.set(0, 1, 10);
+    ws.camera.lookAt(0, 0, 0);
+    ws.camera.updateMatrixWorld();
+    ws.gizmo.update(ws.camera);
+
+    const origin = ws.gizmo.root.position.clone();
+    const scale = ws.gizmo.root.scale.x;
+    // Two rays from above, one screen-unit apart along X, both crossing the axis.
+    const rayA = new THREE.Ray(
+      new THREE.Vector3(origin.x + 0.1 * scale, origin.y + 6, origin.z + 6),
+      new THREE.Vector3(0, -1, -1).normalize()
+    );
+    const rayB = new THREE.Ray(
+      new THREE.Vector3(origin.x + 0.9 * scale, origin.y + 6, origin.z + 6),
+      new THREE.Vector3(0, -1, -1).normalize()
+    );
+
+    check("an X handle drag begins", ws.gizmo.beginDrag(rayA, "x") === true);
+    const delta = ws.gizmo.drag(rayB);
+    check("the X handle reports movement only on X",
+      delta && Math.abs(delta.y) < 1e-9 && Math.abs(delta.z) < 1e-9 && delta.x > 0.5,
+      delta ? `(${delta.x.toFixed(2)}, ${delta.y.toFixed(2)}, ${delta.z.toFixed(2)})` : "null");
+
+    // Applying it must move exactly that far.
+    const before = gs.getTransform(prop.id).position;
+    gs.setTransform(prop.id, {
+      position: { x: before.x + delta.x, y: before.y + delta.y, z: before.z + delta.z }
+    });
+    const after = gs.getTransform(prop.id).position;
+    check("the object moves by exactly the reported delta",
+      Math.abs(after.x - before.x - delta.x) < 1e-9 &&
+      Math.abs(after.y - before.y) < 1e-9,
+      `${after.x.toFixed(3)}`);
+
+    ws.gizmo.endDrag();
+    check("ending a drag clears it", ws.gizmo.dragging === null);
+    check("dragging after release does nothing", ws.gizmo.drag(rayB) === null);
+  }
+
+  // ---- the gizmo's meshes are not part of the exported model -------------
+  {
+    const count = ws.scene.children.filter(c => c.name === "translation-gizmo").length;
+    check("the gizmo lives at the scene root, not inside the model", count === 1, String(count));
+    gs.clear();
+    ws.setGizmo(null);
   }
 }
 
