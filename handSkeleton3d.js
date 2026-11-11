@@ -252,8 +252,15 @@ class HandRig {
     this.tipLayer.renderOrder = 34;
 
     // Palm plate: a single triangle fan through wrist + knuckles.
-    this.palm = new THREE.Mesh(new THREE.BufferGeometry(), this.materials.palm);
+    //
+    // Built once and mutated in place. The vertex count and the index list never
+    // change, so there is no reason to allocate a new geometry per frame.
+    this.palmGeometryData = buildPalmGeometry();
+    this.palm = new THREE.Mesh(this.palmGeometryData.geometry, this.materials.palm);
+    this.palmPoints = palmIndicesToPoints(this.palmGeometryData.indices);
     this.palm.renderOrder = 30;
+    // The palm moves every frame, so its bounds must not be trusted for culling.
+    this.palm.frustumCulled = false;
     this.palmLayer.add(this.palm);
 
     // Bones: a glow sleeve plus a solid core, per connection.
@@ -435,21 +442,64 @@ class HandRig {
     // ---- palm ------------------------------------------------------------
     // Wrist, thumb base and the four knuckles: enough to fill the back of the
     // hand without implying geometry MediaPipe does not actually track.
-    const palmIndices = [0, 1, 5, 9, 13, 17];
-    const verts = new Float32Array(palmIndices.length * 3);
-    palmIndices.forEach((index, i) => {
-      verts[i * 3] = positions[index].x;
-      verts[i * 3 + 1] = positions[index].y;
-      verts[i * 3 + 2] = positions[index].z;
-    });
-    const indices = [];
-    for (let i = 1; i < palmIndices.length - 1; i++) indices.push(0, i, i + 1);
-    this.palm.geometry.dispose();
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(verts, 3));
-    geometry.setIndex(indices);
-    geometry.computeVertexNormals();
-    this.palm.geometry = geometry;
+    //
+    // The geometry is allocated once in the constructor and only its position
+    // and normal buffers are rewritten here. Rebuilding a BufferGeometry every
+    // frame (and disposing the previous one) meant a GPU buffer allocation per
+    // hand per frame, which is exactly the kind of churn the brief rules out.
+    const { indices, position, normal } = this.palmGeometryData;
+    const points = this.palmPoints;
+    for (let i = 0; i < indices.length; i++) {
+      const source = positions[indices[i]];
+      points[i].copy(source);
+      position[i * 3] = source.x;
+      position[i * 3 + 1] = source.y;
+      position[i * 3 + 2] = source.z;
+    }
+
+    // Normals for a flat-ish fan: the face normal of the palm plane. Computed
+    // from the wrist/knuckle spread rather than computeVertexNormals(), which
+    // would rebuild the whole attribute set.
+    this._palmNormalInto(normal);
+
+    this.palmGeometryData.positionAttribute.needsUpdate = true;
+    this.palmGeometryData.normalAttribute.needsUpdate = true;
+  }
+
+  /**
+   * Fill the palm's normal buffer from the palm plane.
+   *
+   * The palm is a fan around the wrist, so a single face normal is correct for
+   * every vertex and stays smooth as the hand moves.
+   */
+  _palmNormalInto(normal) {
+    // palmPoints is indexed by position in PALM_LANDMARKS, not by landmark id:
+    // [0]=wrist, [1]=thumb base, [2..5]=knuckles.
+    const p = this.palmPoints;
+    const wrist = p[0];
+    const indexKnuckle = p[2];
+    const pinkyKnuckle = p[5];
+    const ax = indexKnuckle.x - wrist.x;
+    const ay = indexKnuckle.y - wrist.y;
+    const az = indexKnuckle.z - wrist.z;
+    const bx = pinkyKnuckle.x - wrist.x;
+    const by = pinkyKnuckle.y - wrist.y;
+    const bz = pinkyKnuckle.z - wrist.z;
+    let nx = ay * bz - az * by;
+    let ny = az * bx - ax * bz;
+    let nz = ax * by - ay * bx;
+    const length = Math.hypot(nx, ny, nz);
+    if (length < 1e-8) {
+      // Degenerate palm: any unit normal is as good as another.
+      nx = 0; ny = 0; nz = 1;
+    } else {
+      nx /= length; ny /= length; nz /= length;
+    }
+    for (let i = 0; i < normal.length; i += 3) {
+      normal[i] = nx;
+      normal[i + 1] = ny;
+      normal[i + 2] = nz;
+    }
   }
 
   dispose() {
@@ -461,6 +511,58 @@ class HandRig {
     for (const material of Object.values(this.materials)) material.dispose();
     this.palm.geometry.dispose();
   }
+}
+
+/**
+ * The palm's source landmarks.
+ *
+ * Wrist, thumb base and the four knuckles. This is deliberately NOT a full hand
+ * mesh: these are the only points MediaPipe actually gives us that describe the
+ * back of the hand.
+ */
+export const PALM_LANDMARKS = [0, 1, 5, 9, 13, 17];
+
+/**
+ * Build the palm geometry once.
+ *
+ * A triangle fan around the wrist. The buffers are writable and stay the same
+ * size, so the per-frame update is a memcpy-ish loop rather than an allocation.
+ */
+function buildPalmGeometry() {
+  const count = PALM_LANDMARKS.length;
+  const position = new Float32Array(count * 3);
+  const normal = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) normal[i * 3 + 2] = 1;
+
+  // Fan: (wrist, next, next+1).
+  const indices = [];
+  for (let i = 1; i < count - 1; i++) indices.push(0, i, i + 1);
+
+  const geometry = new THREE.BufferGeometry();
+  const positionAttribute = new THREE.BufferAttribute(position, 3);
+  const normalAttribute = new THREE.BufferAttribute(normal, 3);
+  // Positions change every frame and the palm is never culled, so tell Three.js
+  // not to compute a bounding sphere it would have to replace anyway.
+  positionAttribute.setUsage(THREE.DynamicDrawUsage);
+  normalAttribute.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute("position", positionAttribute);
+  geometry.setAttribute("normal", normalAttribute);
+  geometry.setIndex(indices);
+  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e6);
+
+  return {
+    geometry,
+    indices,
+    position,
+    normal,
+    positionAttribute,
+    normalAttribute
+  };
+}
+
+/** One reusable Vector3 per palm vertex, so the update loop allocates nothing. */
+function palmIndicesToPoints(indices) {
+  return indices.map(() => new THREE.Vector3());
 }
 
 /**

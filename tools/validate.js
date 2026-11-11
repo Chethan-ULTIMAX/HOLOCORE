@@ -2339,6 +2339,56 @@ section("19 · Scene-space hand skeletons");
   check("dispose detaches the layer", skeleton.root.parent === null);
 }
 
+section("19b · Skeleton allocates nothing per frame");
+
+{
+  const { HandSkeleton3D } = await import("../handSkeleton3d.js");
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(42, 1.6, 0.1, 200);
+  const sk = new HandSkeleton3D({ scene, camera, mirror: false });
+
+  const landmarks = (shift = 0) => Array.from({ length: 21 }, (_, i) => ({
+    x: 0.5 + Math.cos(i) * 0.03 + shift, y: 0.5 + Math.sin(i) * 0.03, z: (i % 3) * 0.01
+  }));
+  const world = (shift = 0) => Array.from({ length: 21 }, (_, i) => ({
+    x: Math.cos(i) * 0.03 + shift, y: Math.sin(i) * 0.03, z: (i % 3) * 0.005
+  }));
+
+  sk.update([landmarks()], [world()], ["Right"], { pinched: [false], activity: [0.6], now: 0 });
+  const rig = [...sk.rigs.values()][0];
+  const geometry = rig.palm.geometry;
+  const positionBuffer = geometry.getAttribute("position").array;
+  const indexCount = geometry.index.count;
+
+  // Drive many frames with a moving hand.
+  for (let frame = 1; frame <= 60; frame++) {
+    const shift = Math.sin(frame * 0.1) * 0.02;
+    sk.update([landmarks(shift)], [world(shift)], ["Right"],
+      { pinched: [false], activity: [0.6], now: frame / 30 });
+  }
+
+  check("the palm geometry is built once and reused",
+    rig.palm.geometry === geometry);
+  check("its vertex buffer is not reallocated",
+    rig.palm.geometry.getAttribute("position").array === positionBuffer);
+  check("it keeps the same vertex count", indexCount === 12, String(indexCount));
+
+  // Reusing a buffer is only correct if its contents still track the hand.
+  const before = [...rig.palm.geometry.getAttribute("position").array];
+  sk.update([landmarks(0.05)], [world(0.05)], ["Right"],
+    { pinched: [false], activity: [0.6], now: 3 });
+  const after = [...rig.palm.geometry.getAttribute("position").array];
+  check("the reused buffer still follows the hand",
+    before.some((v, i) => Math.abs(v - after[i]) > 1e-6));
+
+  // Normals must stay unit length, or the palm lights incorrectly.
+  const n = rig.palm.geometry.getAttribute("normal").array;
+  const length = Math.hypot(n[0], n[1], n[2]);
+  check("palm normals stay normalised", Math.abs(length - 1) < 1e-6, length.toFixed(6));
+
+  sk.dispose();
+}
+
 /* ------------------------------------------------------------------------- */
 /* SUMMARY                                                                  */
 /* ------------------------------------------------------------------------- */
