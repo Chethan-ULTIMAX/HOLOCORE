@@ -1402,8 +1402,31 @@ function landmarkViewportPixels(landmark) {
   return { x: stage.x + box.left, y: stage.y + box.top, inside: stage.inside };
 }
 
+/**
+ * Intents that genuinely transform something.
+ *
+ * "point", "hover", "hold", "none", "release" and "tracking-lost" are all
+ * non-destructive: the object is not being moved, so the idle animation should
+ * keep running.
+ */
+const MANIPULATING_INTENTS = new Set([
+  "translate",
+  "rotate",
+  "scale",
+  "explode",
+  "frame",
+  "two-hand grab",
+  "scale + rotate + translate"
+]);
+
 function processHands(now) {
-  if (!tracker || !workspace) return;
+  // Nothing is being manipulated when there is no pipeline at all. Returning
+  // early used to leave the playground's "a hand is acting" flag stuck on from
+  // the last frame that had hands, which silently froze every idle animation.
+  if (!tracker || !workspace) {
+    playground?.setManipulating?.(false);
+    return;
+  }
 
   const hands = tracker.hands || [];
   const handedness = tracker.handedness || [];
@@ -1520,6 +1543,13 @@ function processHands(now) {
   const result = solver.update(activeStates, objectState, now);
   state.gestureMode = result.mode;
   state.intent = result.intent;
+
+  // Tell the playground whether a hand is actively *transforming* something, so
+  // its idle spin can stand down. Only real transforms count: the solver also
+  // reports `active` for hover ("point") and for the SCALE mode's arm-up hold,
+  // neither of which is touching the object. Treating those as manipulation
+  // left the idle spin permanently frozen.
+  playground?.setManipulating?.(MANIPULATING_INTENTS.has(result.intent));
 
   applyGestureResult(result, part);
 

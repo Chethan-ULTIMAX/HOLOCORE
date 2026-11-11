@@ -1178,6 +1178,70 @@ check("the voice chip shows the heard phrase",
 
 vox.stop();
 
+section("5p · Idle spin never fights the user");
+
+{
+  const ip = api.getPlayground();
+  // Earlier sections finish mid-pinch; this section is about the spin rules, so
+  // start from a known idle state rather than from whatever they left behind.
+  ip.setManipulating(false);
+  ip.clear();
+  const first = ip.addPrimitive("cube");
+  const second = ip.addPrimitive("cube");
+  ip.select(null);
+
+  // The harness stubs requestAnimationFrame, so the app's render loop does not
+  // tick. Pump the playground clock directly, exactly as startLoop() would.
+  const tick = seconds => ip.update(seconds);
+
+  tick(1);
+  tick(1);
+  check("unselected primitives still idle-spin",
+    first.group.rotation.y > 0 && second.group.rotation.y > 0,
+    `${first.group.rotation.y.toFixed(2)} / ${second.group.rotation.y.toFixed(2)}`);
+
+  ip.select(first.id);
+  const heldAngle = first.group.rotation.y;
+  tick(1);
+  tick(1);
+  check("a selected primitive holds still",
+    Math.abs(first.group.rotation.y - heldAngle) < 1e-9,
+    `${heldAngle.toFixed(2)} -> ${first.group.rotation.y.toFixed(2)}`);
+  check("other primitives keep spinning while one is selected",
+    second.group.rotation.y > heldAngle, second.group.rotation.y.toFixed(2));
+
+  // A hand rotation must survive the following update untouched.
+  ip.setManipulating(true);
+  ip.setTransform(first.id, { rotationY: 1.0 });
+  tick(1);
+  check("a manual rotation is not fought by the idle spin",
+    first.group.rotation.y === 1.0, String(first.group.rotation.y));
+
+  // Releasing must resume from where it was left, with no jump. Deselect first:
+  // while an object is selected it deliberately holds still, so resuming is only
+  // observable once nothing is selected.
+  ip.setManipulating(false);
+  ip.select(null);
+  tick(0.5);
+  const resumed = first.group.rotation.y;
+  check("the spin resumes from where the hand left it, without a jump",
+    resumed > 1.0 && resumed < 1.2, resumed.toFixed(3));
+
+  // Nothing may drift while a drag is in progress, selected or not.
+  tick(1);
+  const frozen = [first.group.rotation.y, second.group.rotation.y];
+  ip.setManipulating(true);
+  tick(1);
+  tick(1);
+  check("no object drifts while a hand is transforming the scene",
+    Math.abs(first.group.rotation.y - frozen[0]) < 1e-9 &&
+    Math.abs(second.group.rotation.y - frozen[1]) < 1e-9);
+
+  ip.setManipulating(false);
+  ip.clear();
+  ip.select(null);
+}
+
 section("6 · Modes still gate gestures");
 
 const modes = ["select", "move", "rotate", "scale", "explode"];

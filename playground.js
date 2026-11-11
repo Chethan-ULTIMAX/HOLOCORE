@@ -470,11 +470,68 @@ export class Playground {
     this._clock += dt;
     for (const prop of this.props) {
       prop.mixer?.update(dt);
-      // A gentle idle spin so the stage never looks static.
-      if (!prop.mixer && prop.kind === "primitive") {
-        prop.group.rotation.y += dt * 0.22;
+
+      // A gentle idle spin so the stage never looks static — but only for
+      // objects nobody is working on. A selected primitive was still being
+      // spun by 0.22 rad/s underneath the user's own rotation, so letting go
+      // after turning it left the object drifting, and every frame the hand
+      // set a rotation the update immediately added to it.
+      if (prop.mixer || prop.kind !== "primitive") continue;
+
+      // A drag anywhere holds every primitive still: a hand is transforming
+      // the scene, and objects drifting past under it is just confusing.
+      const held = this._isManipulating();
+      const selected = prop.id === this.selectedId;
+      if (held) {
+        // Remember where the user left it, so the idle spin resumes from there
+        // instead of jumping back to the angle it would otherwise have reached.
+        prop._idleAngle = prop.group.rotation.y;
+        prop._idlePaused = true;
+        continue;
       }
+
+      if (selected) {
+        // Selected but not being dragged: still no drift. The user is looking
+        // at this object and needs its orientation to hold still.
+        prop._idleAngle = prop.group.rotation.y;
+        continue;
+      }
+
+      // Resuming: continue from wherever the object was left, so the spin
+      // never snaps. `_idleAngle` is carried forward by the rotation itself.
+      prop._idleAngle = (prop._idleAngle ?? prop.group.rotation.y) + dt * 0.22;
+      prop.group.rotation.y = prop._idleAngle;
+      prop._idlePaused = false;
     }
+  }
+
+  /**
+   * True while a hand (or the pointer) is actively transforming an object.
+   *
+   * Set by the caller around a gesture frame. Kept as a flag rather than
+   * derived from the solver so the playground does not depend on gestures.js.
+   */
+  _isManipulating() {
+    return Boolean(this.manipulating);
+  }
+
+  /** Called by the gesture pipeline when a grab starts and ends. */
+  setManipulating(active) {
+    this.manipulating = Boolean(active);
+  }
+
+  /** Why the idle spin is or is not running, for diagnostics and tests. */
+  idleState() {
+    return {
+      manipulating: Boolean(this.manipulating),
+      selectedId: this.selectedId,
+      props: this.props.map(p => ({
+        id: p.id,
+        kind: p.kind,
+        mixer: Boolean(p.mixer),
+        rotationY: p.group.rotation.y
+      }))
+    };
   }
 
   /** Serializable description, used by the HUD and the voice layer. */
