@@ -2117,9 +2117,13 @@ function projectedTarget() {
  * hand and noise in the size estimate do not push the object around.
  */
 function updateHandDepth(now) {
-  if (!workspace?.gizmo || !playground?.selectedId) {
+  // A selected model component is not a playground prop, so there is nothing for
+  // the box branch below to move; do not arm the gesture and pretend otherwise.
+  const usingProp = Boolean(playground?.selectedId);
+  if (!workspace?.gizmo || !usingProp) {
     depthRegistry.reset();
     state.depth = null;
+    state.depthStart = null;
     return null;
   }
 
@@ -2127,6 +2131,7 @@ function updateHandDepth(now) {
   if (!hand) {
     depthRegistry.reset();
     state.depth = null;
+    state.depthStart = null;
     return null;
   }
 
