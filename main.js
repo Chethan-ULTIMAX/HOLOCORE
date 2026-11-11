@@ -1524,7 +1524,10 @@ function processHands(now) {
   applyGestureResult(result, part);
 
   // ---- pointer, hover and selection ----------------------------------------
-  const pointer = pickPointer(activeStates);
+  // Prefer the hand the solver actually used. The reticle and the object must
+  // be driven by the same hand, or a pinch can be drawn on one hand while the
+  // other one moves the object.
+  const pointer = pickPointer(activeStates, result.activeHand);
   updatePointer(pointer, activeStates, result);
 
   updateGestureLabels(activeStates, result);
@@ -1551,8 +1554,16 @@ function analyzerSettings() {
  * order MediaPipe happened to return. Prefer a pinching hand (you are actively
  * manipulating), then a fully visible one, then the first tracked hand.
  */
-function pickPointer(states) {
+function pickPointer(states, activeHand = null) {
   if (!Array.isArray(states) || !states.length) return null;
+
+  // The solver's choice wins outright. It has already applied the pinch and
+  // lock rules, so re-deriving a preference here could only disagree with it.
+  if (activeHand?.hand && states.includes(activeHand.hand)) {
+    const hand = activeHand.hand;
+    const tip = hand.landmarks?.[8] || hand.indexTip || hand.pinch || null;
+    return { hand: { ...hand, indexTip: tip, pinched: Boolean(hand.pinched) }, state: hand };
+  }
 
   let best = null;
   let bestScore = -Infinity;
