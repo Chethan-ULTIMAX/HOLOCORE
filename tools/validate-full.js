@@ -25,6 +25,31 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as THREE from "three";
 import { VoiceControl } from "../voiceControl.js";
+import { ManipulationSolver } from "../gestures.js";
+import {
+  ratioToTravel,
+  HandDepthTracker,
+  HandDepthRegistry,
+  DEPTH_MODE
+} from "../handDepth.js";
+import {
+  constrainDelta,
+  axisParameter,
+  AXIS_VECTORS,
+  AXIS_HANDLES,
+  PLANE_HANDLES,
+  PLANE_AXES
+} from "../gizmo.js";
+import {
+  viewPlacement,
+  describePlacement,
+  matchingView,
+  safeUp,
+  fitDistance,
+  VIEW_ORDER,
+  VIEW_DIRECTIONS,
+  VIEW_UPS
+} from "../cameraViews.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -71,6 +96,29 @@ global.ResizeObserver = window.ResizeObserver = class {
   unobserve() {}
   disconnect() {}
 };
+// jsdom performs no layout, so every getBoundingClientRect() is 0x0. Real
+// browsers do not behave that way, and a zero-sized viewport makes the pointer
+// mapping degenerate. Give elements a deterministic 16:9 layout so the tests
+// exercise the same geometry the browser provides.
+const VIEWPORT_SIZE = { width: 1280, height: 720 };
+window.Element.prototype.getBoundingClientRect = function getBoundingClientRect() {
+  const isViewport = this.id === "viewport";
+  const rect = isViewport
+    ? { x: 0, y: 0, ...VIEWPORT_SIZE }
+    : { x: 0, y: 0, width: VIEWPORT_SIZE.width, height: VIEWPORT_SIZE.height };
+  return {
+    ...rect, left: rect.x, top: rect.y, right: rect.x + rect.width,
+    bottom: rect.y + rect.height,
+    toJSON() { return this; }
+  };
+};
+Object.defineProperty(window.Element.prototype, "clientWidth", {
+  get() { return VIEWPORT_SIZE.width; }, configurable: true
+});
+Object.defineProperty(window.Element.prototype, "clientHeight", {
+  get() { return VIEWPORT_SIZE.height; }, configurable: true
+});
+
 global.requestAnimationFrame = window.requestAnimationFrame = () => 1;
 global.cancelAnimationFrame = window.cancelAnimationFrame = () => {};
 
@@ -1177,6 +1225,651 @@ check("the voice chip shows the heard phrase",
   doc.getElementById("voice-phrase")?.textContent);
 
 vox.stop();
+
+section("5p · Idle spin never fights the user");
+
+{
+  const ip = api.getPlayground();
+  // Earlier sections finish mid-pinch; this section is about the spin rules, so
+  // start from a known idle state rather than from whatever they left behind.
+  ip.setManipulating(false);
+  ip.clear();
+  const first = ip.addPrimitive("cube");
+  const second = ip.addPrimitive("cube");
+  ip.select(null);
+
+  // The harness stubs requestAnimationFrame, so the app's render loop does not
+  // tick. Pump the playground clock directly, exactly as startLoop() would.
+  const tick = seconds => ip.update(seconds);
+
+  tick(1);
+  tick(1);
+  check("unselected primitives still idle-spin",
+    first.group.rotation.y > 0 && second.group.rotation.y > 0,
+    `${first.group.rotation.y.toFixed(2)} / ${second.group.rotation.y.toFixed(2)}`);
+
+  ip.select(first.id);
+  const heldAngle = first.group.rotation.y;
+  tick(1);
+  tick(1);
+  check("a selected primitive holds still",
+    Math.abs(first.group.rotation.y - heldAngle) < 1e-9,
+    `${heldAngle.toFixed(2)} -> ${first.group.rotation.y.toFixed(2)}`);
+  check("other primitives keep spinning while one is selected",
+    second.group.rotation.y > heldAngle, second.group.rotation.y.toFixed(2));
+
+  // A hand rotation must survive the following update untouched.
+  ip.setManipulating(true);
+  ip.setTransform(first.id, { rotationY: 1.0 });
+  tick(1);
+  check("a manual rotation is not fought by the idle spin",
+    first.group.rotation.y === 1.0, String(first.group.rotation.y));
+
+  // Releasing must resume from where it was left, with no jump. Deselect first:
+  // while an object is selected it deliberately holds still, so resuming is only
+  // observable once nothing is selected.
+  ip.setManipulating(false);
+  ip.select(null);
+  tick(0.5);
+  const resumed = first.group.rotation.y;
+  check("the spin resumes from where the hand left it, without a jump",
+    resumed > 1.0 && resumed < 1.2, resumed.toFixed(3));
+
+  // Nothing may drift while a drag is in progress, selected or not.
+  tick(1);
+  const frozen = [first.group.rotation.y, second.group.rotation.y];
+  ip.setManipulating(true);
+  tick(1);
+  tick(1);
+  check("no object drifts while a hand is transforming the scene",
+    Math.abs(first.group.rotation.y - frozen[0]) < 1e-9 &&
+    Math.abs(second.group.rotation.y - frozen[1]) < 1e-9);
+
+  ip.setManipulating(false);
+  ip.clear();
+  ip.select(null);
+}
+
+section("5q · Seven standard views, correctly oriented");
+
+{
+  const ws = api.getWorkspace();
+  const camera = ws.camera;
+  const controls = ws.controls;
+
+  // A target deliberately away from the origin: every preset must centre on
+  // what it frames, not on world zero.
+  const far = new THREE.Vector3(2.5, 1.2, -3.5);
+
+  for (const id of VIEW_ORDER) {
+    const placement = viewPlacement(id, { target: far, radius: 3, fov: camera.fov });
+    const described = describePlacement(placement);
+    const direction = new THREE.Vector3(...described.direction);
+    const up = new THREE.Vector3(...described.up);
+
+    check(`${id}: camera looks along the named axis`,
+      direction.dot(VIEW_DIRECTIONS[id]) > 0.999,
+      described.direction.map(v => v.toFixed(2)).join(","));
+
+    check(`${id}: frames the target, not the origin`,
+      placement.target.distanceTo(far) < 1e-9,
+      placement.target.toArray().map(v => v.toFixed(1)).join(","));
+
+    // The classic crash: up parallel to the view direction collapses the
+    // camera basis and OrbitControls spins the model unpredictably.
+    check(`${id}: up is not parallel to the view direction`,
+      Math.abs(direction.dot(up)) < 0.9,
+      Math.abs(direction.dot(up)).toFixed(3));
+
+    // The camera must genuinely point at the target once oriented this way.
+    const probe = new THREE.PerspectiveCamera(42, 1.6, 0.1, 200);
+    probe.up.copy(up);
+    probe.position.copy(placement.position);
+    probe.lookAt(placement.target);
+    probe.updateMatrixWorld();
+    const forward = new THREE.Vector3();
+    probe.getWorldDirection(forward);
+    const toTarget = far.clone().sub(placement.position).normalize();
+    check(`${id}: the oriented camera points at the target`,
+      forward.dot(toTarget) > 0.999, forward.dot(toTarget).toFixed(4));
+
+    // And it must be recognised as that view afterwards.
+    check(`${id}: is recognised as the active view`,
+      matchingView(placement.position, far) === id,
+      String(matchingView(placement.position, far)));
+  }
+
+  // Top and Bottom specifically: a plan view must have a horizontal up vector,
+  // otherwise the model appears rotated by an arbitrary roll.
+  for (const id of ["top", "bottom"]) {
+    const up = VIEW_UPS[id];
+    check(`${id}: up is horizontal`, Math.abs(up.y) < 1e-9, up.toArray().join(","));
+  }
+
+  // The default (0,1,0) up would be degenerate for Top. safeUp must rescue it.
+  {
+    const rescued = safeUp(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 1, 0));
+    check("safeUp rescues a degenerate up vector",
+      Math.abs(rescued.dot(new THREE.Vector3(0, 1, 0))) < 0.999 && rescued.lengthSq() > 0.9,
+      rescued.toArray().map(v => v.toFixed(2)).join(","));
+    const normal = safeUp(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 1, 0));
+    check("safeUp leaves a good up vector alone",
+      normal.equals(new THREE.Vector3(0, 1, 0)));
+  }
+
+  // Orbiting away from a preset must clear the indicator rather than lie.
+  {
+    const offAxis = new THREE.Vector3(1, 0.35, 0.8).normalize().multiplyScalar(10);
+    check("an orbited camera matches no preset",
+      matchingView(offAxis, new THREE.Vector3()) === null,
+      String(matchingView(offAxis, new THREE.Vector3())));
+  }
+
+  // Actually switch the live workspace and confirm it lands where it should.
+  {
+    api.getPlayground().clear();
+    const prop = api.getPlayground().addPrimitive("cube");
+    api.getPlayground().setTransform(prop.id, { position: { x: 3, y: 0.5, z: -2 } });
+
+    ws.setView("top", { animate: false, preferSelection: true });
+    check("switching to Top orients the real camera",
+      camera.position.y > camera.position.x && camera.position.y > camera.position.z,
+      camera.position.toArray().map(v => v.toFixed(2)).join(","));
+    check("switching to Top sets a non-degenerate up",
+      Math.abs(camera.up.dot(new THREE.Vector3(0, 1, 0))) < 0.9,
+      camera.up.toArray().map(v => v.toFixed(2)).join(","));
+    check("Top frames the selected object rather than the origin",
+      controls.target.distanceTo(new THREE.Vector3(3, 0.5, -2)) < 1.5,
+      controls.target.toArray().map(v => v.toFixed(2)).join(","));
+    check("the workspace reports Top as the active view",
+      ws.activeView === "top", String(ws.activeView));
+
+    // Switching views must not touch the objects themselves.
+    const before = api.getPlayground().getTransform(prop.id);
+    ws.setView("front", { animate: false });
+    const after = api.getPlayground().getTransform(prop.id);
+    check("changing the camera does not move the objects",
+      before.position.x === after.position.x &&
+      before.position.y === after.position.y &&
+      before.position.z === after.position.z,
+      JSON.stringify(after.position));
+
+    // Orbit controls must still be usable afterwards.
+    check("orbit controls survive a view switch",
+      Boolean(controls) && controls.enabled !== false && controls.target.isVector3);
+    const radiusBefore = camera.position.distanceTo(controls.target);
+    controls.target.set(0, 0, 0);
+    controls.update();
+    check("the camera can still orbit after switching views",
+      camera.position.lengthSq() > 0 && Number.isFinite(radiusBefore),
+      radiusBefore.toFixed(2));
+
+    api.getPlayground().clear();
+    ws.setView("iso", { animate: false });
+  }
+
+  // Only real presets are accepted.
+  check("an unknown view id is rejected", ws.setView("sideways") === null);
+
+  // Framing distance scales with the object, and never puts the camera inside
+  // it or outside OrbitControls' limits.
+  {
+    const small = fitDistance(0.3, 42);
+    const large = fitDistance(6, 42);
+    check("a larger object is framed from further away", large > small,
+      `${small.toFixed(2)} -> ${large.toFixed(2)}`);
+    check("framing distance respects the minimum", small >= 3.2, small.toFixed(2));
+  }
+}
+
+section("5r · Pinch-drag is camera-relative");
+
+{
+  const cam = new THREE.PerspectiveCamera(42, 1.6, 0.1, 200);
+  const hand = (pinched = true) => ({
+    pinched,
+    pinch: { x: 0.5, y: 0.5, z: 0 },
+    indexTip: { x: 0.5, y: 0.4, inside: true },
+    palm: { x: 0.5, y: 0.55 },
+    openPalm: 0.2,
+    pointing: 0.9,
+    landmarks: Array.from({ length: 21 }, () => ({ x: 0.5, y: 0.5, z: 0 }))
+  });
+  const at = (x = 0, y = 0, z = 0) => ({
+    position: { x, y, z }, rotationZ: 0, rotationX: 0, scale: 1
+  });
+
+  // Orient a camera at a standard view, the same way the workspace does.
+  const aim = view => {
+    const p = viewPlacement(view, { target: new THREE.Vector3(), radius: 3, fov: 42 });
+    cam.position.copy(p.position);
+    cam.up.copy(p.up);
+    cam.lookAt(p.target);
+    cam.updateMatrixWorld();
+  };
+
+  /** Grab at NDC (0,0) then move the pointer, returning the world delta. */
+  const drag = (view, ndc, startAt = at()) => {
+    aim(view);
+    const solver = new ManipulationSolver({
+      settings: { mode: "move", limits: { x: 40, y: 40, z: 40 } }
+    });
+    solver.setViewContext({ camera: cam, ndc: { x: 0, y: 0 } });
+    solver.update([hand()], startAt, 0);
+    solver.setViewContext({ camera: cam, ndc });
+    const result = solver.update([hand()], startAt, 0.1);
+    return {
+      x: result.position.x - startAt.position.x,
+      y: result.position.y - startAt.position.y,
+      z: result.position.z - startAt.position.z
+    };
+  };
+
+  // The expectations from the brief, stated as their own cases.
+  const cases = [
+    ["front", { x: 0.2, y: 0 }, { axis: "x", sign: 1, label: "right -> +X" }],
+    ["front", { x: 0, y: 0.2 }, { axis: "y", sign: 1, label: "up -> +Y" }],
+    ["front", { x: -0.2, y: 0 }, { axis: "x", sign: -1, label: "left -> -X" }],
+    ["front", { x: 0, y: -0.2 }, { axis: "y", sign: -1, label: "down -> -Y" }],
+    ["top", { x: 0.2, y: 0 }, { axis: "x", sign: 1, label: "right -> +X" }],
+    ["top", { x: 0, y: 0.2 }, { axis: "z", sign: -1, label: "up -> -Z" }],
+    ["top", { x: 0, y: -0.2 }, { axis: "z", sign: 1, label: "down -> +Z" }],
+    ["left", { x: 0.2, y: 0 }, { axis: "z", sign: 1, label: "right -> +Z" }],
+    ["left", { x: 0, y: 0.2 }, { axis: "y", sign: 1, label: "up -> +Y" }],
+    ["right", { x: 0.2, y: 0 }, { axis: "z", sign: -1, label: "right -> -Z" }],
+    ["back", { x: 0.2, y: 0 }, { axis: "x", sign: -1, label: "right -> -X" }],
+    ["bottom", { x: 0, y: 0.2 }, { axis: "z", sign: 1, label: "up -> +Z" }]
+  ];
+
+  for (const [view, ndc, want] of cases) {
+    const d = drag(view, ndc);
+    const value = d[want.axis];
+    const other = ["x", "y", "z"].filter(a => a !== want.axis);
+    const leakage = Math.max(Math.abs(d[other[0]]), Math.abs(d[other[1]]));
+    check(`${view}: drag ${want.label}`,
+      Math.sign(value) === want.sign && Math.abs(value) > 0.2,
+      `(${d.x.toFixed(2)}, ${d.y.toFixed(2)}, ${d.z.toFixed(2)})`);
+    // Camera-relative movement must stay in the view plane, not drift along the
+    // view axis.
+    check(`${view}: drag ${want.label} does not leak into other axes`,
+      leakage < Math.abs(value) * 0.25,
+      `leak ${leakage.toFixed(3)}`);
+  }
+
+  // The same screen movement must produce different world movement in different
+  // views. This is the whole point: fixed world axes would make these equal.
+  {
+    const front = drag("front", { x: 0.2, y: 0 });
+    const top = drag("top", { x: 0.2, y: 0 });
+    const left = drag("left", { x: 0.2, y: 0 });
+    // Same screen drag, different world axis: that is what "camera-relative"
+    // means. A fixed world-axis solver would have moved both along X.
+    check("the same drag moves a different world axis in different views",
+      Math.abs(front.x) > 0.2 && Math.abs(front.z) < 1e-6 &&
+      Math.abs(left.z) > 0.2 && Math.abs(left.x) < 1e-6,
+      `front=(${front.x.toFixed(2)},${front.z.toFixed(2)}) left=(${left.x.toFixed(2)},${left.z.toFixed(2)})`);
+    check("Top and Front agree on horizontal movement",
+      Math.abs(front.x - top.x) < 1e-6,
+      `${front.x.toFixed(3)} vs ${top.x.toFixed(3)}`);
+    check("Front and Left disagree on horizontal movement",
+      Math.abs(front.x) > 0.2 && Math.abs(front.z) < 1e-6,
+      `front=(${front.x.toFixed(2)},${front.z.toFixed(2)}) left=(${left.x.toFixed(2)},${left.z.toFixed(2)})`);
+  }
+
+  // A grab must not move the object on its first frame.
+  {
+    aim("front");
+    const solver = new ManipulationSolver({
+      settings: { mode: "move", limits: { x: 40, y: 40, z: 40 } }
+    });
+    solver.setViewContext({ camera: cam, ndc: { x: 0.1, y: -0.05 } });
+    const start = at(1, 2, 3);
+    const result = solver.update([hand()], start, 0);
+    check("grabbing does not jump the object",
+      result.position.x === 1 && result.position.y === 2 && result.position.z === 3,
+      `(${result.position.x}, ${result.position.y}, ${result.position.z})`);
+  }
+
+  // A camera change mid-drag must not shift the object: the plane is captured
+  // once and held for the whole grab.
+  {
+    aim("front");
+    const solver = new ManipulationSolver({
+      settings: { mode: "move", limits: { x: 40, y: 40, z: 40 } }
+    });
+    const start = at();
+    solver.setViewContext({ camera: cam, ndc: { x: 0, y: 0 } });
+    solver.update([hand()], start, 0);
+    solver.setViewContext({ camera: cam, ndc: { x: 0.1, y: 0 } });
+    const before = solver.update([hand()], start, 0.1).position.x;
+
+    // Re-aim the camera at a completely different view, without releasing.
+    aim("top");
+    solver.setViewContext({ camera: cam, ndc: { x: 0.1, y: 0 } });
+    const after = solver.update([hand()], start, 0.2).position.x;
+
+    check("a camera change mid-drag does not shift the object",
+      Math.abs(after - before) < 0.35,
+      `${before.toFixed(2)} -> ${after.toFixed(2)}`);
+  }
+
+  // Releasing must drop the plane so the next grab starts fresh.
+  {
+    aim("front");
+    const solver = new ManipulationSolver({
+      settings: { mode: "move", limits: { x: 40, y: 40, z: 40 } }
+    });
+    solver.setViewContext({ camera: cam, ndc: { x: 0, y: 0 } });
+    solver.update([hand()], at(), 0);
+    check("a drag plane is active during a grab", solver.dragPlane.active === true);
+    solver.update([hand(false)], at(), 0.1);
+    check("releasing drops the drag plane", solver.dragPlane.active === false);
+  }
+
+  // Movement is bounded by the stage limits.
+  {
+    aim("front");
+    const solver = new ManipulationSolver({
+      settings: { mode: "move", limits: { x: 2, y: 2, z: 2 } }
+    });
+    solver.setViewContext({ camera: cam, ndc: { x: 0, y: 0 } });
+    solver.update([hand()], at(), 0);
+    solver.setViewContext({ camera: cam, ndc: { x: 1, y: 1 } });
+    const result = solver.update([hand()], at(), 0.1);
+    check("camera-relative movement respects the stage limits",
+      Math.abs(result.position.x) <= 2 && Math.abs(result.position.y) <= 2,
+      `(${result.position.x.toFixed(2)}, ${result.position.y.toFixed(2)})`);
+  }
+
+  // With no camera supplied, the old behaviour must still work, so headless
+  // callers and existing tests are not broken.
+  {
+    const solver = new ManipulationSolver({
+      settings: { mode: "move", limits: { x: 40, y: 40, z: 40 } }
+    });
+    solver.update([hand()], at(), 0);
+    const moved = solver.update(
+      [{ ...hand(), pinch: { x: 0.7, y: 0.5, z: 0 } }], at(), 0.1
+    );
+    check("without a camera the solver still translates",
+      moved.intent === "translate" && moved.position.x > 0,
+      String(moved.position.x));
+  }
+}
+
+section("5s · Translation gizmo");
+
+{
+  const ws = api.getWorkspace();
+  const gs = api.getPlayground();
+
+  // ---- pure constraint rules ---------------------------------------------
+  for (const axis of AXIS_HANDLES) {
+    const out = constrainDelta(axis, { x: 3, y: 5, z: 7 });
+    const others = ["x", "y", "z"].filter(a => a !== axis);
+    check(`axis ${axis} handle moves only ${axis.toUpperCase()}`,
+      out[axis] === { x: 3, y: 5, z: 7 }[axis] &&
+      others.every(a => out[a] === 0),
+      JSON.stringify(out));
+  }
+  for (const plane of PLANE_HANDLES) {
+    const out = constrainDelta(plane, { x: 3, y: 5, z: 7 });
+    const blocked = ["x", "y", "z"].find(a => !PLANE_AXES[plane].includes(a));
+    check(`plane ${plane} handle blocks ${blocked.toUpperCase()}`,
+      out[blocked] === 0 &&
+      PLANE_AXES[plane].every(a => out[a] === { x: 3, y: 5, z: 7 }[a]),
+      JSON.stringify(out));
+  }
+
+  // A ray crossing the axis at a known point must report that distance.
+  {
+    const ray = new THREE.Ray(new THREE.Vector3(2, 5, 0), new THREE.Vector3(0, -1, 0));
+    const t = axisParameter(new THREE.Vector3(), AXIS_VECTORS.x, ray);
+    check("closest-approach finds the crossing point", Math.abs(t - 2) < 1e-9, String(t));
+  }
+  // A ray parallel to the axis cannot define a position: refuse, do not produce
+  // a huge number.
+  {
+    const ray = new THREE.Ray(new THREE.Vector3(5, 0, 0), new THREE.Vector3(1, 0, 0));
+    check("a ray parallel to the axis is refused",
+      axisParameter(new THREE.Vector3(), AXIS_VECTORS.x, ray) === null);
+  }
+
+  // ---- visibility rules ---------------------------------------------------
+  {
+    gs.clear();
+    ws.setGizmo(null);
+    check("no selection means no gizmo", ws.gizmo?.root.visible === false ||
+      ws.gizmo === null, String(ws.gizmo?.root.visible));
+
+    const prop = gs.addPrimitive("cube");
+    gs.setTransform(prop.id, { position: { x: 2, y: 1.5, z: -1 } });
+    gs.select(prop.id);
+    api._internals.selectProp?.(prop.id);
+    check("selecting a prop shows the gizmo", ws.gizmo?.root.visible === true);
+    check("the gizmo sits on the selection",
+      ws.gizmo.root.position.distanceTo(prop.group.position) < 1e-6,
+      ws.gizmo.root.position.toArray().map(v => v.toFixed(2)).join(","));
+
+    // It must follow the object when the object moves.
+    gs.setTransform(prop.id, { position: { x: -1, y: 0.5, z: 2 } });
+    ws.gizmo.update(ws.camera);
+    check("the gizmo follows the object",
+      ws.gizmo.root.position.distanceTo(new THREE.Vector3(-1, 0.5, 2)) < 1e-6,
+      ws.gizmo.root.position.toArray().map(v => v.toFixed(2)).join(","));
+
+    gs.select(null);
+    api._internals.selectProp?.(null);
+    check("clearing the selection hides the gizmo", ws.gizmo?.root.visible === false);
+  }
+
+  // ---- constant on-screen size -------------------------------------------
+  {
+    gs.clear();
+    const prop = gs.addPrimitive("cube");
+    ws.setGizmo(prop.group);
+    ws.camera.position.set(0, 3, 8);
+    ws.camera.lookAt(0, 0, 0);
+    ws.camera.updateMatrixWorld();
+    ws.gizmo.update(ws.camera);
+    const near = ws.gizmo.root.scale.x;
+    ws.camera.position.set(0, 12, 32);
+    ws.camera.lookAt(0, 0, 0);
+    ws.camera.updateMatrixWorld();
+    ws.gizmo.update(ws.camera);
+    const far = ws.gizmo.root.scale.x;
+    check("the gizmo grows with distance to stay legible", far > near,
+      `${near.toFixed(3)} -> ${far.toFixed(3)}`);
+    check("the gizmo stays within sane bounds", far <= 6 && near >= 0.08,
+      `${near.toFixed(3)}, ${far.toFixed(3)}`);
+  }
+
+  // ---- an axis drag moves the object along exactly one axis --------------
+  {
+    gs.clear();
+    const prop = gs.addPrimitive("cube");
+    gs.setTransform(prop.id, { position: { x: 0, y: 0, z: 0 } });
+    ws.setGizmo(prop.group);
+    ws.camera.position.set(0, 1, 10);
+    ws.camera.lookAt(0, 0, 0);
+    ws.camera.updateMatrixWorld();
+    ws.gizmo.update(ws.camera);
+
+    const origin = ws.gizmo.root.position.clone();
+    const scale = ws.gizmo.root.scale.x;
+    // Two rays from above, one screen-unit apart along X, both crossing the axis.
+    const rayA = new THREE.Ray(
+      new THREE.Vector3(origin.x + 0.1 * scale, origin.y + 6, origin.z + 6),
+      new THREE.Vector3(0, -1, -1).normalize()
+    );
+    const rayB = new THREE.Ray(
+      new THREE.Vector3(origin.x + 0.9 * scale, origin.y + 6, origin.z + 6),
+      new THREE.Vector3(0, -1, -1).normalize()
+    );
+
+    check("an X handle drag begins", ws.gizmo.beginDrag(rayA, "x") === true);
+    const delta = ws.gizmo.drag(rayB);
+    check("the X handle reports movement only on X",
+      delta && Math.abs(delta.y) < 1e-9 && Math.abs(delta.z) < 1e-9 && delta.x > 0.5,
+      delta ? `(${delta.x.toFixed(2)}, ${delta.y.toFixed(2)}, ${delta.z.toFixed(2)})` : "null");
+
+    // Applying it must move exactly that far.
+    const before = gs.getTransform(prop.id).position;
+    gs.setTransform(prop.id, {
+      position: { x: before.x + delta.x, y: before.y + delta.y, z: before.z + delta.z }
+    });
+    const after = gs.getTransform(prop.id).position;
+    check("the object moves by exactly the reported delta",
+      Math.abs(after.x - before.x - delta.x) < 1e-9 &&
+      Math.abs(after.y - before.y) < 1e-9,
+      `${after.x.toFixed(3)}`);
+
+    ws.gizmo.endDrag();
+    check("ending a drag clears it", ws.gizmo.dragging === null);
+    check("dragging after release does nothing", ws.gizmo.drag(rayB) === null);
+  }
+
+  // ---- the gizmo's meshes are not part of the exported model -------------
+  {
+    const count = ws.scene.children.filter(c => c.name === "translation-gizmo").length;
+    check("the gizmo lives at the scene root, not inside the model", count === 1, String(count));
+    gs.clear();
+    ws.setGizmo(null);
+  }
+}
+
+section("5t · Depth is calibrated, not guessed");
+
+{
+  // ---- the transfer function --------------------------------------------
+  check("no size change means no depth travel",
+    ratioToTravel(1).travel === 0 && ratioToTravel(1).engaged === false);
+
+  // The dead zone must be a plateau, not a step: sitting just inside it and just
+  // outside must not produce a visible jump.
+  {
+    const inside = ratioToTravel(1 + DEPTH_MODE.deadZone * 0.9);
+    const edge = ratioToTravel(1 + DEPTH_MODE.deadZone * 1.01);
+    check("the dead zone absorbs jitter", inside.travel === 0 && inside.engaged === false);
+    check("leaving the dead zone does not jump",
+      Math.abs(edge.travel) < 0.3,
+      edge.travel.toFixed(3));
+  }
+
+  // Monotonic in both directions, and symmetric about 1.
+  {
+    const near = ratioToTravel(1.3).travel;
+    const nearer = ratioToTravel(1.6).travel;
+    const far = ratioToTravel(0.7).travel;
+    const farther = ratioToTravel(0.4).travel;
+    check("a larger hand moves the object one way, monotonically",
+      near > 0 && nearer > near, `${near.toFixed(2)} -> ${nearer.toFixed(2)}`);
+    check("a smaller hand moves it the other way, monotonically",
+      far < 0 && farther < far, `${far.toFixed(2)} -> ${farther.toFixed(2)}`);
+    check("depth is symmetric about the reference",
+      Math.abs(ratioToTravel(0.75).travel + ratioToTravel(1.25).travel) < 1e-9);
+  }
+
+  check("depth travel is clamped",
+    Math.abs(ratioToTravel(50).travel) <= DEPTH_MODE.maxTravel + 1e-9,
+    String(ratioToTravel(50).travel));
+  check("depth sensitivity scales travel",
+    Math.abs(ratioToTravel(1.3, { sensitivity: 2 }).travel -
+      2 * ratioToTravel(1.3).travel) < 1e-9);
+  check("depth can be inverted", ratioToTravel(1.3, { invert: true }).travel < 0);
+
+  // ---- activation is deliberate -----------------------------------------
+  {
+    const openHand = { openPalm: 0.9, pinched: false, pointing: 0.1, size: 0.11 };
+
+    const quick = new HandDepthTracker();
+    quick.update(openHand, 0);
+    check("one frame of the depth pose does not engage", quick.active === false);
+
+    const held = new HandDepthTracker();
+    for (let i = 0; i < DEPTH_MODE.activationFrames - 1; i++) held.update(openHand, i * 0.033);
+    check("holding short of the threshold does not engage", held.active === false);
+    const engaged = held.update(openHand, 1);
+    check("holding the pose engages depth", engaged.active === true);
+    check("engagement captures a reference size",
+      Math.abs(engaged.reference - 0.11) < 1e-9, String(engaged.reference));
+    check("engagement does not move the object", engaged.travel === 0);
+
+    // A pinch must never arm depth: that would fight the drag.
+    const pinch = new HandDepthTracker();
+    for (let i = 0; i < 30; i++) {
+      pinch.update({ ...openHand, pinched: true }, i * 0.033);
+    }
+    check("pinching never arms depth", pinch.active === false);
+
+    // Nor may a pointing hand.
+    const point = new HandDepthTracker();
+    for (let i = 0; i < 30; i++) {
+      point.update({ ...openHand, pointing: 0.9 }, i * 0.033);
+    }
+    check("pointing never arms depth", point.active === false);
+
+    // A partial openPalm is not the pose either.
+    const half = new HandDepthTracker();
+    for (let i = 0; i < 30; i++) {
+      half.update({ ...openHand, openPalm: 0.55 }, i * 0.033);
+    }
+    check("a half-open hand does not arm depth", half.active === false);
+  }
+
+  // ---- tracking loss resets the reference -------------------------------
+  {
+    const tracker = new HandDepthTracker();
+    const openHand = { openPalm: 0.9, pinched: false, pointing: 0.1, size: 0.1 };
+    for (let i = 0; i < DEPTH_MODE.activationFrames + 1; i++) {
+      tracker.update(openHand, i * 0.033);
+    }
+    check("depth is active before tracking is lost", tracker.active === true);
+    tracker.update(null, 1);
+    check("losing the hand resets depth", tracker.active === false && tracker.reference === null);
+  }
+
+  // ---- two hands keep separate references -------------------------------
+  {
+    const registry = new HandDepthRegistry();
+    const openHand = (size) => ({ openPalm: 0.9, pinched: false, pointing: 0.1, size });
+    // Left hand is close to the camera, right hand is far: different apparent
+    // sizes. Each must calibrate against its own.
+    for (let i = 0; i < DEPTH_MODE.activationFrames; i++) {
+      registry.update("left", openHand(0.20), i * 0.033);
+      registry.update("right", openHand(0.08), i * 0.033);
+    }
+    const left = registry.update("left", openHand(0.20), 1);
+    const right = registry.update("right", openHand(0.08), 1);
+    check("each hand keeps its own depth reference",
+      Math.abs(left.reference - 0.20) < 0.01 && Math.abs(right.reference - 0.08) < 0.01,
+      `${left.reference?.toFixed(3)} vs ${right.reference?.toFixed(3)}`);
+    check("two different-sized hands at rest produce no travel",
+      Math.abs(left.travel) < 0.05 && Math.abs(right.travel) < 0.05,
+      `${left.travel.toFixed(3)}, ${right.travel.toFixed(3)}`);
+    check("the registry tracks both hands", registry.size === 2);
+    registry.forget("left");
+    check("forgetting a hand drops its state", registry.size === 1);
+  }
+
+  // ---- depth never depends on landmark z --------------------------------
+  {
+    // Identical hands with wildly different reported z must produce identical
+    // depth: z is what the old code wrongly trusted.
+    const base = { openPalm: 0.9, pinched: false, pointing: 0.1, size: 0.1 };
+    const a = new HandDepthTracker();
+    const b = new HandDepthTracker();
+    for (let i = 0; i < DEPTH_MODE.activationFrames; i++) {
+      a.update({ ...base, z: -0.9 }, i * 0.033);
+      b.update({ ...base, z: 0.9 }, i * 0.033);
+    }
+    const ra = a.update({ ...base, z: -0.9 }, 1);
+    const rb = b.update({ ...base, z: 0.9 }, 1);
+    check("landmark z has no influence on depth",
+      Math.abs(ra.travel - rb.travel) < 1e-9 && ra.reference === rb.reference,
+      `${ra.travel} vs ${rb.travel}`);
+  }
+}
 
 section("6 · Modes still gate gestures");
 

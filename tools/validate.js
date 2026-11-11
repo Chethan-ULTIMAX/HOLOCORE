@@ -22,6 +22,7 @@ import {
   OneEuroPoint,
   HandAnalyzer,
   ManipulationSolver,
+  resolveActiveHand,
   pinchStrength,
   fingerExtensions,
   pointingConfidence,
@@ -581,6 +582,133 @@ const neutralObject = () => ({
 /* ------------------------------------------------------------------------- */
 /* 4. ASSISTANT                                                              */
 /* ------------------------------------------------------------------------- */
+
+section("3x · Active-hand selection is stable and order-independent");
+
+{
+  /** A minimal hand state, enough for the solver's decisions. */
+  const hand = (over = {}) => ({
+    pinched: false,
+    pinch: { x: 0.5, y: 0.5, z: 0 },
+    indexTip: { x: 0.5, y: 0.4, inside: true },
+    palm: { x: 0.5, y: 0.55 },
+    landmarks: Array.from({ length: 21 }, () => ({ x: 0.5, y: 0.5, z: 0 })),
+    openPalm: 0.2,
+    pointing: 0.9,
+    ...over
+  });
+  const freshObject = () => ({
+    position: { x: 0, y: 0, z: 0 }, rotationZ: 0, rotationX: 0, scale: 1
+  });
+
+  // The pointer preferred a pinching hand while every modal mode used hands[0],
+  // so the outcome depended on the order MediaPipe happened to return.
+  for (const order of ["open-first", "pinch-first"]) {
+    const open = hand({ palm: { x: 0.3, y: 0.5 }, pinch: { x: 0.3, y: 0.5, z: 0 } });
+    const pinch = hand({ pinched: true, palm: { x: 0.75, y: 0.5 }, pinch: { x: 0.75, y: 0.5, z: 0 } });
+    const hands = order === "open-first" ? [open, pinch] : [pinch, open];
+    const solver = new ManipulationSolver({ settings: { mode: "move" } });
+    const result = solver.update(hands, freshObject(), 0);
+    check(`a pinching second hand still grabs (${order})`,
+      result.active === true && result.intent === "translate", result.intent);
+    check(`the pinching hand is the one that drove (${order})`,
+      result.activeHand?.hand.pinched === true);
+  }
+
+  // Once a hand is driving, a second pinch must not steal the gesture.
+  {
+    const solver = new ManipulationSolver({ settings: { mode: "move" } });
+    const first = hand({ pinched: true, palm: { x: 0.3, y: 0.5 }, pinch: { x: 0.3, y: 0.5, z: 0 } });
+    const second = hand({ palm: { x: 0.8, y: 0.5 } });
+    solver.update([first, second], freshObject(), 0);
+    const lockedKey = solver.activeKey;
+    // Now the other hand pinches too.
+    const secondPinching = hand({ pinched: true, palm: { x: 0.8, y: 0.5 }, pinch: { x: 0.8, y: 0.5, z: 0 } });
+    solver.update([first, secondPinching], freshObject(), 0.1);
+    check("a second pinch does not steal an in-progress drag",
+      solver.activeKey === lockedKey, `${lockedKey} -> ${solver.activeKey}`);
+    check("the driving hand is the one that started the drag",
+      solver.activeHand === first);
+  }
+
+  // Two open hands must never transform anything on their own.
+  {
+    const solver = new ManipulationSolver({ settings: { mode: "auto" } });
+    const a = hand({ palm: { x: 0.15, y: 0.5 }, openPalm: 0.1 });
+    const b = hand({ palm: { x: 0.85, y: 0.5 }, openPalm: 0.1 });
+    const result = solver.update([a, b], freshObject(), 0);
+    // Hovering ("point") is allowed and transforms nothing; what must never
+    // happen is a translate/rotate/scale/explode the user did not ask for.
+    const transforms = ["translate", "rotate", "scale", "explode", "frame",
+      "two-hand grab", "scale + rotate + translate"];
+    check("two open hands do not manipulate the object",
+      result.active === false && !transforms.includes(result.intent), result.intent);
+  }
+
+  // Keeping the two hands high and apart used to be enough to start framing,
+  // which is not a gesture anyone performs on purpose.
+  {
+    const solver = new ManipulationSolver({ settings: { mode: "auto" } });
+    const a = hand({ palm: { x: 0.1, y: 0.2 }, openPalm: 0.3 });
+    const b = hand({ palm: { x: 0.9, y: 0.8 }, openPalm: 0.3 });
+    const result = solver.update([a, b], freshObject(), 0);
+    check("hands merely being far apart is not a gesture",
+      result.active === false, result.intent);
+  }
+
+  // Both hands pinching is unmistakably deliberate.
+  {
+    const solver = new ManipulationSolver({ settings: { mode: "auto" } });
+    const a = hand({ pinched: true, palm: { x: 0.25, y: 0.5 } });
+    const b = hand({ pinched: true, palm: { x: 0.75, y: 0.5 } });
+    const result = solver.update([a, b], freshObject(), 0);
+    check("both hands pinching starts a two-hand gesture",
+      result.active === true && result.intent === "two-hand grab", result.intent);
+  }
+
+  // One pinching hand in auto mode must be a one-hand manipulation, not a frame.
+  {
+    const solver = new ManipulationSolver({ settings: { mode: "auto" } });
+    const a = hand({ pinched: true, palm: { x: 0.3, y: 0.5 }, pinch: { x: 0.3, y: 0.5, z: 0 } });
+    const b = hand({ palm: { x: 0.8, y: 0.5 }, openPalm: 0.1 });
+    const result = solver.update([a, b], freshObject(), 0);
+    check("one pinch with a second hand present is a one-hand grab",
+      result.intent === "translate", result.intent);
+  }
+
+  // The resolver itself, in isolation.
+  {
+    const a = hand({ pinched: false });
+    const b = hand({ pinched: true });
+    check("the resolver prefers a pinching hand", resolveActiveHand([a, b]).hand === b);
+    check("the resolver keeps a locked hand",
+      resolveActiveHand([a, b], { lockedKey: "hand-0", keyOf: (h, i) => `hand-${i}` }).hand === a);
+    check("the resolver falls back to the first hand",
+      resolveActiveHand([a, hand({ pinched: false })]).hand === a);
+    check("the resolver handles no hands",
+      resolveActiveHand([]).hand === null && resolveActiveHand(null).hand === null);
+  }
+
+  // Losing every hand must release cleanly and reset the lock.
+  {
+    const solver = new ManipulationSolver({ settings: { mode: "move" } });
+    solver.update([hand({ pinched: true })], freshObject(), 0);
+    const lost = solver.update([], freshObject(), 0.2);
+    check("losing tracking releases the gesture",
+      lost.intent === "tracking-lost" && lost.active === false, lost.intent);
+  }
+
+  // A hand leaving the array must not leave a stale lock pointing at nothing.
+  {
+    const solver = new ManipulationSolver({ settings: { mode: "move" } });
+    const left = hand({ pinched: true, palm: { x: 0.25, y: 0.5 } });
+    const right = hand({ pinched: true, palm: { x: 0.75, y: 0.5 } });
+    solver.update([left, right], freshObject(), 0);
+    const result = solver.update([right], freshObject(), 0.1);
+    check("the remaining hand takes over cleanly",
+      result.activeHand?.hand === right, String(result.activeHand?.key));
+  }
+}
 
 section("4 · Engineering assistant (contextual answers)");
 
@@ -2209,6 +2337,56 @@ section("19 · Scene-space hand skeletons");
 
   skeleton.dispose();
   check("dispose detaches the layer", skeleton.root.parent === null);
+}
+
+section("19b · Skeleton allocates nothing per frame");
+
+{
+  const { HandSkeleton3D } = await import("../handSkeleton3d.js");
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(42, 1.6, 0.1, 200);
+  const sk = new HandSkeleton3D({ scene, camera, mirror: false });
+
+  const landmarks = (shift = 0) => Array.from({ length: 21 }, (_, i) => ({
+    x: 0.5 + Math.cos(i) * 0.03 + shift, y: 0.5 + Math.sin(i) * 0.03, z: (i % 3) * 0.01
+  }));
+  const world = (shift = 0) => Array.from({ length: 21 }, (_, i) => ({
+    x: Math.cos(i) * 0.03 + shift, y: Math.sin(i) * 0.03, z: (i % 3) * 0.005
+  }));
+
+  sk.update([landmarks()], [world()], ["Right"], { pinched: [false], activity: [0.6], now: 0 });
+  const rig = [...sk.rigs.values()][0];
+  const geometry = rig.palm.geometry;
+  const positionBuffer = geometry.getAttribute("position").array;
+  const indexCount = geometry.index.count;
+
+  // Drive many frames with a moving hand.
+  for (let frame = 1; frame <= 60; frame++) {
+    const shift = Math.sin(frame * 0.1) * 0.02;
+    sk.update([landmarks(shift)], [world(shift)], ["Right"],
+      { pinched: [false], activity: [0.6], now: frame / 30 });
+  }
+
+  check("the palm geometry is built once and reused",
+    rig.palm.geometry === geometry);
+  check("its vertex buffer is not reallocated",
+    rig.palm.geometry.getAttribute("position").array === positionBuffer);
+  check("it keeps the same vertex count", indexCount === 12, String(indexCount));
+
+  // Reusing a buffer is only correct if its contents still track the hand.
+  const before = [...rig.palm.geometry.getAttribute("position").array];
+  sk.update([landmarks(0.05)], [world(0.05)], ["Right"],
+    { pinched: [false], activity: [0.6], now: 3 });
+  const after = [...rig.palm.geometry.getAttribute("position").array];
+  check("the reused buffer still follows the hand",
+    before.some((v, i) => Math.abs(v - after[i]) > 1e-6));
+
+  // Normals must stay unit length, or the palm lights incorrectly.
+  const n = rig.palm.geometry.getAttribute("normal").array;
+  const length = Math.hypot(n[0], n[1], n[2]);
+  check("palm normals stay normalised", Math.abs(length - 1) < 1e-6, length.toFixed(6));
+
+  sk.dispose();
 }
 
 /* ------------------------------------------------------------------------- */

@@ -23,6 +23,9 @@ import { HandOverlay } from "./handOverlay.js";
 import { HandSkeleton3D } from "./handSkeleton3d.js";
 import { Playground, PRIMITIVES } from "./playground.js";
 import { chimes } from "./chimes.js";
+import { VIEW_LABELS } from "./cameraViews.js";
+import { HandDepthRegistry } from "./handDepth.js";
+import { OneEuroFilter } from "./gestures.js";
 import { VoiceControl, VOICE_STATUS, COLOR_PALETTE, parseCommand } from "./voiceControl.js";
 import { MODES, getMode, isMode, instructionFor } from "./interactionModes.js";
 import { landmarkToNdc, landmarkToStage, coverFit } from "./handGeometry.js";
@@ -98,6 +101,8 @@ const dom = {
   hudObjects: $("#hud-objects"),
   hudObjectName: $("#hud-object-name"),
   voiceChip: $("#voice-chip"),
+  viewCube: $("#view-cube"),
+  viewCubeLabel: $("#view-cube-label"),
   voiceState: $("#voice-state"),
   voicePhrase: $("#voice-phrase"),
   sceneOutliner: $("#scene-outliner"),
@@ -209,6 +214,14 @@ const state = {
   intent: "none",
   /** Active interaction mode id (select | move | rotate | scale | explode). */
   mode: "select",
+  /** Gizmo handles: the transform a drag started from, and an in-flight drag. */
+  gizmoStart: null,
+  gizmoDrag: false,
+  handGizmo: null,
+  gizmoHintShown: false,
+  /** Hands-free depth: latest reading, and the Z the gesture started from. */
+  depth: null,
+  depthStart: null,
   /** Full-workspace camera vs. small preview card. */
   cameraView: "workspace",
   /** True while the workspace video element is actually showing frames. */
@@ -353,6 +366,15 @@ function applyNonSceneSettings() {
   dom.workspaceVideo?.classList.toggle("unmirrored", !settings.camera.mirror);
   overlay?.updateSettings?.(settings.camera);
   overlayWorkspace?.updateSettings?.(settings.camera);
+  // The scene-space skeletons must follow the mirror setting too. Without this
+  // the preview flipped while the 3D hands stayed put, which is precisely the
+  // mismatch the coordinate module now prevents. `updateSettings` reconfigure
+  // the existing rigs; it does not rebuild them, so the change is instant and
+  // tracking is not interrupted.
+  skeleton3d?.updateSettings?.({
+    mirror: settings.camera.mirror,
+    smoothing: settings.gesture.smoothing
+  });
   dom.viewport?.style.setProperty("--scrim-strength", String(settings.camera.scrim ?? 0));
   const workspaceViewInput = document.getElementById("set-workspace-view");
   if (workspaceViewInput) workspaceViewInput.checked = settings.camera.workspaceView !== false;
@@ -448,9 +470,74 @@ function boot() {
   }
 
   installGlErrorWatch(workspace);
+  // Standard-view controller. Safe to call here: it only touches the DOM and
+  // the workspace's camera API.
+  setupViewCube();
 
   // Scene-space hand skeletons: real geometry so hands can be occluded by the
   // model and share its lighting, which a 2D overlay can never do.
+  // A mouse drag on a gizmo handle moves the selection. Hand input goes through
+  // the same solver path (see processHands), so both devices share one
+  // constraint implementation.
+  // Capture the transform the drag starts from. The gizmo reports a cumulative
+  // delta, so applying it to a moving reference would run away.
+  workspace.onGizmoBegin = () => {
+    if (playground?.selectedId) {
+      const prop = playground.byId.get(playground.selectedId);
+      const pos = prop ? playground.getTransform(prop.id).position : null;
+      state.gizmoStart = pos ? { x: pos.x, y: pos.y, z: pos.z } : null;
+    } else if (state.partId) {
+      const record = workspace.partTransforms?.get?.(workspace.getPart?.(state.partId));
+      const offset = record?.offset;
+      state.gizmoStart = offset
+        ? { x: offset.x, y: offset.y, z: offset.z }
+        : { x: 0, y: 0, z: 0 };
+    } else {
+      state.gizmoStart = null;
+    }
+    state.gizmoDrag = true;
+  };
+
+  workspace.onGizmoEnd = () => {
+    state.gizmoDrag = false;
+    state.gizmoStart = null;
+  };
+
+  workspace.onGizmoChange = (delta, handle) => {
+    if (!delta) return;
+    if (playground?.selectedId) {
+      const prop = playground.byId.get(playground.selectedId);
+      if (!prop) return;
+      // The delta is measured from the drag start, so apply it to the transform
+      // captured when the drag began rather than accumulating per frame.
+      const start = state.gizmoStart || playground.getTransform(prop.id).position;
+      const position = {
+        x: clamp(start.x + delta.x, -STAGE_BOUNDS.x, STAGE_BOUNDS.x),
+        y: clamp(start.y + delta.y, -STAGE_BOUNDS.y, STAGE_BOUNDS.y),
+        z: clamp(start.z + delta.z, -STAGE_BOUNDS.z, STAGE_BOUNDS.z)
+      };
+      playground.setTransform(prop.id, { position });
+      updateObjectHud?.();
+    } else if (state.partId) {
+      // Components carry an offset from their exploded/home position, so the
+      // gizmo delta is applied to that offset rather than to - and the delta is
+      // cumulative from the drag start, not per frame.
+      const start = state.gizmoStart;
+      if (!start) return;
+      workspace.setPartTransform(state.partId, {
+        offset: {
+          x: start.x + delta.x,
+          y: start.y + delta.y,
+          z: start.z + delta.z
+        }
+      });
+    }
+  };
+
+  // Let the workspace frame a selected playground object: switching to Front
+  // with a prop at x=4 must centre the prop, not the model behind it.
+  workspace.onFramingTarget = () => playground?.get?.()?.group || null;
+
   skeleton3d = new HandSkeleton3D({
     scene: workspace.scene,
     camera: workspace.camera,
@@ -703,7 +790,40 @@ function selectProp(id, source = "hand") {
   }
   refreshSceneOutliner();
   updateObjectHud();
+  syncGizmo();
   return prop;
+}
+
+/**
+ * Attach the translation gizmo to the current selection.
+ *
+ * A selected playground prop gets handles; a selected model component gets
+ * handles too. Nothing selected means no gizmo: a permanent gizmo floating at
+ * the origin would be exactly the kind of clutter the brief warns about.
+ */
+function syncGizmo() {
+  if (!workspace?.setGizmo) return;
+  // Never swap the target out from under an in-flight drag: the handles would
+  // jump and the object would keep moving without a pointer on it.
+  if (state.gizmoDrag) return;
+
+  let target = null;
+  const prop = playground?.selectedId ? playground.byId.get(playground.selectedId) : null;
+  if (prop?.group) {
+    target = prop.group;
+  } else if (state.partId) {
+    const part = workspace.getPart?.(state.partId);
+    if (part) target = part.mesh || part.object3D || part;
+  }
+  workspace.setGizmo(target || null);
+
+  // Tell the user, once, that the handles exist. Without it the gizmo is only
+  // discoverable by accident.
+  if (target && !state.gizmoHintShown) {
+    state.gizmoHintShown = true;
+    toast("Drag a coloured arrow to move along one axis · pinch it to do the same by hand",
+      "accent", 3600);
+  }
 }
 
 function updatePartListSelection() {
@@ -889,6 +1009,59 @@ function renderImportedPartList() {
     });
     dom.partList.appendChild(button);
   });
+}
+
+/**
+ * Standard-view controller.
+ *
+ * Wires the seven faces, keyboard shortcuts and the active indicator. The
+ * workspace owns the maths; this only decides what the user asked for.
+ */
+function setupViewCube() {
+  if (!dom.viewCube || !workspace) return;
+
+  const faces = [...dom.viewCube.querySelectorAll("[data-view]")];
+  for (const face of faces) {
+    face.addEventListener("click", event => {
+      event.preventDefault();
+      setStandardView(face.dataset.view);
+    });
+  }
+
+  // Reflect whatever the camera is doing, including orbits the user performs
+  // by hand, so the indicator never lies about the current orientation.
+  workspace.onCameraChange = () => updateViewCube();
+
+  const shortcuts = { 1: "front", 2: "top", 3: "iso" };
+  dom.viewCube.dataset.shortcuts = JSON.stringify(shortcuts);
+  updateViewCube();
+}
+
+/** Switch to a standard view and keep the indicator in step. */
+function setStandardView(id) {
+  if (!workspace) return;
+  // If the pointer is over something, frame that; otherwise the model. The
+  // workspace resolves the same way, and this keeps the two in agreement.
+  const framed = workspace.setView(id, { animate: true, preferSelection: true });
+  if (!framed) return;
+  updateViewCube(framed);
+  const label = VIEW_LABELS[framed] || framed;
+  toast(`${label} view`, "", 1200);
+}
+
+/** Light the face matching the camera, or show FREE when orbiting. */
+function updateViewCube(pending = null) {
+  if (!dom.viewCube) return;
+  const active = pending || workspace?.activeView || null;
+  for (const face of dom.viewCube.querySelectorAll("[data-view]")) {
+    face.classList.toggle("is-active", face.dataset.view === active);
+    face.setAttribute("aria-pressed", String(face.dataset.view === active));
+  }
+  if (dom.viewCubeLabel) {
+    const label = active ? (VIEW_LABELS[active] || active).toUpperCase() : "FREE";
+    dom.viewCubeLabel.textContent = label;
+    dom.viewCubeLabel.classList.toggle("is-free", !active);
+  }
 }
 
 function toggleIsolate() {
@@ -1338,6 +1511,14 @@ const solver = new ManipulationSolver({
 });
 
 /**
+ * Per-hand depth state. Two hands must not share a reference size, so this is a
+ * registry keyed by hand rather than a single value.
+ */
+const depthRegistry = new HandDepthRegistry({
+  makeFilter: () => new OneEuroFilter({ minCutoff: 1.1, beta: 0.02 })
+});
+
+/**
  * The rectangle the camera image is displayed in. In workspace mode that is the
  * viewport itself; in preview mode it is the small card. This is the box the
  * landmark mapping must use, and it must match the CSS exactly.
@@ -1362,10 +1543,17 @@ function cameraDisplayBox() {
 
 function videoSize() {
   const video = dom.workspaceVideo?.videoWidth ? dom.workspaceVideo : dom.cameraVideo;
-  return {
-    videoWidth: video?.videoWidth || 0,
-    videoHeight: video?.videoHeight || 0
-  };
+  const videoWidth = video?.videoWidth || 0;
+  const videoHeight = video?.videoHeight || 0;
+  // Before the first frame (and in headless runs) a <video> reports 0x0, which
+  // collapses the cover-fit and maps every landmark to the same corner of the
+  // screen. Assume the usual 16:9 webcam frame instead: during startup this only
+  // affects where the reticle is drawn, whereas a degenerate box would silently
+  // freeze the pointer for the whole session.
+  if (videoWidth < 2 || videoHeight < 2) {
+    return { videoWidth: 1280, videoHeight: 720 };
+  }
+  return { videoWidth, videoHeight };
 }
 
 /** Map a landmark to viewport NDC using the exact display box + mirror. */
@@ -1373,10 +1561,17 @@ function landmarkNdc(landmark) {
   const video = videoSize();
   const box = cameraDisplayBox();
   const viewRect = dom.viewport.getBoundingClientRect();
+  // A zero-sized viewport (headless harness, or a frame before layout) would
+  // collapse every pointer to (-1, -1) and silently freeze camera-relative
+  // dragging. Fall back to mapping through the camera box itself, which is
+  // exactly the same thing in workspace mode.
+  const viewport = viewRect.width > 1 && viewRect.height > 1
+    ? { width: viewRect.width, height: viewRect.height }
+    : null;
   return landmarkToNdc(
     landmark,
     { ...video, boxWidth: box.width, boxHeight: box.height },
-    { width: viewRect.width, height: viewRect.height },
+    viewport,
     { mirror: settings.camera.mirror !== false }
   );
 }
@@ -1393,8 +1588,31 @@ function landmarkViewportPixels(landmark) {
   return { x: stage.x + box.left, y: stage.y + box.top, inside: stage.inside };
 }
 
+/**
+ * Intents that genuinely transform something.
+ *
+ * "point", "hover", "hold", "none", "release" and "tracking-lost" are all
+ * non-destructive: the object is not being moved, so the idle animation should
+ * keep running.
+ */
+const MANIPULATING_INTENTS = new Set([
+  "translate",
+  "rotate",
+  "scale",
+  "explode",
+  "frame",
+  "two-hand grab",
+  "scale + rotate + translate"
+]);
+
 function processHands(now) {
-  if (!tracker || !workspace) return;
+  // Nothing is being manipulated when there is no pipeline at all. Returning
+  // early used to leave the playground's "a hand is acting" flag stuck on from
+  // the last frame that had hands, which silently froze every idle animation.
+  if (!tracker || !workspace) {
+    playground?.setManipulating?.(false);
+    return;
+  }
 
   const hands = tracker.hands || [];
   const handedness = tracker.handedness || [];
@@ -1451,7 +1669,15 @@ function processHands(now) {
       hands,
       tracker.worldLandmarks || [],
       handedness,
-      { pinched: overlayPinched, activity, fit, dt: state.frameDelta ?? 1 / 60 }
+      {
+        pinched: overlayPinched,
+        activity,
+        fit,
+        dt: state.frameDelta ?? 1 / 60,
+        // Monotonic seconds for the per-joint filters, so smoothing is
+        // time-based rather than assuming a fixed frame rate.
+        now: now / 1000
+      }
     );
   }
 
@@ -1500,14 +1726,48 @@ function processHands(now) {
   const part = getGesturePart();
   const objectState = gestureObjectState(part);
 
+  // Give the solver the camera and the current pointer, so translation is
+  // camera-relative rather than locked to world X/Y. Without this a drag in Top
+  // view moved the object towards the viewer, where it appeared not to move.
+  // The pointer belongs to the controlling hand, not simply the first one:
+  // with both hands up, measuring the drag with the non-controlling hand would
+  // move the object by the wrong amount.
+  const pointerHand = solver.activeHand ||
+    activeStates.find(hand => hand?.pinched) ||
+    activeStates[0] ||
+    null;
+  const solverPointer = pointerHand
+    ? landmarkNdc(pointerHand.indexTip || pointerHand.pinch)
+    : null;
+
+  // ---- hands-free depth --------------------------------------------------
+  // Runs after the gizmo so the Z handle exists before travel is applied.
+  updateHandDepth(now / 1000);
+
+  // A pinch that lands on a gizmo handle drags that handle, and only that
+  // handle: doing this before the solver is what stops a handle grab from also
+  // dragging the object behind it. Both devices share the same constraint code.
+  handleHandGizmo(pinching, solverPointer);
+  solver.setViewContext({ camera: workspace?.camera || null, ndc: solverPointer });
+
   const result = solver.update(activeStates, objectState, now);
   state.gestureMode = result.mode;
   state.intent = result.intent;
 
+  // Tell the playground whether a hand is actively *transforming* something, so
+  // its idle spin can stand down. Only real transforms count: the solver also
+  // reports `active` for hover ("point") and for the SCALE mode's arm-up hold,
+  // neither of which is touching the object. Treating those as manipulation
+  // left the idle spin permanently frozen.
+  playground?.setManipulating?.(MANIPULATING_INTENTS.has(result.intent));
+
   applyGestureResult(result, part);
 
   // ---- pointer, hover and selection ----------------------------------------
-  const pointer = pickPointer(activeStates);
+  // Prefer the hand the solver actually used. The reticle and the object must
+  // be driven by the same hand, or a pinch can be drawn on one hand while the
+  // other one moves the object.
+  const pointer = pickPointer(activeStates, result.activeHand);
   updatePointer(pointer, activeStates, result);
 
   updateGestureLabels(activeStates, result);
@@ -1534,8 +1794,16 @@ function analyzerSettings() {
  * order MediaPipe happened to return. Prefer a pinching hand (you are actively
  * manipulating), then a fully visible one, then the first tracked hand.
  */
-function pickPointer(states) {
+function pickPointer(states, activeHand = null) {
   if (!Array.isArray(states) || !states.length) return null;
+
+  // The solver's choice wins outright. It has already applied the pinch and
+  // lock rules, so re-deriving a preference here could only disagree with it.
+  if (activeHand?.hand && states.includes(activeHand.hand)) {
+    const hand = activeHand.hand;
+    const tip = hand.landmarks?.[8] || hand.indexTip || hand.pinch || null;
+    return { hand: { ...hand, indexTip: tip, pinched: Boolean(hand.pinched) }, state: hand };
+  }
 
   let best = null;
   let bestScore = -Infinity;
@@ -1829,6 +2097,120 @@ function projectedTarget() {
 }
 
 /** Place the reticle and resolve what it is pointing at. */
+/**
+ * Drive a gizmo drag from the hand pointer.
+ *
+ * A pinch that lands on a handle grabs the handle and nothing else. The drag
+ * then reports a cumulative world delta, which is applied to the transform
+ * captured at pinch time.
+ */
+/**
+ * Hands-free depth.
+ *
+ * Two things have to hold for this to be safe:
+ *   - a handle exists to move along (the Z handle of the gizmo), so depth travel
+ *     is expressed as a normal gizmo delta and cannot drift off-axis; and
+ *   - the pose is held deliberately (see handDepth.js), so it cannot fire while
+ *     the user is pinching or pointing at something.
+ *
+ * The palm-size ratio is smoothed, dead-zoned and clamped, so slow drift of the
+ * hand and noise in the size estimate do not push the object around.
+ */
+function updateHandDepth(now) {
+  // A selected model component is not a playground prop, so there is nothing for
+  // the box branch below to move; do not arm the gesture and pretend otherwise.
+  const usingProp = Boolean(playground?.selectedId);
+  if (!workspace?.gizmo || !usingProp) {
+    depthRegistry.reset();
+    state.depth = null;
+    state.depthStart = null;
+    return null;
+  }
+
+  const hand = overlayHands?.[0]?.state;
+  if (!hand) {
+    depthRegistry.reset();
+    state.depth = null;
+    state.depthStart = null;
+    return null;
+  }
+
+  const settings = store.get?.() || {};
+  const result = depthRegistry.update(hand.key || "hand-0", hand, now, {
+    sensitivity: settings.object?.depthSensitivity ?? 1,
+    invert: Boolean(settings.object?.depthInvert)
+  });
+  state.depth = result;
+
+  // Capture the starting Z the first frame travel begins, so depth is applied to
+  // a fixed reference rather than accumulating frame by frame.
+  if (result.active) {
+    if (!state.depthStart) {
+      const prop = playground.byId.get(playground.selectedId);
+      const pos = prop ? playground.getTransform(prop.id).position : null;
+      if (pos) state.depthStart = { x: pos.x, y: pos.y, z: pos.z };
+    }
+  } else {
+    state.depthStart = null;
+  }
+
+  if (!result?.active || !result.engaged) return result;
+
+  // Apply the travel as a Z-handle drag. The gizmo's drag machinery already
+  // converts a delta into a constrained one, so depth stays on Z.
+  const prop = playground.byId.get(playground.selectedId);
+  if (!prop) return result;
+
+  const base = state.depthStart;
+  if (!base) return result;
+
+  const position = {
+    x: base.x,
+    y: base.y,
+    z: clamp(base.z + result.travel, -STAGE_BOUNDS.z, STAGE_BOUNDS.z)
+  };
+  playground.setTransform(prop.id, { position });
+  updateObjectHud?.();
+  return result;
+}
+
+function handleHandGizmo(pinching, ndc) {
+  if (!workspace?.beginGizmoDrag || !ndc) {
+    if (state.handGizmo) {
+      workspace?.endGizmoDrag?.();
+      workspace.onGizmoEnd?.();
+      state.handGizmo = null;
+    }
+    return;
+  }
+
+  if (pinching && !state.handGizmo) {
+    // Hover the handle first so the user can see what a pinch would grab.
+    const hovered = workspace.pickGizmo?.({ x: ndc.x, y: ndc.y });
+    if (!hovered) return;
+    const handle = workspace.beginGizmoDrag({ x: ndc.x, y: ndc.y }, hovered);
+    if (!handle) return;
+    state.handGizmo = handle;
+    workspace.onGizmoBegin?.(handle);
+    chimes().play("grab");
+    return;
+  }
+
+  if (pinching && state.handGizmo) {
+    const delta = workspace.dragGizmo?.({ x: ndc.x, y: ndc.y });
+    if (delta) workspace.onGizmoChange?.(delta, state.handGizmo);
+    return;
+  }
+
+  // Released.
+  if (!pinching && state.handGizmo) {
+    workspace.endGizmoDrag?.();
+    workspace.onGizmoEnd?.();
+    state.handGizmo = null;
+    chimes().play("release");
+  }
+}
+
 function updatePointer(pointer, states, result) {
   if (!pointer || state.cameraView !== "workspace") {
     if (pointer && state.cameraView === "preview") {
@@ -3131,6 +3513,20 @@ function setupShortcuts() {
       case "v":
         event.preventDefault();
         toggleCameraView();
+        break;
+      // Standard views. Digits are taken by the interaction modes, so the
+      // view shortcuts are Shift+digit.
+      case "!":
+        event.preventDefault();
+        setStandardView("front");
+        break;
+      case "@":
+        event.preventDefault();
+        setStandardView("top");
+        break;
+      case "#":
+        event.preventDefault();
+        setStandardView("iso");
         break;
       case "m":
         // Voice: M for microphone, leaving V for the camera view.

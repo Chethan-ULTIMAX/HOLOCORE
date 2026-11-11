@@ -32,6 +32,12 @@
 
 import * as THREE from "three";
 import { HAND_CONNECTIONS } from "./handOverlay.js";
+import {
+  handJoints,
+  spreadFromWrist,
+  FALLBACK_METRIC_SCALE
+} from "./handCoordinates.js";
+import { HandSmootherRegistry } from "./handSmoothing.js";
 
 const TIP_INDICES = [4, 8, 12, 16, 20];
 
@@ -246,8 +252,15 @@ class HandRig {
     this.tipLayer.renderOrder = 34;
 
     // Palm plate: a single triangle fan through wrist + knuckles.
-    this.palm = new THREE.Mesh(new THREE.BufferGeometry(), this.materials.palm);
+    //
+    // Built once and mutated in place. The vertex count and the index list never
+    // change, so there is no reason to allocate a new geometry per frame.
+    this.palmGeometryData = buildPalmGeometry();
+    this.palm = new THREE.Mesh(this.palmGeometryData.geometry, this.materials.palm);
+    this.palmPoints = palmIndicesToPoints(this.palmGeometryData.indices);
     this.palm.renderOrder = 30;
+    // The palm moves every frame, so its bounds must not be trusted for culling.
+    this.palm.frustumCulled = false;
     this.palmLayer.add(this.palm);
 
     // Bones: a glow sleeve plus a solid core, per connection.
@@ -300,9 +313,20 @@ class HandRig {
 
     this.visible = true;
     this._cameraRef = null;
+    // Reusable joint output, filled by the coordinate module each frame. The
+    // rig rebuilds its geometry from these; allocating 21 vectors per hand per
+    // frame at 60fps is 2,500 allocations a second for no benefit.
+    this.scratchPositions = Array.from({ length: 21 }, () => new THREE.Vector3());
+    // The smoothed copy the rig actually draws from, so the raw solver output
+    // is never mutated and depth probing still sees the true position.
+    this.scratchSmoothed = Array.from({ length: 21 }, () => new THREE.Vector3());
     this.pulse = 0;
     this._depth = 1;
     this._up = new THREE.Vector3(0, 1, 0);
+    // Shared scratch for bone orientation, installed by the manager so every
+    // bone in every rig reuses one quaternion and one direction vector.
+    this._boneQuat = new THREE.Quaternion();
+    this._boneDir = new THREE.Vector3();
     this._dir = new THREE.Vector3();
     this._mid = new THREE.Vector3();
   }
@@ -385,8 +409,10 @@ class HandRig {
         continue;
       }
       const mid = this._mid.addVectors(pa, pb).multiplyScalar(0.5);
-      const quaternion = new THREE.Quaternion().setFromUnitVectors(
-        this._up, this._dir.clone().normalize()
+      // Reuse the manager's scratch objects: `setFromUnitVectors` needs a unit
+      // vector, and cloning one per bone was ~220 allocations a frame.
+      const quaternion = this._boneQuat.setFromUnitVectors(
+        this._up, this._boneDir.copy(this._dir).normalize()
       );
 
       // Fingertip segments taper; the palm rays are the heaviest.
@@ -416,21 +442,64 @@ class HandRig {
     // ---- palm ------------------------------------------------------------
     // Wrist, thumb base and the four knuckles: enough to fill the back of the
     // hand without implying geometry MediaPipe does not actually track.
-    const palmIndices = [0, 1, 5, 9, 13, 17];
-    const verts = new Float32Array(palmIndices.length * 3);
-    palmIndices.forEach((index, i) => {
-      verts[i * 3] = positions[index].x;
-      verts[i * 3 + 1] = positions[index].y;
-      verts[i * 3 + 2] = positions[index].z;
-    });
-    const indices = [];
-    for (let i = 1; i < palmIndices.length - 1; i++) indices.push(0, i, i + 1);
-    this.palm.geometry.dispose();
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(verts, 3));
-    geometry.setIndex(indices);
-    geometry.computeVertexNormals();
-    this.palm.geometry = geometry;
+    //
+    // The geometry is allocated once in the constructor and only its position
+    // and normal buffers are rewritten here. Rebuilding a BufferGeometry every
+    // frame (and disposing the previous one) meant a GPU buffer allocation per
+    // hand per frame, which is exactly the kind of churn the brief rules out.
+    const { indices, position, normal } = this.palmGeometryData;
+    const points = this.palmPoints;
+    for (let i = 0; i < indices.length; i++) {
+      const source = positions[indices[i]];
+      points[i].copy(source);
+      position[i * 3] = source.x;
+      position[i * 3 + 1] = source.y;
+      position[i * 3 + 2] = source.z;
+    }
+
+    // Normals for a flat-ish fan: the face normal of the palm plane. Computed
+    // from the wrist/knuckle spread rather than computeVertexNormals(), which
+    // would rebuild the whole attribute set.
+    this._palmNormalInto(normal);
+
+    this.palmGeometryData.positionAttribute.needsUpdate = true;
+    this.palmGeometryData.normalAttribute.needsUpdate = true;
+  }
+
+  /**
+   * Fill the palm's normal buffer from the palm plane.
+   *
+   * The palm is a fan around the wrist, so a single face normal is correct for
+   * every vertex and stays smooth as the hand moves.
+   */
+  _palmNormalInto(normal) {
+    // palmPoints is indexed by position in PALM_LANDMARKS, not by landmark id:
+    // [0]=wrist, [1]=thumb base, [2..5]=knuckles.
+    const p = this.palmPoints;
+    const wrist = p[0];
+    const indexKnuckle = p[2];
+    const pinkyKnuckle = p[5];
+    const ax = indexKnuckle.x - wrist.x;
+    const ay = indexKnuckle.y - wrist.y;
+    const az = indexKnuckle.z - wrist.z;
+    const bx = pinkyKnuckle.x - wrist.x;
+    const by = pinkyKnuckle.y - wrist.y;
+    const bz = pinkyKnuckle.z - wrist.z;
+    let nx = ay * bz - az * by;
+    let ny = az * bx - ax * bz;
+    let nz = ax * by - ay * bx;
+    const length = Math.hypot(nx, ny, nz);
+    if (length < 1e-8) {
+      // Degenerate palm: any unit normal is as good as another.
+      nx = 0; ny = 0; nz = 1;
+    } else {
+      nx /= length; ny /= length; nz /= length;
+    }
+    for (let i = 0; i < normal.length; i += 3) {
+      normal[i] = nx;
+      normal[i + 1] = ny;
+      normal[i + 2] = nz;
+    }
   }
 
   dispose() {
@@ -442,6 +511,58 @@ class HandRig {
     for (const material of Object.values(this.materials)) material.dispose();
     this.palm.geometry.dispose();
   }
+}
+
+/**
+ * The palm's source landmarks.
+ *
+ * Wrist, thumb base and the four knuckles. This is deliberately NOT a full hand
+ * mesh: these are the only points MediaPipe actually gives us that describe the
+ * back of the hand.
+ */
+export const PALM_LANDMARKS = [0, 1, 5, 9, 13, 17];
+
+/**
+ * Build the palm geometry once.
+ *
+ * A triangle fan around the wrist. The buffers are writable and stay the same
+ * size, so the per-frame update is a memcpy-ish loop rather than an allocation.
+ */
+function buildPalmGeometry() {
+  const count = PALM_LANDMARKS.length;
+  const position = new Float32Array(count * 3);
+  const normal = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) normal[i * 3 + 2] = 1;
+
+  // Fan: (wrist, next, next+1).
+  const indices = [];
+  for (let i = 1; i < count - 1; i++) indices.push(0, i, i + 1);
+
+  const geometry = new THREE.BufferGeometry();
+  const positionAttribute = new THREE.BufferAttribute(position, 3);
+  const normalAttribute = new THREE.BufferAttribute(normal, 3);
+  // Positions change every frame and the palm is never culled, so tell Three.js
+  // not to compute a bounding sphere it would have to replace anyway.
+  positionAttribute.setUsage(THREE.DynamicDrawUsage);
+  normalAttribute.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute("position", positionAttribute);
+  geometry.setAttribute("normal", normalAttribute);
+  geometry.setIndex(indices);
+  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e6);
+
+  return {
+    geometry,
+    indices,
+    position,
+    normal,
+    positionAttribute,
+    normalAttribute
+  };
+}
+
+/** One reusable Vector3 per palm vertex, so the update loop allocates nothing. */
+function palmIndicesToPoints(indices) {
+  return indices.map(() => new THREE.Vector3());
 }
 
 /**
@@ -467,8 +588,23 @@ export class HandSkeleton3D {
     this._occluders = [];
     this._occluderRefreshAt = 0;
     this._depthProbeAt = 0;
-    // Smoothed per-rig nearness, keyed like the rigs themselves.
-    this._nearness = new Map();
+    // The camera's rotation half, refreshed once per update rather than once
+    // per joint. `extractRotation` inside the joint loop was the single biggest
+    // per-frame allocation in this module.
+    this._cameraRotation = new THREE.Matrix4();
+    // 21 reusable camera-local offsets, shared across hands because they are
+    // consumed into the rig's own buffer before the next hand is handled.
+    this._offsets = Array.from({ length: 21 }, () => new THREE.Vector3());
+    // Bone orientation scratch, so the per-bone quaternion is not reallocated.
+    this._boneQuat = new THREE.Quaternion();
+    this._boneDir = new THREE.Vector3();
+    // Per-hand, per-joint smoothing. The 3D rig is the skeleton the user
+    // actually sees and touches; it used to place joints straight from the
+    // solver while the 2D overlay smoothed, so the visible one juddered.
+    this.smoothers = new HandSmootherRegistry();
+    // Per-hand depth state, keyed like the rigs themselves. Each hand owns its
+    // own probe timer and its own smoothed value.
+    this._nearnessState = new Map();
   }
 
   /**
@@ -503,14 +639,24 @@ export class HandSkeleton3D {
    * uses this to dim and shrink rather than vanish, because `depthTest: false`
    * keeps the skeleton visible but should not make it look flat.
    */
-  _nearnessFor(positions) {
+  _nearnessFor(positions, key = "default") {
     if (!positions?.length) return 1;
     const now = performance.now();
-    if (now < this._depthProbeAt) return this._lastNearness ?? 1;
-    this._depthProbeAt = now + 60; // ~16 probes/second is plenty
+
+    // Per-hand cache. There used to be a single `_lastNearness` shared by every
+    // hand and a single probe timer, so the second hand always reused the first
+    // hand's result: bring one hand forward and the other appeared to come
+    // forward with it.
+    let hand = this._nearnessState.get(key);
+    if (!hand) {
+      hand = { value: 1, probeAt: 0 };
+      this._nearnessState.set(key, hand);
+    }
+    if (now < hand.probeAt) return hand.value;
+    hand.probeAt = now + 60; // ~16 probes/second is plenty per hand
 
     const occluders = this._refreshOccluders(now);
-    if (!occluders.length) return (this._lastNearness = 1);
+    if (!occluders.length) return (hand.value = 1);
 
     // Probe the wrist and every fingertip: a hand half behind the model should
     // read as partly occluded, not all-or-nothing.
@@ -530,11 +676,12 @@ export class HandSkeleton3D {
       if (this._cast.intersectObjects(occluders, false).length) blocked += 1;
     }
     const fraction = blocked / probes.length;
-    return (this._lastNearness = 1 - fraction * 0.65);
+    return (hand.value = 1 - fraction * 0.65);
   }
 
-  updateSettings({ mirror } = {}) {
+  updateSettings({ mirror, smoothing } = {}) {
     if (typeof mirror === "boolean") this.mirror = mirror;
+    if (typeof smoothing === "number") this.smoothers.updateSettings({ smoothing });
   }
 
   setVisible(visible) {
@@ -559,11 +706,19 @@ export class HandSkeleton3D {
    * @param {object} options { pinched: boolean[], activity: number[] }
    */
   update(landmarks, worldLandmarks, handedness, {
-    pinched = [], activity = [], fit = null, dt = 1 / 60
+    pinched = [], activity = [], fit = null, dt = 1 / 60, now = null
   } = {}) {
-    if (!this.visible) return;
+    if (!this.visible) {
+      // Nothing to draw: drop filter history so a resumed stream does not ease
+      // in from a stale pose.
+      this.smoothers.resetAll();
+      return;
+    }
+    const time = Number.isFinite(now) ? now : performance.now() / 1000;
     this.camera.getWorldPosition(this._camPos);
     this.camera.updateMatrixWorld();
+    // Cached once per frame; every joint of every hand reuses it.
+    this._cameraRotation.extractRotation(this.camera.matrixWorld);
 
     const seen = new Set();
 
@@ -584,61 +739,38 @@ export class HandSkeleton3D {
 
       const world = worldLandmarks?.[handIndex] || null;
 
-      // Anchor the hand at its wrist, so the whole skeleton is positioned by
-      // the wrist landmark and shaped by the rest.
-      const wristAnchor = landmarkToWorld(points[0], this.camera, {
-        mirror: this.mirror,
-        fit
-      });
-
-      // Place every joint on the hand plane first. This is always correct, and
+      // Place every joint on the hand plane first. `planePositions[0]` is the
+      // wrist anchor: the whole skeleton is positioned by it and shaped by the
+      // rest. This is always correct, and
       // it is all we need when MediaPipe gives no metric landmarks.
       const planePositions = points.map(point =>
         landmarkToWorld(point, this.camera, { mirror: this.mirror, fit })
       );
 
-      // Derive the hand's size from those plane positions rather than assuming
-      // a fixed size. The 2D overlay has always drawn the hand at whatever size
-      // the video shows; sizing the 3D rig from a constant made the two layers
-      // disagree whenever the hand moved nearer or further from the camera.
-      let spread = 0;
-      for (let i = 1; i < planePositions.length; i++) {
-        spread = Math.max(spread, planePositions[i].distanceTo(planePositions[0]));
-      }
-      const metricSpread = world && world.length >= 21
-        ? Math.max(
-            ...world.slice(1).map(w => Math.hypot(
-              w.x - world[0].x, w.y - world[0].y, w.z - world[0].z
-            ))
-          )
-        : 0;
-      // worldLandmarks are in metres, so this converts a metric offset into the
-      // same world units the plane mapping produced.
-      // Both spreads must be usable: identical landmarks give a zero spread and
-      // would collapse every joint onto one point (and hide every bone).
-      const METRIC_TO_WORLD =
-        metricSpread > 1e-4 && spread > 1e-4 ? spread / metricSpread : 8.6;
-
-      const positions = points.map((point, i) => {
-        if (!world || !world[i]) {
-          return planePositions[i].clone();
-        }
-        const w0 = world[0] || { x: 0, y: 0, z: 0 };
-        const dx = (world[i].x - w0.x) * METRIC_TO_WORLD;
-        const dy = -(world[i].y - w0.y) * METRIC_TO_WORLD;
-        const dz = (world[i].z - w0.z) * METRIC_TO_WORLD;
-
-        // Orient the metric offsets into camera space so the hand rotates with
-        // the view rather than staying axis-aligned in world space.
-        const offset = this._tmp.set(dx, dy, dz).applyMatrix4(
-          new THREE.Matrix4().extractRotation(this.camera.matrixWorld)
-        );
-        return wristAnchor.clone().add(offset);
+      // Joint positions come from the shared coordinate module, which applies
+      // the mirror to the metric offsets exactly once. Building them inline is
+      // what produced an anatomically reflected skeleton in mirror mode, and it
+      // also allocated a Matrix4 per joint per hand per frame.
+      const positions = handJoints({
+        planePositions,
+        world,
+        cameraRotation: this._cameraRotation,
+        mirror: this.mirror,
+        scratch: this._offsets,
+        scratchVec: this._tmp,
+        out: rig.scratchPositions
       });
 
+      // Smooth each joint independently, filtered per hand. The raw solver
+      // output is left untouched; the rig draws the smoothed copy.
+      const smoother = this.smoothers.for(key);
+      const smoothed = smoother.update(positions, rig.scratchSmoothed, time);
+
       rig.group.visible = true;
-      rig.applyDepth(this._nearnessFor(positions));
-      rig.update(positions, activity[handIndex] ?? 0,
+      // Depth is measured on the raw positions: the cue is about where the hand
+      // really is relative to the model, not where its display copy is.
+      rig.applyDepth(this._nearnessFor(positions, key));
+      rig.update(smoothed, activity[handIndex] ?? 0,
         Boolean(pinched[handIndex]), dt);
     });
 
@@ -647,6 +779,10 @@ export class HandSkeleton3D {
     for (const [key, rig] of this.rigs) {
       if (!seen.has(key)) rig.setVisible(false);
     }
+    // A hand that has gone must not keep smoothing toward its last pose: when
+    // it comes back the skeleton should appear where the hand is, not glide
+    // there from where it used to be.
+    this.smoothers.retain(seen);
   }
 
   /** Screen-space anchor for a hand, for tether lines. */

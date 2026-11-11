@@ -8,6 +8,15 @@
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import {
+  viewPlacement,
+  matchingView,
+  isViewId,
+  VIEW_ORDER,
+  VIEW_LABELS,
+  safeUp
+} from "./cameraViews.js";
+import { TranslationGizmo } from "./gizmo.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { buildAssembly, disposeAssembly } from "./modelFactory.js";
@@ -61,6 +70,10 @@ export class Workspace {
     this._hoverPending = null;
     /** Group composited after the main pass (the hand skeletons). */
     this.lateLayer = null;
+
+    // Translation gizmo. Created lazily by setGizmo so headless callers and the
+    // camera preview never pay for six meshes they cannot see.
+    this.gizmo = null;
 
     this._initRenderer();
     this._initScene();
@@ -169,6 +182,14 @@ export class Workspace {
     controls.autoRotateSpeed = 0.8;
     controls.autoRotate = this.settings.autoRotate;
     this.controls = controls;
+
+    // Notify the UI when the camera moves so the view indicator never lies
+    // about the current orientation -- including after the user orbits by hand.
+    // `change` fires for orbit, pan and zoom; it is throttled by the caller.
+    this.onCameraChange = null;
+    controls.addEventListener?.("change", () => {
+      this.onCameraChange?.();
+    });
   }
 
   _initLights() {
@@ -299,12 +320,58 @@ export class Workspace {
     const dom = this.renderer.domElement;
 
     this._pointerStart = null;
+
+    /** Pointer position in NDC, measured against the canvas. */
+    const toNdc = event => {
+      const rect = dom.getBoundingClientRect();
+      return new THREE.Vector2(
+        ((event.clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1,
+        -((event.clientY - rect.top) / Math.max(1, rect.height)) * 2 + 1
+      );
+    };
+
+    // The gizmo takes precedence over everything else. Without capturing the
+    // pointer here, OrbitControls would also orbit while a handle was being
+    // dragged, because both listen on the same canvas.
+    this.onGizmoChange = null;
+    let gizmoHandle = null;
+
     dom.addEventListener("pointerdown", event => {
       this._pointerStart = { x: event.clientX, y: event.clientY, time: performance.now() };
-    });
+      if (!this.gizmo?.root.visible || event.button !== 0) return;
+      gizmoHandle = this.beginGizmoDrag(toNdc(event));
+      if (gizmoHandle) {
+        dom.setPointerCapture?.(event.pointerId);
+        this.controls.enabled = false;
+        event.stopPropagation();
+        event.preventDefault();
+        // Tell the app what the drag started from, so it can apply the
+        // cumulative delta to a fixed reference instead of accumulating.
+        this.onGizmoBegin?.(gizmoHandle);
+      }
+    }, { capture: true });
+
+    dom.addEventListener("pointermove", event => {
+      if (!gizmoHandle) return;
+      const delta = this.dragGizmo(toNdc(event));
+      if (delta) this.onGizmoChange?.(delta, gizmoHandle);
+    }, { capture: true });
+
+    const endGizmo = event => {
+      if (!gizmoHandle) return;
+      gizmoHandle = null;
+      this.endGizmoDrag();
+      this.controls.enabled = true;
+      dom.releasePointerCapture?.(event.pointerId);
+      this.onGizmoEnd?.();
+    };
+    dom.addEventListener("pointerup", endGizmo, { capture: true });
+    dom.addEventListener("pointercancel", endGizmo, { capture: true });
 
     dom.addEventListener("pointerup", event => {
       if (!this._pointerStart) return;
+      // A gizmo drag is not a click: do not reselect on release.
+      if (event.target === dom && gizmoHandle) return;
       const dx = event.clientX - this._pointerStart.x;
       const dy = event.clientY - this._pointerStart.y;
       const moved = Math.hypot(dx, dy);
@@ -414,7 +481,63 @@ export class Workspace {
     return this.assembly?.byId.get(partId) || null;
   }
 
-  /** Raycast a screen NDC point. Returns the part id or null. */
+  /* ---- translation gizmo ------------------------------------------------- */
+
+  /**
+   * Attach the gizmo to an object (or detach with null).
+   *
+   * The gizmo is added to the scene root, not to the object, so a rotated or
+   * scaled object cannot skew the handles and the handles can never be saved as
+   * part of the model.
+   */
+  setGizmo(object3D) {
+    if (!this.gizmo && object3D) {
+      this.gizmo = new TranslationGizmo();
+      this.scene.add(this.gizmo.root);
+      this.gizmoColors = true;
+    }
+    this.gizmo?.setTarget(object3D);
+    return this.gizmo;
+  }
+
+  /** True when a pointer ray is hovering a gizmo handle. */
+  pickGizmo(ndc) {
+    if (!this.gizmo?.root.visible) return null;
+    this._gizmoRaycaster ||= new THREE.Raycaster();
+    this._gizmoRaycaster.setFromCamera(ndc, this.camera);
+    const handle = this.gizmo.pick(this._gizmoRaycaster);
+    this.gizmo.setHovered(handle);
+    return handle;
+  }
+
+  /**
+   * Begin a gizmo drag from a normalised pointer position.
+   *
+   * Returns the handle name so the caller can route subsequent motion, or null
+   * if the pointer missed or the handle is unusable from this angle (an axis
+   * pointing straight at the camera has no detectable movement).
+   */
+  beginGizmoDrag(ndc, handle = null) {
+    if (!this.gizmo?.root.visible) return null;
+    this._gizmoRaycaster ||= new THREE.Raycaster();
+    this._gizmoRaycaster.setFromCamera(ndc, this.camera);
+    const target = handle || this.gizmo.pick(this._gizmoRaycaster);
+    if (!target) return null;
+    return this.gizmo.beginDrag(this._gizmoRaycaster.ray, target) ? target : null;
+  }
+
+  /** Move the gizmo drag; returns the world delta since the drag started. */
+  dragGizmo(ndc) {
+    if (!this.gizmo?.dragging) return null;
+    this._gizmoRaycaster ||= new THREE.Raycaster();
+    this._gizmoRaycaster.setFromCamera(ndc, this.camera);
+    return this.gizmo.drag(this._gizmoRaycaster.ray);
+  }
+
+  endGizmoDrag() {
+    this.gizmo?.endDrag();
+  }
+
   raycast(ndc) {
     if (!this.assembly) return null;
     this._raycaster = this._raycaster || new THREE.Raycaster();
@@ -723,13 +846,121 @@ export class Workspace {
     this.frameModel();
   }
 
-  _moveCamera(position, target, duration = 0.8) {
+  _moveCamera(position, target, duration = 0.8, up = null) {
     this._cameraGoal = {
       position: position.clone(),
       target: target.clone(),
+      // `up` is part of the placement, not a global: Top and Bottom need a
+      // different one, and OrbitControls goes unstable if it is wrong.
+      up: up ? safeUp(position.clone().sub(target), up) : null,
+      fromUp: this.camera.up.clone(),
       t: 0,
       duration: Math.max(0.001, duration)
     };
+  }
+
+  /* ===================================================================== */
+  /* STANDARD VIEWS (front, back, left, right, top, bottom, isometric)     */
+  /* ===================================================================== */
+
+  /**
+   * The box the view controller should frame.
+   *
+   * Prefers a selected playground object, then the selected part, then the
+   * whole model. Never assumes the origin: a prop parked at (4, 1, -2) must be
+   * centred, and the model itself may not sit at 0,0,0 after a transform.
+   */
+  framingBounds({ preferSelection = true } = {}) {
+    const box = new THREE.Box3();
+    const candidates = [];
+
+    if (preferSelection && this.onFramingTarget) {
+      const target = this.onFramingTarget();
+      if (target) candidates.push(target);
+    }
+    if (preferSelection && this.selected) candidates.push(this.selected);
+    if (this.assembly?.group) candidates.push(this.assembly.group);
+
+    for (const object of candidates) {
+      if (!object) continue;
+      box.setFromObject(object);
+      if (!box.isEmpty()) break;
+    }
+
+    if (box.isEmpty()) {
+      // Nothing measurable: fall back to the controls' own target so the
+      // camera still has a sane centre.
+      const centre = this.controls?.target?.clone() || new THREE.Vector3();
+      return { centre, radius: 3 };
+    }
+
+    const size = box.getSize(new THREE.Vector3());
+    const centre = box.getCenter(new THREE.Vector3());
+    return { centre, radius: Math.max(size.length() * 0.5, 0.4) };
+  }
+
+  /**
+   * Go to one of the seven standard views.
+   *
+   * @param {string} id  front|back|left|right|top|bottom|iso
+   * @param {object} [options]
+   * @param {boolean} [options.animate=true]
+   * @param {boolean} [options.preferSelection=true] frame the selection if any
+   * @returns {string|null} the view id, or null if unknown
+   */
+  setView(id, { animate = true, preferSelection = true } = {}) {
+    if (!isViewId(id)) return null;
+    const { centre, radius } = this.framingBounds({ preferSelection });
+    const placement = viewPlacement(id, {
+      target: centre,
+      radius,
+      fov: this.camera.fov
+    });
+    if (!placement) return null;
+
+    this.currentView = id;
+    this._moveCamera(
+      placement.position,
+      placement.target,
+      animate ? 0.85 : 0,
+      placement.up
+    );
+    if (!animate) {
+      this.camera.up.copy(placement.up);
+      this.controls?.target.copy(placement.target);
+      this.camera.position.copy(placement.position);
+      this.camera.lookAt(placement.target);
+      this.controls?.update?.();
+    }
+    return id;
+  }
+
+  /**
+   * The standard view the camera currently sits at, or null if it is free.
+   *
+   * An orbiting camera should show no active preset, so the tolerance is tight.
+   */
+  get activeView() {
+    return matchingView(this.camera.position, this.controls?.target);
+  }
+
+  /** Shift the framing target to the selection without changing the angle. */
+  centreOnSelection({ animate = true } = {}) {
+    const { centre, radius } = this.framingBounds({ preferSelection: true });
+    const direction = this.camera.position
+      .clone()
+      .sub(this.controls?.target || new THREE.Vector3());
+    const distance = Math.max(
+      direction.length(),
+      viewPlacement("iso", { target: centre, radius, fov: this.camera.fov }).position
+        .distanceTo(centre)
+    );
+    direction.normalize();
+    this._moveCamera(
+      centre.clone().addScaledVector(direction, distance),
+      centre,
+      animate ? 0.7 : 0
+    );
   }
 
   /* ===================================================================== */
@@ -1062,6 +1293,9 @@ export class Workspace {
   update(dt) {
     this.time = (this.time || 0) + dt;
 
+    // Keep the gizmo a constant size on screen and glued to its target.
+    this.gizmo?.update(this.camera);
+
     // Hover raycast is throttled to once per frame from the latest pointer.
     if (this._hoverPending) {
       const ndc = this._hoverPending;
@@ -1092,8 +1326,19 @@ export class Workspace {
       const goal = this._cameraGoal;
       goal.t = Math.min(1, goal.t + dt / goal.duration);
       const e = 1 - Math.pow(1 - goal.t, 3);
-      this.camera.position.lerp(goal.position, Math.min(1, alpha * (0.6 + e)));
-      this.controls.target.lerp(goal.target, Math.min(1, alpha * (0.6 + e)));
+      const step = Math.min(1, alpha * (0.6 + e));
+      this.camera.position.lerp(goal.position, step);
+      this.controls.target.lerp(goal.target, step);
+
+      // Interpolate `up` alongside the position. Switching from Perspective to
+      // Top by snapping the up vector at the end would make the model roll
+      // visibly during the move; easing it keeps the horizon level throughout.
+      if (goal.up) {
+        this.camera.up.lerp(goal.up, step);
+        if (this.camera.up.lengthSq() < 1e-8) this.camera.up.copy(goal.up);
+        else this.camera.up.normalize();
+      }
+
       if (
         goal.t >= 1 &&
         this.camera.position.distanceToSquared(goal.position) < 1e-4 &&
@@ -1101,6 +1346,8 @@ export class Workspace {
       ) {
         this.camera.position.copy(goal.position);
         this.controls.target.copy(goal.target);
+        if (goal.up) this.camera.up.copy(goal.up);
+        this.camera.lookAt(goal.target);
         this._cameraGoal = null;
       }
     }
