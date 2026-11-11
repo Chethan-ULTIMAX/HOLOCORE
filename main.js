@@ -353,6 +353,12 @@ function applyNonSceneSettings() {
   dom.workspaceVideo?.classList.toggle("unmirrored", !settings.camera.mirror);
   overlay?.updateSettings?.(settings.camera);
   overlayWorkspace?.updateSettings?.(settings.camera);
+  // The scene-space skeletons must follow the mirror setting too. Without this
+  // the preview flipped while the 3D hands stayed put, which is precisely the
+  // mismatch the coordinate module now prevents. `updateSettings` reconfigure
+  // the existing rigs; it does not rebuild them, so the change is instant and
+  // tracking is not interrupted.
+  skeleton3d?.updateSettings?.({ mirror: settings.camera.mirror });
   dom.viewport?.style.setProperty("--scrim-strength", String(settings.camera.scrim ?? 0));
   const workspaceViewInput = document.getElementById("set-workspace-view");
   if (workspaceViewInput) workspaceViewInput.checked = settings.camera.workspaceView !== false;

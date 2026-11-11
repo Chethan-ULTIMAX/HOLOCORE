@@ -32,6 +32,11 @@
 
 import * as THREE from "three";
 import { HAND_CONNECTIONS } from "./handOverlay.js";
+import {
+  handJoints,
+  spreadFromWrist,
+  FALLBACK_METRIC_SCALE
+} from "./handCoordinates.js";
 
 const TIP_INDICES = [4, 8, 12, 16, 20];
 
@@ -300,9 +305,17 @@ class HandRig {
 
     this.visible = true;
     this._cameraRef = null;
+    // Reusable joint output, filled by the coordinate module each frame. The
+    // rig rebuilds its geometry from these; allocating 21 vectors per hand per
+    // frame at 60fps is 2,500 allocations a second for no benefit.
+    this.scratchPositions = Array.from({ length: 21 }, () => new THREE.Vector3());
     this.pulse = 0;
     this._depth = 1;
     this._up = new THREE.Vector3(0, 1, 0);
+    // Shared scratch for bone orientation, installed by the manager so every
+    // bone in every rig reuses one quaternion and one direction vector.
+    this._boneQuat = new THREE.Quaternion();
+    this._boneDir = new THREE.Vector3();
     this._dir = new THREE.Vector3();
     this._mid = new THREE.Vector3();
   }
@@ -385,8 +398,10 @@ class HandRig {
         continue;
       }
       const mid = this._mid.addVectors(pa, pb).multiplyScalar(0.5);
-      const quaternion = new THREE.Quaternion().setFromUnitVectors(
-        this._up, this._dir.clone().normalize()
+      // Reuse the manager's scratch objects: `setFromUnitVectors` needs a unit
+      // vector, and cloning one per bone was ~220 allocations a frame.
+      const quaternion = this._boneQuat.setFromUnitVectors(
+        this._up, this._boneDir.copy(this._dir).normalize()
       );
 
       // Fingertip segments taper; the palm rays are the heaviest.
@@ -467,8 +482,19 @@ export class HandSkeleton3D {
     this._occluders = [];
     this._occluderRefreshAt = 0;
     this._depthProbeAt = 0;
-    // Smoothed per-rig nearness, keyed like the rigs themselves.
-    this._nearness = new Map();
+    // The camera's rotation half, refreshed once per update rather than once
+    // per joint. `extractRotation` inside the joint loop was the single biggest
+    // per-frame allocation in this module.
+    this._cameraRotation = new THREE.Matrix4();
+    // 21 reusable camera-local offsets, shared across hands because they are
+    // consumed into the rig's own buffer before the next hand is handled.
+    this._offsets = Array.from({ length: 21 }, () => new THREE.Vector3());
+    // Bone orientation scratch, so the per-bone quaternion is not reallocated.
+    this._boneQuat = new THREE.Quaternion();
+    this._boneDir = new THREE.Vector3();
+    // Per-hand depth state, keyed like the rigs themselves. Each hand owns its
+    // own probe timer and its own smoothed value.
+    this._nearnessState = new Map();
   }
 
   /**
@@ -503,14 +529,24 @@ export class HandSkeleton3D {
    * uses this to dim and shrink rather than vanish, because `depthTest: false`
    * keeps the skeleton visible but should not make it look flat.
    */
-  _nearnessFor(positions) {
+  _nearnessFor(positions, key = "default") {
     if (!positions?.length) return 1;
     const now = performance.now();
-    if (now < this._depthProbeAt) return this._lastNearness ?? 1;
-    this._depthProbeAt = now + 60; // ~16 probes/second is plenty
+
+    // Per-hand cache. There used to be a single `_lastNearness` shared by every
+    // hand and a single probe timer, so the second hand always reused the first
+    // hand's result: bring one hand forward and the other appeared to come
+    // forward with it.
+    let hand = this._nearnessState.get(key);
+    if (!hand) {
+      hand = { value: 1, probeAt: 0 };
+      this._nearnessState.set(key, hand);
+    }
+    if (now < hand.probeAt) return hand.value;
+    hand.probeAt = now + 60; // ~16 probes/second is plenty per hand
 
     const occluders = this._refreshOccluders(now);
-    if (!occluders.length) return (this._lastNearness = 1);
+    if (!occluders.length) return (hand.value = 1);
 
     // Probe the wrist and every fingertip: a hand half behind the model should
     // read as partly occluded, not all-or-nothing.
@@ -530,7 +566,7 @@ export class HandSkeleton3D {
       if (this._cast.intersectObjects(occluders, false).length) blocked += 1;
     }
     const fraction = blocked / probes.length;
-    return (this._lastNearness = 1 - fraction * 0.65);
+    return (hand.value = 1 - fraction * 0.65);
   }
 
   updateSettings({ mirror } = {}) {
@@ -564,6 +600,8 @@ export class HandSkeleton3D {
     if (!this.visible) return;
     this.camera.getWorldPosition(this._camPos);
     this.camera.updateMatrixWorld();
+    // Cached once per frame; every joint of every hand reuses it.
+    this._cameraRotation.extractRotation(this.camera.matrixWorld);
 
     const seen = new Set();
 
@@ -584,60 +622,30 @@ export class HandSkeleton3D {
 
       const world = worldLandmarks?.[handIndex] || null;
 
-      // Anchor the hand at its wrist, so the whole skeleton is positioned by
-      // the wrist landmark and shaped by the rest.
-      const wristAnchor = landmarkToWorld(points[0], this.camera, {
-        mirror: this.mirror,
-        fit
-      });
-
-      // Place every joint on the hand plane first. This is always correct, and
+      // Place every joint on the hand plane first. `planePositions[0]` is the
+      // wrist anchor: the whole skeleton is positioned by it and shaped by the
+      // rest. This is always correct, and
       // it is all we need when MediaPipe gives no metric landmarks.
       const planePositions = points.map(point =>
         landmarkToWorld(point, this.camera, { mirror: this.mirror, fit })
       );
 
-      // Derive the hand's size from those plane positions rather than assuming
-      // a fixed size. The 2D overlay has always drawn the hand at whatever size
-      // the video shows; sizing the 3D rig from a constant made the two layers
-      // disagree whenever the hand moved nearer or further from the camera.
-      let spread = 0;
-      for (let i = 1; i < planePositions.length; i++) {
-        spread = Math.max(spread, planePositions[i].distanceTo(planePositions[0]));
-      }
-      const metricSpread = world && world.length >= 21
-        ? Math.max(
-            ...world.slice(1).map(w => Math.hypot(
-              w.x - world[0].x, w.y - world[0].y, w.z - world[0].z
-            ))
-          )
-        : 0;
-      // worldLandmarks are in metres, so this converts a metric offset into the
-      // same world units the plane mapping produced.
-      // Both spreads must be usable: identical landmarks give a zero spread and
-      // would collapse every joint onto one point (and hide every bone).
-      const METRIC_TO_WORLD =
-        metricSpread > 1e-4 && spread > 1e-4 ? spread / metricSpread : 8.6;
-
-      const positions = points.map((point, i) => {
-        if (!world || !world[i]) {
-          return planePositions[i].clone();
-        }
-        const w0 = world[0] || { x: 0, y: 0, z: 0 };
-        const dx = (world[i].x - w0.x) * METRIC_TO_WORLD;
-        const dy = -(world[i].y - w0.y) * METRIC_TO_WORLD;
-        const dz = (world[i].z - w0.z) * METRIC_TO_WORLD;
-
-        // Orient the metric offsets into camera space so the hand rotates with
-        // the view rather than staying axis-aligned in world space.
-        const offset = this._tmp.set(dx, dy, dz).applyMatrix4(
-          new THREE.Matrix4().extractRotation(this.camera.matrixWorld)
-        );
-        return wristAnchor.clone().add(offset);
+      // Joint positions come from the shared coordinate module, which applies
+      // the mirror to the metric offsets exactly once. Building them inline is
+      // what produced an anatomically reflected skeleton in mirror mode, and it
+      // also allocated a Matrix4 per joint per hand per frame.
+      const positions = handJoints({
+        planePositions,
+        world,
+        cameraRotation: this._cameraRotation,
+        mirror: this.mirror,
+        scratch: this._offsets,
+        scratchVec: this._tmp,
+        out: rig.scratchPositions
       });
 
       rig.group.visible = true;
-      rig.applyDepth(this._nearnessFor(positions));
+      rig.applyDepth(this._nearnessFor(positions, key));
       rig.update(positions, activity[handIndex] ?? 0,
         Boolean(pinched[handIndex]), dt);
     });
