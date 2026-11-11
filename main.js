@@ -358,7 +358,10 @@ function applyNonSceneSettings() {
   // mismatch the coordinate module now prevents. `updateSettings` reconfigure
   // the existing rigs; it does not rebuild them, so the change is instant and
   // tracking is not interrupted.
-  skeleton3d?.updateSettings?.({ mirror: settings.camera.mirror });
+  skeleton3d?.updateSettings?.({
+    mirror: settings.camera.mirror,
+    smoothing: settings.gesture.smoothing
+  });
   dom.viewport?.style.setProperty("--scrim-strength", String(settings.camera.scrim ?? 0));
   const workspaceViewInput = document.getElementById("set-workspace-view");
   if (workspaceViewInput) workspaceViewInput.checked = settings.camera.workspaceView !== false;
@@ -1457,7 +1460,15 @@ function processHands(now) {
       hands,
       tracker.worldLandmarks || [],
       handedness,
-      { pinched: overlayPinched, activity, fit, dt: state.frameDelta ?? 1 / 60 }
+      {
+        pinched: overlayPinched,
+        activity,
+        fit,
+        dt: state.frameDelta ?? 1 / 60,
+        // Monotonic seconds for the per-joint filters, so smoothing is
+        // time-based rather than assuming a fixed frame rate.
+        now: now / 1000
+      }
     );
   }
 

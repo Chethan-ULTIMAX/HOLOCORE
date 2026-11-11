@@ -37,6 +37,7 @@ import {
   spreadFromWrist,
   FALLBACK_METRIC_SCALE
 } from "./handCoordinates.js";
+import { HandSmootherRegistry } from "./handSmoothing.js";
 
 const TIP_INDICES = [4, 8, 12, 16, 20];
 
@@ -309,6 +310,9 @@ class HandRig {
     // rig rebuilds its geometry from these; allocating 21 vectors per hand per
     // frame at 60fps is 2,500 allocations a second for no benefit.
     this.scratchPositions = Array.from({ length: 21 }, () => new THREE.Vector3());
+    // The smoothed copy the rig actually draws from, so the raw solver output
+    // is never mutated and depth probing still sees the true position.
+    this.scratchSmoothed = Array.from({ length: 21 }, () => new THREE.Vector3());
     this.pulse = 0;
     this._depth = 1;
     this._up = new THREE.Vector3(0, 1, 0);
@@ -492,6 +496,10 @@ export class HandSkeleton3D {
     // Bone orientation scratch, so the per-bone quaternion is not reallocated.
     this._boneQuat = new THREE.Quaternion();
     this._boneDir = new THREE.Vector3();
+    // Per-hand, per-joint smoothing. The 3D rig is the skeleton the user
+    // actually sees and touches; it used to place joints straight from the
+    // solver while the 2D overlay smoothed, so the visible one juddered.
+    this.smoothers = new HandSmootherRegistry();
     // Per-hand depth state, keyed like the rigs themselves. Each hand owns its
     // own probe timer and its own smoothed value.
     this._nearnessState = new Map();
@@ -569,8 +577,9 @@ export class HandSkeleton3D {
     return (hand.value = 1 - fraction * 0.65);
   }
 
-  updateSettings({ mirror } = {}) {
+  updateSettings({ mirror, smoothing } = {}) {
     if (typeof mirror === "boolean") this.mirror = mirror;
+    if (typeof smoothing === "number") this.smoothers.updateSettings({ smoothing });
   }
 
   setVisible(visible) {
@@ -595,9 +604,15 @@ export class HandSkeleton3D {
    * @param {object} options { pinched: boolean[], activity: number[] }
    */
   update(landmarks, worldLandmarks, handedness, {
-    pinched = [], activity = [], fit = null, dt = 1 / 60
+    pinched = [], activity = [], fit = null, dt = 1 / 60, now = null
   } = {}) {
-    if (!this.visible) return;
+    if (!this.visible) {
+      // Nothing to draw: drop filter history so a resumed stream does not ease
+      // in from a stale pose.
+      this.smoothers.resetAll();
+      return;
+    }
+    const time = Number.isFinite(now) ? now : performance.now() / 1000;
     this.camera.getWorldPosition(this._camPos);
     this.camera.updateMatrixWorld();
     // Cached once per frame; every joint of every hand reuses it.
@@ -644,9 +659,16 @@ export class HandSkeleton3D {
         out: rig.scratchPositions
       });
 
+      // Smooth each joint independently, filtered per hand. The raw solver
+      // output is left untouched; the rig draws the smoothed copy.
+      const smoother = this.smoothers.for(key);
+      const smoothed = smoother.update(positions, rig.scratchSmoothed, time);
+
       rig.group.visible = true;
+      // Depth is measured on the raw positions: the cue is about where the hand
+      // really is relative to the model, not where its display copy is.
       rig.applyDepth(this._nearnessFor(positions, key));
-      rig.update(positions, activity[handIndex] ?? 0,
+      rig.update(smoothed, activity[handIndex] ?? 0,
         Boolean(pinched[handIndex]), dt);
     });
 
@@ -655,6 +677,10 @@ export class HandSkeleton3D {
     for (const [key, rig] of this.rigs) {
       if (!seen.has(key)) rig.setVisible(false);
     }
+    // A hand that has gone must not keep smoothing toward its last pose: when
+    // it comes back the skeleton should appear where the hand is, not glide
+    // there from where it used to be.
+    this.smoothers.retain(seen);
   }
 
   /** Screen-space anchor for a hand, for tether lines. */

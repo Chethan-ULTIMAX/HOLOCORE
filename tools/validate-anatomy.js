@@ -28,6 +28,7 @@ import {
   FALLBACK_METRIC_SCALE
 } from "../handCoordinates.js";
 import { landmarkToWorld } from "../handSkeleton3d.js";
+import { HandJointSmoother, HandSmootherRegistry } from "../handSmoothing.js";
 import { HAND_CONNECTIONS } from "../handOverlay.js";
 import {
   ANATOMY_CASES,
@@ -399,6 +400,122 @@ section("8 · Coordinate helpers are pure and allocation-free");
   check("fallback scale is a usable constant",
     Number.isFinite(FALLBACK_METRIC_SCALE) && FALLBACK_METRIC_SCALE > 0,
     String(FALLBACK_METRIC_SCALE));
+}
+
+/* ========================================================================= */
+section("9 · The 3D skeleton filter removes jitter without lagging");
+
+{
+  const point = value => ({ x: value, y: value, z: 0 });
+  const buffer = () => Array.from({ length: 21 }, () => ({
+    x: 0, y: 0, z: 0,
+    set(a, b, c) { this.x = a; this.y = b; this.z = c; return this; }
+  }));
+  const rms = values => {
+    const mean = values.reduce((sum, v) => sum + v, 0) / values.length;
+    return Math.sqrt(values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / values.length);
+  };
+
+  // Jitter on a still hand must visibly reduce.
+  {
+    const smoother = new HandJointSmoother();
+    const out = buffer();
+    const raw = [];
+    const filtered = [];
+    // Deterministic noise: a fixed pseudo-random sequence, so the check is
+    // reproducible rather than flaky.
+    let seed = 12345;
+    const noise = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return (seed / 0x7fffffff - 0.5) * 0.04;
+    };
+    for (let frame = 0; frame < 200; frame++) {
+      const joints = Array.from({ length: 21 }, (_, i) => ({
+        x: 0.1 * Math.sin(i) + noise(),
+        y: 0.1 * Math.cos(i) + noise(),
+        z: 0
+      }));
+      smoother.update(joints, out, frame / 30);
+      if (frame > 20) { raw.push(joints[8].x); filtered.push(out[8].x); }
+    }
+    const reduction = 1 - rms(filtered) / rms(raw);
+    check("filtering removes most jitter from a still hand", reduction > 0.4,
+      `${(reduction * 100).toFixed(0)}% reduction`);
+  }
+
+  // A deliberate movement must not be damped into sluggishness.
+  {
+    const smoother = new HandJointSmoother();
+    const out = buffer();
+    let stepFrame = -1;
+    let reach = -1;
+    for (let frame = 0; frame < 80; frame++) {
+      const moving = frame >= 10;
+      smoother.update(Array.from({ length: 21 }, () => point(moving ? 1 : 0)), out, frame / 30);
+      if (moving && stepFrame < 0) stepFrame = frame;
+      if (stepFrame >= 0 && reach < 0 && out[0].x > 0.9) reach = frame - stepFrame;
+    }
+    check("a deliberate move settles inside 200 ms", reach > 0 && reach <= 6,
+      `${reach} frames = ${Math.round((reach / 30) * 1000)} ms`);
+  }
+
+  // Joints must be filtered independently: one fingertip moving must not drag
+  // its neighbours, which would deform the hand's proportions.
+  {
+    const smoother = new HandJointSmoother();
+    const out = buffer();
+    for (let frame = 0; frame < 60; frame++) {
+      smoother.update(
+        Array.from({ length: 21 }, (_, i) => point(i === 8 ? (frame < 20 ? 0 : 1) : 0)),
+        out,
+        frame / 30
+      );
+    }
+    check("a moving fingertip does not drag its neighbours",
+      out[8].x > 0.95 && out[7].x === 0 && out[9].x === 0,
+      `8=${out[8].x.toFixed(2)} 7=${out[7].x} 9=${out[9].x}`);
+  }
+
+  // Losing the hand and finding it again must not glide in from the old pose.
+  {
+    const smoother = new HandJointSmoother();
+    const out = buffer();
+    for (let frame = 0; frame < 30; frame++) {
+      smoother.update(Array.from({ length: 21 }, () => point(0)), out, frame / 30);
+    }
+    smoother.reset();
+    smoother.update(Array.from({ length: 21 }, () => point(5)), out, 100);
+    check("a reappearing hand is taken as-is, not eased in", out[0].x === 5, String(out[0].x));
+  }
+
+  // The caller's input must never be mutated.
+  {
+    const smoother = new HandJointSmoother();
+    const out = buffer();
+    const joints = Array.from({ length: 21 }, (_, i) => ({ x: i * 0.01, y: 0, z: 0 }));
+    const snapshot = joints.map(j => ({ ...j }));
+    for (let frame = 0; frame < 10; frame++) smoother.update(joints, out, frame / 30);
+    const untouched = joints.every((j, i) =>
+      j.x === snapshot[i].x && j.y === snapshot[i].y && j.z === snapshot[i].z);
+    check("smoothing never mutates the source landmarks", untouched);
+  }
+
+  // Separate smoothers must keep separate history: the second hand must not
+  // inherit the first hand's filtered positions.
+  {
+    const registry = new HandSmootherRegistry();
+    const outA = buffer();
+    const outB = buffer();
+    for (let frame = 0; frame < 40; frame++) {
+      registry.for("Right-0").update(Array.from({ length: 21 }, () => point(1)), outA, frame / 30);
+      registry.for("Left-1").update(Array.from({ length: 21 }, () => point(-1)), outB, frame / 30);
+    }
+    check("each hand keeps its own filter history",
+      Math.abs(outA[0].x - 1) < 1e-6 && Math.abs(outB[0].x + 1) < 1e-6,
+      `${outA[0].x.toFixed(2)} / ${outB[0].x.toFixed(2)}`);
+    check("two hands get distinct smoothers", registry.smoothers.size === 2,
+      String(registry.smoothers.size));
+  }
 }
 
 /* ========================================================================= */
