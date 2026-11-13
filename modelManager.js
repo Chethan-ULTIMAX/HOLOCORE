@@ -1378,19 +1378,72 @@ export class Workspace {
     // Depth is not thrown away: the rig dims and shrinks when scene geometry is
     // between it and the camera (see HandRig.applyDepth), so it still reads as
     // 3D rather than as a flat sticker.
+    //
+    // The late pass used to re-render `this.scene` in full: every model mesh
+    // traversed and drawn a second time just to composite the hands, which
+    // roughly doubled the GPU work for the whole frame. The hands are
+    // MeshBasicMaterial with depthTest disabled, so they need no lighting,
+    // shadows or tone mapping -- a standalone scene containing only the hand
+    // root renders identically and draws nothing else.
     const late = this.lateLayer && this.lateLayer.visible;
-    if (late) this.lateLayer.visible = false;
 
     if (this.composer) this.composer.render();
     else this.renderer.render(this.scene, this.camera);
 
     if (late) {
-      this.lateLayer.visible = true;
-      const autoClear = this.renderer.autoClear;
-      this.renderer.autoClear = false;
-      this.renderer.clearDepth();
-      this.renderer.render(this.scene, this.camera);
-      this.renderer.autoClear = autoClear;
+      this._renderLateLayer();
+    }
+  }
+
+  /**
+   * Composite the hand skeleton over the finished frame.
+   *
+   * Renders a scene that contains only the hand root, reusing the same camera
+   * and clearing depth first so the hands always sit on top. The model is not
+   * traversed a second time.
+   */
+  _renderLateLayer() {
+    if (!this._lateScene) {
+      this._lateScene = new THREE.Scene();
+      // no fog, no background: this pass adds to whatever is already there
+      this._lateScene.name = "late-layer-scene";
+    }
+
+    // Reparent only if needed. Moving the root out of the main scene keeps it
+    // from being drawn (and lit, and shadowed) in the first pass at all.
+    const layer = this.lateLayer;
+    if (layer.parent !== this._lateScene) {
+      this._lateScene.add(layer);
+    }
+
+    const renderer = this.renderer;
+    const autoClear = renderer.autoClear;
+    const shadowAutoUpdate = renderer.shadowMap?.autoUpdate;
+
+    renderer.autoClear = false;
+    if (renderer.shadowMap && shadowAutoUpdate !== undefined) {
+      // The hand geometry is basic material; it neither casts nor needs shadows.
+      renderer.shadowMap.autoUpdate = false;
+    }
+    renderer.clearDepth();
+    renderer.render(this._lateScene, this.camera);
+    renderer.autoClear = autoClear;
+    if (renderer.shadowMap && shadowAutoUpdate !== undefined) {
+      renderer.shadowMap.autoUpdate = shadowAutoUpdate;
+    }
+    this._lateRenderCount = (this._lateRenderCount || 0) + 1;
+  }
+
+  /**
+   * Put the late layer back into the main scene.
+   *
+   * Called when the layer is detached or the workspace is disposed, so nothing
+   * is left holding a reference into a scene that no longer renders.
+   */
+  _detachLateLayer() {
+    if (this.lateLayer && this._lateScene && this.lateLayer.parent === this._lateScene) {
+      this._lateScene.remove(this.lateLayer);
+      this.scene.add(this.lateLayer);
     }
   }
 
@@ -1401,7 +1454,19 @@ export class Workspace {
    * render loop knows what to hold back for the second pass.
    */
   setLateLayer(object3d) {
+    // Detach the previous layer before swapping, so a replaced skeleton is not
+    // left parented to the late scene where nothing will ever update it.
+    this._detachLateLayer();
     this.lateLayer = object3d || null;
+    if (this.lateLayer) {
+      // Live in the late scene from the start: it is drawn by the composite pass
+      // only, never by the main scene render.
+      if (!this._lateScene) {
+        this._lateScene = new THREE.Scene();
+        this._lateScene.name = "late-layer-scene";
+      }
+      this._lateScene.add(this.lateLayer);
+    }
     return this.lateLayer;
   }
 

@@ -252,8 +252,15 @@ section("2 · Scene-space hand skeletons are live");
 
 const skeleton = api?.getHandSkeleton?.();
 check("the 3D hand skeleton layer exists", Boolean(skeleton));
-check("it is attached to the workspace scene",
-  skeleton?.root?.parent === workspace?.scene);
+// The hands live in their own scene so the main pass draws only the model and
+// the late pass draws only the hands. Asserting "parented to the workspace
+// scene" would re-encode the old design, where the whole scene was rendered
+// twice to composite them.
+check("the skeleton renders from its own late scene",
+  skeleton?.root?.parent?.name === "late-layer-scene",
+  skeleton?.root?.parent?.name || String(skeleton?.root?.parent));
+check("the skeleton is not part of the main scene",
+  skeleton?.root?.parent !== workspace?.scene);
 check("it is hidden until a hand is detected",
   skeleton?.root?.visible !== false);
 
@@ -907,10 +914,44 @@ if (realClearDepth) ws.renderer.clearDepth = realClearDepth;
 
 check("the frame renders twice when the hand layer is live", passes.length === 2,
   `${passes.length} pass(es)`);
-check("the main pass excludes the hands", passes[0]?.lateVisible === false);
-check("the late pass draws the hands", passes[1]?.lateVisible === true);
 check("depth is cleared between the passes", clearDepthCalls >= 1, `${clearDepthCalls}`);
-check("the hand layer is visible again after the frame", ws.lateLayer.visible === true);
+check("the hand layer stays visible across the frame", ws.lateLayer.visible === true);
+
+// The point of the selective pass: the second render must see a scene that
+// contains only the hands. Counting mesh draws proves the model is not redrawn.
+{
+  const drawn = [];
+  const counting = ws.renderer.render.bind(ws.renderer);
+  ws.renderer.render = (scene, camera) => {
+    let meshes = 0;
+    scene.traverse(object => { if (object.isMesh) meshes++; });
+    let modelMeshes = 0;
+    if (ws.assembly?.group) {
+      ws.assembly.group.traverse(object => { if (object.isMesh) modelMeshes++; });
+    }
+    drawn.push({
+      scene: scene.name || "main",
+      meshes,
+      modelMeshes: scene === ws.scene ? modelMeshes : 0,
+      hasModel: Boolean(ws.assembly?.group && scene === ws.scene)
+    });
+    return counting(scene, camera);
+  };
+  ws.update(1 / 60);
+  ws.renderer.render = counting;
+
+  check("the main pass renders the model", drawn[0]?.hasModel === true);
+  check("the late pass does not contain the model",
+    drawn[1]?.hasModel === false, String(drawn[1]?.hasModel));
+  // The hand skeleton legitimately has more meshes than a small model (21 joints,
+  // haloes and two bone layers per hand), so "fewer meshes" is not the property.
+  // The property is that not one model mesh is inside the late scene.
+  check("the late pass contains only hand geometry",
+    drawn[1]?.meshes > 0 && drawn[1]?.modelMeshes === 0,
+    `${drawn[1]?.modelMeshes} model meshes in ${drawn[1]?.meshes}`);
+  check("the model is not traversed twice",
+    drawn[0]?.meshes > 40, `${drawn[0]?.meshes} model meshes`);
+}
 
 // With no hand layer the frame must still render exactly once.
 ws.setLateLayer(null);
