@@ -38,6 +38,7 @@ import {
   FALLBACK_METRIC_SCALE
 } from "./handCoordinates.js";
 import { HandSmootherRegistry } from "./handSmoothing.js";
+import { normaliseProfile } from "./trackingProfiles.js";
 
 const TIP_INDICES = [4, 8, 12, 16, 20];
 
@@ -569,10 +570,13 @@ function palmIndicesToPoints(indices) {
  * Manages one rig per detected hand.
  */
 export class HandSkeleton3D {
-  constructor({ scene, camera, mirror = true }) {
+  constructor({ scene, camera, mirror = true, profile = "balanced" }) {
     this.scene = scene;
     this.camera = camera;
     this.mirror = mirror;
+    // The smoothing profile is applied here so a saved setting takes effect on
+    // the very first frame, not after the user touches the control.
+    this.profile = normaliseProfile(profile);
     this.rigs = new Map();
     this.root = new THREE.Group();
     this.root.name = "hand-skeletons";
@@ -601,7 +605,7 @@ export class HandSkeleton3D {
     // Per-hand, per-joint smoothing. The 3D rig is the skeleton the user
     // actually sees and touches; it used to place joints straight from the
     // solver while the 2D overlay smoothed, so the visible one juddered.
-    this.smoothers = new HandSmootherRegistry();
+    this.smoothers = new HandSmootherRegistry({ settings: { profile: this.profile } });
     // Per-hand depth state, keyed like the rigs themselves. Each hand owns its
     // own probe timer and its own smoothed value.
     this._nearnessState = new Map();
@@ -679,9 +683,13 @@ export class HandSkeleton3D {
     return (hand.value = 1 - fraction * 0.65);
   }
 
-  updateSettings({ mirror, smoothing } = {}) {
+  updateSettings({ mirror, smoothing, profile } = {}) {
     if (typeof mirror === "boolean") this.mirror = mirror;
-    if (typeof smoothing === "number") this.smoothers.updateSettings({ smoothing });
+    // `profile` is the real control; `smoothing` is accepted so a saved 0..1
+    // slider value from an older version still works and is migrated.
+    if (profile !== undefined || typeof smoothing === "number") {
+      this.smoothers.updateSettings({ profile, smoothing });
+    }
   }
 
   setVisible(visible) {

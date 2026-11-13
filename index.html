@@ -561,8 +561,15 @@
           <input type="range" id="set-release" min="0.15" max="0.85" step="0.02">
         </label>
         <label class="field">
-          <span>Tracking smoothing <b id="val-smoothing">0.45</b></span>
-          <input type="range" id="set-smoothing" min="0" max="1" step="0.05">
+          <span>Tracking profile <b id="val-profile">BALANCED</b></span>
+          <select id="set-tracking-profile">
+            <option value="responsive">Responsive — follows fast hand movement</option>
+            <option value="balanced">Balanced — recommended</option>
+            <option value="precision">Precision — steadiest, for fine placement</option>
+          </select>
+          <small class="field-hint" id="hint-profile">
+            Responsive settles ~300 ms after a quick move; Precision ~470 ms with the least jitter.
+          </small>
         </label>
         <label class="switch-field">
           <span>Rotational inertia on release</span>

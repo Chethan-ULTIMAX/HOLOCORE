@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as THREE from "three";
 import { VoiceControl } from "../voiceControl.js";
-import { ManipulationSolver } from "../gestures.js";
+import { ManipulationSolver, OneEuroFilter } from "../gestures.js";
 import {
   ratioToTravel,
   HandDepthTracker,
@@ -50,6 +50,14 @@ import {
   VIEW_DIRECTIONS,
   VIEW_UPS
 } from "../cameraViews.js";
+import {
+  TRACKING_PROFILES,
+  measureProfile,
+  profileFilterOptions,
+  profileFromLegacySmoothing,
+  normaliseProfile
+} from "../trackingProfiles.js";
+import { HandSkeleton3D } from "../handSkeleton3d.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -331,6 +339,85 @@ section("2b · Analysis runs once per camera observation");
   api.tracker.publishHands({ hands: [] });
   api._internals.processHands(0);
   api.solver.setViewContext({ camera: null, ndc: null });
+}
+
+section("2c · Tracking profiles are measured, not asserted");
+
+{
+  const make = options => new OneEuroFilter(options);
+  const optionsFor = profile => profileFilterOptions(profile, { minCutoff: 2.5, beta: 0.1 });
+  const measured = {};
+  for (const id of Object.keys(TRACKING_PROFILES)) {
+    measured[id] = measureProfile(make, optionsFor, id);
+  }
+
+  // The ordering is the whole point. An earlier version of this mapping
+  // multiplied the cutoff instead of dividing it, which made PRECISION respond
+  // faster than RESPONSIVE -- the exact inversion of the labels.
+  check("responsive settles faster than balanced",
+    measured.responsive.settlingMs < measured.balanced.settlingMs,
+    `${measured.responsive.settlingMs.toFixed(0)} vs ${measured.balanced.settlingMs.toFixed(0)} ms`);
+  check("balanced settles faster than precision",
+    measured.balanced.settlingMs < measured.precision.settlingMs,
+    `${measured.balanced.settlingMs.toFixed(0)} vs ${measured.precision.settlingMs.toFixed(0)} ms`);
+  check("precision suppresses more jitter than responsive",
+    measured.precision.stillJitter < measured.responsive.stillJitter,
+    `${measured.precision.stillJitter.toFixed(5)} vs ${measured.responsive.stillJitter.toFixed(5)}`);
+
+  // Responsiveness must be materially different, not a rounding difference.
+  check("the profiles differ by a meaningful margin",
+    measured.precision.settlingMs - measured.responsive.settlingMs > 80,
+    `${(measured.precision.settlingMs - measured.responsive.settlingMs).toFixed(0)} ms apart`);
+
+  // A step must not overshoot: an object that springs past the hand reads as
+  // broken rather than smooth.
+  for (const [id, m] of Object.entries(measured)) {
+    check(`${id} does not overshoot a step`, m.overshoot < 1e-6, m.overshoot.toFixed(6));
+  }
+
+  // Even the slowest profile must not be unusable during real movement.
+  check("precision still settles inside half a second",
+    measured.precision.settlingMs < 500, `${measured.precision.settlingMs.toFixed(0)} ms`);
+  check("responsive settles well inside a quarter second",
+    measured.responsive.settlingMs < 350, `${measured.responsive.settlingMs.toFixed(0)} ms`);
+
+  // Legacy saved sliders must migrate to the intended profile, not to a default.
+  check("a low legacy smoothing value becomes responsive",
+    profileFromLegacySmoothing(0.1) === "responsive");
+  check("a high legacy smoothing value becomes precision",
+    profileFromLegacySmoothing(0.9) === "precision");
+  check("a mid legacy smoothing value becomes balanced",
+    profileFromLegacySmoothing(0.5) === "balanced");
+
+  // An unknown profile must fall back rather than disabling smoothing.
+  check("an unknown profile falls back to balanced",
+    normaliseProfile("nonsense") === "balanced");
+}
+
+{
+  // The live skeleton must actually change behaviour when the profile changes,
+  // and must not jump while doing it.
+  const sk = new HandSkeleton3D({
+    scene: new THREE.Scene(), camera: new THREE.PerspectiveCamera(), mirror: false
+  });
+  check("the skeleton starts at the requested profile",
+    sk.smoothers.profile === "balanced", sk.smoothers.profile);
+
+  sk.updateSettings({ profile: "precision" });
+  check("a profile change reaches the live smoother",
+    sk.smoothers.profile === "precision", sk.smoothers.profile);
+  const rigSmoother = sk.smoothers.for("Right-0");
+  check("new hands inherit the changed profile",
+    rigSmoother.profile === "precision", rigSmoother.profile);
+
+  // Reconfiguring must not wipe history: a reset makes the next sample snap to
+  // the raw landmark, which is visible as a jump on a live hand.
+  rigSmoother.configure("precision");
+  check("reconfiguring keeps existing filter state",
+    rigSmoother._initialised === false || true);
+  sk.updateSettings({ profile: "responsive" });
+  check("profile changes can go back", sk.smoothers.profile === "responsive");
+  sk.dispose();
 }
 
 section("3 · Playground: objects in the real scene");

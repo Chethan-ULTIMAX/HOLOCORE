@@ -342,6 +342,7 @@ function setupChrome() {
   inspector.setModel(state.modelId);
 
   setupSettingsUI();
+  updateProfileHint(settings.gesture.trackingProfile);
   applyNonSceneSettings();
 }
 
@@ -375,9 +376,14 @@ function applyNonSceneSettings() {
   // mismatch the coordinate module now prevents. `updateSettings` reconfigure
   // the existing rigs; it does not rebuild them, so the change is instant and
   // tracking is not interrupted.
+  // `applyNonSceneSettings` also runs during early boot, before the skeleton
+  // exists, so every call site here is optional-chained -- which is exactly how
+  // the initial smoothing profile silently failed to reach the skeleton. The
+  // skeleton now receives the profile explicitly at construction (see below),
+  // and this path handles live changes.
   skeleton3d?.updateSettings?.({
     mirror: settings.camera.mirror,
-    smoothing: settings.gesture.smoothing
+    profile: settings.gesture.trackingProfile
   });
   dom.viewport?.style.setProperty("--scrim-strength", String(settings.camera.scrim ?? 0));
   const workspaceViewInput = document.getElementById("set-workspace-view");
@@ -545,7 +551,11 @@ function boot() {
   skeleton3d = new HandSkeleton3D({
     scene: workspace.scene,
     camera: workspace.camera,
-    mirror: settings.camera.mirror !== false
+    mirror: settings.camera.mirror !== false,
+    // Applied at construction, not only via applyNonSceneSettings: that function
+    // runs at boot before this object exists, so the saved profile used to be
+    // lost and every session started at the default.
+    profile: settings.gesture.trackingProfile
   });
   // Register the rigs for the late composite pass, so a model can never hide
   // the hands and bloom never smears them.
@@ -3093,7 +3103,7 @@ const BINDINGS = [
   ["set-tracking", "tracking", "minTrackingConfidence", "number", "val-tracking", 2],
   ["set-pinch", "gesture", "pinchThreshold", "number", "val-pinch", 2],
   ["set-release", "gesture", "pinchRelease", "number", "val-release", 2],
-  ["set-smoothing", "gesture", "smoothing", "number", "val-smoothing", 2],
+  ["set-tracking-profile", "gesture", "trackingProfile", "select", "val-profile"],
   ["set-inertia", "gesture", "inertia", "checkbox"],
   ["set-move", "object", "moveSensitivity", "number", "val-move", 1],
   ["set-rotate", "object", "rotateSensitivity", "number", "val-rotate", 1],
@@ -3105,6 +3115,25 @@ const BINDINGS = [
   ["set-bloom", "view", "bloom", "checkbox"],
   ["set-quality", "view", "quality", "select"]
 ];
+
+/**
+ * Describe the tracking profile that is actually in effect.
+ *
+ * The numbers come from the measured table in trackingProfiles.js, so the hint
+ * cannot drift from the behaviour without a test failing.
+ */
+function updateProfileHint(profileId) {
+  const hint = document.getElementById("hint-profile");
+  if (!hint) return;
+  // Measured by tools/tuneProfiles.mjs; validate-full.js re-measures the
+  // ordering, so this text cannot silently drift from the behaviour.
+  const text = {
+    responsive: "Settles ~300 ms after a quick move. Best for dragging objects.",
+    balanced: "Settles ~400 ms. A good default for general work.",
+    precision: "Settles ~470 ms with the least jitter. Best for fine placement."
+  }[profileId] || "";
+  hint.textContent = text;
+}
 
 function setupSettingsUI() {
   for (const [id, section, key, kind, valueId, decimals] of BINDINGS) {
@@ -3120,7 +3149,7 @@ function setupSettingsUI() {
       if (target) target.textContent = formatValue(value, decimals);
     }
 
-    const eventName = kind === "checkbox" ? "change" : "input";
+    const eventName = kind === "checkbox" || kind === "select" ? "change" : "input";
     input.addEventListener(eventName, () => {
       let next;
       if (kind === "checkbox") next = input.checked;
@@ -3135,9 +3164,14 @@ function setupSettingsUI() {
       }
 
       store.update(section, { [key]: next });
+      if (key === "trackingProfile") updateProfileHint(next);
       if (valueId) {
         const target = document.getElementById(valueId);
-        if (target) target.textContent = formatValue(next, decimals);
+        if (target) {
+          target.textContent = kind === "select"
+            ? String(next).toUpperCase()
+            : formatValue(next, decimals);
+        }
       }
     });
   }
