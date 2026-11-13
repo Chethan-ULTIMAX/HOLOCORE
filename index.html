@@ -276,20 +276,39 @@
         <div class="diag" id="diagnostics" data-open="false">
           <button type="button" class="diag-toggle" id="diag-toggle" aria-expanded="false">
             <span class="diag-dot" aria-hidden="true"></span>
-            RENDER DIAGNOSTICS
+            DIAGNOSTICS
           </button>
-          <dl class="diag-grid" id="diag-grid">
-            <dt>MODEL</dt><dd id="diag-model">—</dd>
-            <dt>MESHES</dt><dd id="diag-meshes">—</dd>
-            <dt>VISIBLE</dt><dd id="diag-visible">—</dd>
-            <dt>TRIANGLES</dt><dd id="diag-tris">—</dd>
-            <dt>BOUNDS</dt><dd id="diag-bounds">—</dd>
-            <dt>CAM DIST</dt><dd id="diag-camdist">—</dd>
-            <dt>ATTACHED</dt><dd id="diag-attached">—</dd>
-            <dt>IN FRAME</dt><dd id="diag-infrustum">—</dd>
-            <dt>RENDER LOOP</dt><dd id="diag-loop">—</dd>
-            <dt>WEBGL ERRORS</dt><dd id="diag-errors">—</dd>
-          </dl>
+          <div class="diag-body">
+            <div class="diag-col">
+              <h3 class="diag-group">RENDER</h3>
+              <dl class="diag-grid" id="diag-grid">
+                <dt>MODEL</dt><dd id="diag-model">—</dd>
+                <dt>MESHES</dt><dd id="diag-meshes">—</dd>
+                <dt>VISIBLE</dt><dd id="diag-visible">—</dd>
+                <dt>TRIANGLES</dt><dd id="diag-tris">—</dd>
+                <dt>BOUNDS</dt><dd id="diag-bounds">—</dd>
+                <dt>CAM DIST</dt><dd id="diag-camdist">—</dd>
+                <dt>ATTACHED</dt><dd id="diag-attached">—</dd>
+                <dt>IN FRAME</dt><dd id="diag-infrustum">—</dd>
+                <dt>RENDER LOOP</dt><dd id="diag-loop">—</dd>
+                <dt>WEBGL ERRORS</dt><dd id="diag-errors">—</dd>
+              </dl>
+            </div>
+            <div class="diag-col">
+              <h3 class="diag-group">TRACKING</h3>
+              <dl class="diag-grid">
+                <dt>TRACKER</dt><dd id="diag-track-status">—</dd>
+                <dt>CAMERA FPS</dt><dd id="diag-track-fps">—</dd>
+                <dt>INFERENCE</dt><dd id="diag-track-inference">—</dd>
+                <dt>DELEGATE</dt><dd id="diag-track-delegate">—</dd>
+                <dt>HANDS</dt><dd id="diag-track-hands">—</dd>
+                <dt>IDENTITY</dt><dd id="diag-track-identity">—</dd>
+                <dt>DUPLICATE FRAMES</dt><dd id="diag-track-duplicate">—</dd>
+                <dt>REJECTED</dt><dd id="diag-track-rejected">—</dd>
+                <dt>OBS LAG</dt><dd id="diag-track-lag">—</dd>
+              </dl>
+            </div>
+          </div>
         </div>
 
         <!-- Floating stage toolbar -->

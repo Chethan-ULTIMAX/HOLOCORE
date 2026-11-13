@@ -599,6 +599,65 @@ section("2e · Hover raycasting is not repeated when nothing changed");
   api._internals.resetTrackingState();
 }
 
+section("2f · Diagnostics report the live tracking pipeline");
+
+{
+  const doc = api.getDocument?.() || globalThis.document;
+  const read = id => doc.getElementById(id)?.textContent?.trim();
+
+  // Drive one real observation, then read the panel the user would read.
+  const landmarks = (x) => {
+    const points = Array.from({ length: 21 }, () => ({ x, y: 0.5, z: 0 }));
+    points[0] = { x: x + 0.50, y: 0.72, z: 0 };
+    const columns = [0.42, 0.45, 0.50, 0.55, 0.60];
+    [1, 5, 9, 13, 17].forEach((joint, i) => {
+      points[joint] = { x: x + columns[i], y: 0.55, z: 0 };
+      points[joint + 1] = { x: x + columns[i], y: 0.48, z: 0 };
+      points[joint + 2] = { x: x + columns[i], y: 0.42, z: 0 };
+      if (i > 0) points[joint + 3] = { x: x + columns[i], y: 0.37, z: 0 };
+    });
+    points[4] = { x: x + 0.42, y: 0.51, z: 0 };
+    return points;
+  };
+
+  const clock = performance.now();
+  api.tracker.publishHands({
+    hands: [landmarks(0.5)], handedness: ["Right"], observationMs: clock
+  });
+  api._internals.processHands(clock / 1000);
+  api._internals.updateDiagnostics();
+
+  check("the tracking group is rendered",
+    read("diag-track-status") && read("diag-track-status") !== "—",
+    read("diag-track-status"));
+  check("hand count and identity are reported together",
+    /^\d+ · hand-\d+$/.test(read("diag-track-hands") || ""),
+    read("diag-track-hands"));
+  check("identity reads as stable when keys are assigned",
+    read("diag-track-identity") === "stable", read("diag-track-identity"));
+  check("observation lag is measured, not assumed",
+    /^\d+ ms$/.test(read("diag-track-lag") || ""), read("diag-track-lag"));
+  check("rejected hands start at zero",
+    read("diag-track-rejected") === "0", read("diag-track-rejected"));
+
+  // A malformed payload must show up in the panel, not just in a counter.
+  api.tracker.publishHands({ hands: [null], handedness: ["Right"], observationMs: clock });
+  api._internals.updateDiagnostics();
+  check("a rejected hand is visible in the panel",
+    read("diag-track-rejected") === "1", read("diag-track-rejected"));
+  check("the panel flags a rejection", doc.getElementById("diag-track-rejected")?.classList.contains("is-bad") === true);
+
+  // With no hands the identity field must not claim success.
+  api.tracker.publishHands({ hands: [], handedness: [], observationMs: clock });
+  api._internals.processHands(clock / 1000);
+  api._internals.updateDiagnostics();
+  check("no hands means no identity claim",
+    read("diag-track-identity") === "—", read("diag-track-identity"));
+
+  api.solver.setViewContext({ camera: null, ndc: null });
+  api._internals.resetTrackingState();
+}
+
 section("3 · Playground: objects in the real scene");
 
 const playground = api?.getPlayground?.();

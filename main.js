@@ -108,6 +108,15 @@ const dom = {
   voicePhrase: $("#voice-phrase"),
   sceneOutliner: $("#scene-outliner"),
   diagnostics: $("#diagnostics"),
+  diagTrackStatus: $("#diag-track-status"),
+  diagTrackFps: $("#diag-track-fps"),
+  diagTrackInference: $("#diag-track-inference"),
+  diagTrackDelegate: $("#diag-track-delegate"),
+  diagTrackHands: $("#diag-track-hands"),
+  diagTrackIdentity: $("#diag-track-identity"),
+  diagTrackDuplicate: $("#diag-track-duplicate"),
+  diagTrackRejected: $("#diag-track-rejected"),
+  diagTrackLag: $("#diag-track-lag"),
   diagToggle: $("#diag-toggle"),
   diagGrid: $("#diag-grid"),
   diagModel: $("#diag-model"),
@@ -2989,9 +2998,89 @@ function updateDiagnostics() {
   setDiagValue(dom.diagErrors, String(glErrorCount), glErrorCount === 0);
   if (glErrorCount > 0) problems.push("gl");
 
+  updateTrackingDiagnostics(problems);
+
   panel.dataset.ok = problems.length === 0 ? "true" : "false";
   panel.dataset.open = state.diagnosticsOpen ? "true" : "false";
   dom.diagToggle?.setAttribute("aria-expanded", state.diagnosticsOpen ? "true" : "false");
+}
+
+/**
+ * Tracking half of the diagnostic panel.
+ *
+ * The render half answers "is anything on screen?"; this half answers "is the
+ * hand data arriving, and is it current?". They fail in different ways, and
+ * without the second set a frozen skeleton looks identical to a stationary hand.
+ *
+ * Every value is read from the live tracker and pipeline. When there is no
+ * tracker the fields say so rather than showing a stale or assumed value.
+ *
+ * @param {string[]} problems accumulates failure codes for the panel indicator
+ */
+function updateTrackingDiagnostics(problems) {
+  if (!dom.diagTrackStatus) return;
+
+  const t = tracker?.getState?.();
+
+  if (!t) {
+    setDiagValue(dom.diagTrackStatus, "no tracker", false);
+    setDiagValue(dom.diagTrackFps, "—", false);
+    setDiagValue(dom.diagTrackInference, "—", false);
+    setDiagValue(dom.diagTrackDelegate, "—", false);
+    setDiagValue(dom.diagTrackHands, "—", false);
+    setDiagValue(dom.diagTrackIdentity, "—", false);
+    setDiagValue(dom.diagTrackDuplicate, "—", false);
+    setDiagValue(dom.diagTrackRejected, "—", false);
+    setDiagValue(dom.diagTrackLag, "—", false);
+    problems.push("tracker");
+    return;
+  }
+
+  // Status is only "good" when the tracker is actually producing hands. ACTIVE
+  // means the camera is streaming but no hand has been seen yet, which is a
+  // normal state and not an error.
+  const producing = t.status === TRACKER_STATUS.HANDS;
+  setDiagValue(dom.diagTrackStatus, t.label || t.status, producing || t.status === TRACKER_STATUS.ACTIVE);
+
+  setDiagValue(dom.diagTrackFps,
+    Number.isFinite(t.fps) && t.fps > 0 ? t.fps.toFixed(0) : "—",
+    Number.isFinite(t.fps) && t.fps > 0);
+
+  setDiagValue(dom.diagTrackInference,
+    Number.isFinite(t.inferenceMs) && t.inferenceMs > 0 ? `${t.inferenceMs.toFixed(0)} ms` : "—",
+    !Number.isFinite(t.inferenceMs) || t.inferenceMs <= 0 || t.inferenceMs < 200);
+
+  setDiagValue(dom.diagTrackDelegate, t.delegate || "—", Boolean(t.delegate));
+
+  const liveKeys = state.lastAnalysis?.activeStates?.map(hand => hand.key) || [];
+  setDiagValue(dom.diagTrackHands,
+    t.hands > 0 && liveKeys.length
+      ? `${liveKeys.length} · ${liveKeys.join(", ")}`
+      : String(t.hands ?? 0),
+    (t.hands ?? 0) === liveKeys.length);
+
+  // Identity going missing is the fingerprint of the section 4.2 class of bug:
+  // hands are being tracked, but nothing downstream knows which hand is which.
+  const keyed = liveKeys.every(key => typeof key === "string" && key.length > 0);
+  setDiagValue(dom.diagTrackIdentity,
+    liveKeys.length ? (keyed ? "stable" : "missing") : "—",
+    liveKeys.length ? keyed : undefined);
+
+  setDiagValue(dom.diagTrackDuplicate, String(state.duplicateFrames || 0), true);
+
+  const rejected = tracker?.rejectedHands || 0;
+  setDiagValue(dom.diagTrackRejected, String(rejected), rejected === 0);
+  if (rejected > 0) problems.push("rejected");
+
+  // How far behind real time the analysed observation is. A large or growing lag
+  // means the analysis is not keeping up with the camera, which shows up as
+  // "the hands feel late" long before the frame rate drops.
+  const observationMs = tracker?.observationMs;
+  const lag = Number.isFinite(observationMs) ? performance.now() - observationMs : NaN;
+  setDiagValue(dom.diagTrackLag,
+    Number.isFinite(lag) ? `${lag.toFixed(0)} ms` : "—",
+    Number.isFinite(lag) && lag < 250);
+  if (Number.isFinite(lag) && lag >= 250) problems.push("lag");
 }
 
 function formatCompact(value) {
@@ -3938,6 +4027,8 @@ window.HOLOCORE = {
     // Identity and analyser state are process-wide, exactly like the tracker and
     // the solver. A test that wants a clean slate should reset all of them.
     resetTrackingState,
+    updateDiagnostics,
+    getDocument: () => document,
     hoverNdc: () => ({ ...state.hoverNdc })
   }
 };
