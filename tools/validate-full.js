@@ -2862,9 +2862,165 @@ const activeButton = doc.querySelector(".mode-btn.is-active");
 check("the mode bar highlights the active mode",
   Boolean(activeButton), activeButton?.textContent?.trim());
 
+section("7 · A complete session, end to end, from synthetic hands");
+
+/*
+ * Everything above tests a part. This walks one continuous session through the
+ * real pipeline, in the order a user would: raise a hand, point, pinch, drag,
+ * rotate, scale with two hands, change view mid-drag, lose tracking, recover,
+ * and clean up.
+ *
+ * The point is not to re-test the parts. It is to catch state that leaks BETWEEN
+ * them: a lock not released, a frame captured under an old camera, a filter that
+ * never forgets a hand that left. Those bugs are invisible to per-part tests and
+ * obvious to a session.
+ */
+{
+  // The previous section left the solver in ROTATE mode, which by design refuses
+  // to translate. A session starts the way a user does: in MOVE, which is the
+  // mode for dragging (there is no "auto" entry in the mode bar).
+  api.setMode("move");
+  const session = api.getPlayground();
+  session.clear();
+  const cube = session.addPrimitive("cube");
+  session.select(cube.id);
+  const start = { ...session.getTransform(cube.id).position };
+  const problems = [];
+
+  // A plausible 21-point hand, positioned and pinched as asked.
+  const makeHand = (x, y, pinched, z = 0) => {
+    const points = Array.from({ length: 21 }, () => ({ x, y, z }));
+    points[0] = { x: x + 0.50, y: y + 0.22, z };              // wrist
+    const columns = [0.42, 0.45, 0.50, 0.55, 0.60];           // thumb..pinky
+    [1, 5, 9, 13, 17].forEach((joint, i) => {
+      points[joint] = { x: x + columns[i], y: y + 0.05, z };
+      points[joint + 1] = { x: x + columns[i], y: y - 0.02, z };
+      points[joint + 2] = { x: x + columns[i], y: y - 0.08, z };
+      if (i > 0) points[joint + 3] = { x: x + columns[i], y: y - 0.13, z };
+    });
+    // Thumb tip: against the index tip when pinched, out to the side when open.
+    points[4] = pinched
+      ? { x: x + 0.45, y: y - 0.08, z }
+      : { x: x + 0.30, y: y + 0.02, z };
+    return points;
+  };
+
+  const clock = { t: performance.now() };
+  const frame = (hands, handedness = []) => {
+    clock.t += 33;
+    api.tracker.publishHands({ hands, handedness, observationMs: clock.t });
+    api._internals.processHands(clock.t / 1000);
+    return api._internals.pointerTargets();
+  };
+
+  const record = (label, expected) => {
+    if (!expected) problems.push(label);
+  };
+
+  api.solver.setViewContext({ camera: workspace?.camera || null, ndc: null });
+
+  // 1. Raise an open hand and let the filters settle.
+  let seen = null;
+  for (let i = 0; i < 12; i++) seen = frame([makeHand(0.1, 0.3, false)], ["Right"]);
+  record("an open hand is tracked", api._internals.analyzers.size >= 1);
+  record("the pointer resolves to something", Boolean(seen));
+
+  // 2. Pinch. The solver must enter a grab.
+  for (let i = 0; i < 8; i++) frame([makeHand(0.1, 0.3, true)], ["Right"]);
+  record("a pinch starts a grab", api.solver.mode !== "idle", api.solver.mode);
+
+  // 3. Drag across the stage. The object must move, and stay on the stage.
+  for (let i = 1; i <= 14; i++) {
+    frame([makeHand(0.1 - i * 0.012, 0.3 + i * 0.004, true)], ["Right"]);
+  }
+  const dragged = session.getTransform(cube.id).position;
+  const travelled = Math.hypot(dragged.x - start.x, dragged.y - start.y, dragged.z - start.z);
+  record("the drag moved the object", travelled > 0.05, `${travelled.toFixed(3)}`);
+  record("the object stayed inside the stage", Math.abs(dragged.x) <= 5 && Math.abs(dragged.y) <= 5);
+
+  // 4. Change view MID-DRAG. The grab must survive a view change, and the object
+  //    must not jump: the drag plane belongs to the gesture, and the camera basis
+  //    is captured once at frame start.
+  const beforeViewChange = { ...session.getTransform(cube.id).position };
+  api.getWorkspace().setView("top", { animate: false });
+  for (let i = 1; i <= 5; i++) {
+    frame([makeHand(0.1 - 0.168 - i * 0.006, 0.3 + 0.056, true)], ["Right"]);
+  }
+  const afterViewChange = session.getTransform(cube.id).position;
+  const jump = Math.hypot(
+    afterViewChange.x - beforeViewChange.x,
+    afterViewChange.y - beforeViewChange.y,
+    afterViewChange.z - beforeViewChange.z
+  );
+  record("a view change mid-drag does not teleport the object", jump < 4, jump.toFixed(2));
+
+  // 5. Release. The grab must end and the lock must clear.
+  for (let i = 0; i < 6; i++) frame([makeHand(0.0, 0.3, false)], ["Right"]);
+  record("releasing ends the grab", api.solver.mode === "idle", api.solver.mode);
+  record("releasing clears the controller lock", api.solver.activeKey === null);
+
+  // 6. Two hands: frame/scale. Both hands pinch and separate.
+  api.getWorkspace().setView("iso", { animate: false });
+  for (let i = 0; i < 8; i++) {
+    frame([makeHand(0.30, 0.3, true), makeHand(0.70, 0.3, true)], ["Left", "Right"]);
+  }
+  const twoHandMode = api.solver.mode;
+  for (let i = 1; i <= 6; i++) {
+    frame([
+      makeHand(0.30 - i * 0.010, 0.3, true),
+      makeHand(0.70 + i * 0.010, 0.3, true)
+    ], ["Left", "Right"]);
+  }
+  record("two hands enter a two-hand gesture",
+    twoHandMode !== "idle" || api.solver.mode !== "idle", `${twoHandMode} -> ${api.solver.mode}`);
+
+  // 7. Both hands leave. Everything must be released and no analyser must linger.
+  for (let i = 0; i < 3; i++) frame([], []);
+  record("both hands leaving releases everything", api.solver.mode === "idle", api.solver.mode);
+  record("no analyser outlives its hand",
+    api._internals.analyzers.size === 0, String(api._internals.analyzers.size));
+
+  // 8. Recover with the other hand. It must be a fresh identity, not the old one.
+  for (let i = 0; i < 8; i++) frame([makeHand(0.1, 0.3, false)], ["Left"]);
+  const recovered = api._internals.pointerTargets();
+  const analysersAfterRecovery = api._internals.analyzers.size;
+  record("a new hand is tracked after a full loss", analysersAfterRecovery === 1,
+    String(analysersAfterRecovery));
+
+  // 9. Deselect and clean up.
+  session.clear();
+  record("clearing the playground removes the object", session.props.length === 0);
+  api.solver.setViewContext({ camera: null, ndc: null });
+  api._internals.resetTrackingState();
+
+  check("a full synthetic session runs without a state leak",
+    problems.length === 0, problems.join("; "));
+
+  // Non-vacuity: each stage must have been reached and observed. A session test
+  // that "passes" because every step quietly did nothing would be worthless.
+  check("the session exercised a real two-hand gesture",
+    twoHandMode !== "idle", twoHandMode);
+  // Captured at the moment it happened: the cleanup below legitimately empties
+  // the analyser cache, so checking afterwards would measure the cleanup.
+  check("the session recovered after a full loss",
+    analysersAfterRecovery === 1, String(analysersAfterRecovery));
+  check("the view change landed mid-drag",
+    Math.abs(beforeViewChange.x - start.x) > 0.1,
+    `object was at ${beforeViewChange.x.toFixed(2)} when the view changed`);
+  check("the drag was long enough to be a drag, not a twitch",
+    travelled > 0.5, `${travelled.toFixed(2)} units`);
+
+  // And it must have actually done something: a session that "passes" because
+  // every step was a no-op is not a test.
+  check("the session moved an object", travelled > 0.05, `${travelled.toFixed(3)} units`);
+  check("the session used the real solver, not a stub",
+    typeof api.solver.update === "function" && api.solver.modeId !== undefined,
+    String(api.solver.modeId));
+  void recovered;
+}
+
 /* ------------------------------------------------------------------------- */
 /* SUMMARY                                                                   */
-/* ------------------------------------------------------------------------- */
 
 console.log(`\n${"─".repeat(64)}`);
 if (failed === 0) {
