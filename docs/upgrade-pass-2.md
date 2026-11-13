@@ -34,6 +34,15 @@ Calibrate button threw `ReferenceError` on every press, because it assigned to
 `hoverLock`, a binding that has never existed. No test called it, so no test
 noticed. That class of defect now has a static check (§E, §15).
 
+Each of these three was worse than the commit that fixed it claimed. The
+timestamp commit described the double conversion correctly but did not measure
+it; the two-hand commit said the rotation "flips by roughly 180 degrees", and it
+does not — the frame that observes a reorder captures its reference angle between
+the *opposite* pair of hands, so the reported rotation is measured against the
+wrong pair for the rest of the gesture. That is 1.44 rad in the measurement
+above: large and wrong, but not a flip. The commit messages are left as written;
+the numbers in this report are what was actually measured.
+
 ---
 
 ## B · Tracking latency (§2)
