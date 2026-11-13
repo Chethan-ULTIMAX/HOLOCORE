@@ -41,14 +41,9 @@ import {
   PLANE_AXES
 } from "../gizmo.js";
 import {
-  viewPlacement,
-  describePlacement,
-  matchingView,
-  safeUp,
-  fitDistance,
-  VIEW_ORDER,
-  VIEW_DIRECTIONS,
-  VIEW_UPS
+  viewPlacement, describePlacement, matchingView, safeUp, fitDistance,
+  VIEW_ORDER, VIEW_DIRECTIONS, VIEW_UPS, SHORTCUT_LIST, isViewId,
+  shortcutHint, viewForEvent
 } from "../cameraViews.js";
 import {
   TRACKING_PROFILES,
@@ -871,6 +866,67 @@ section("2h · The driving hand can be chosen, and its role is honoured");
   api._internals.store.update("gesture", { handRole: DEFAULT_ROLE });
 
   api._internals.resetTrackingState();
+}
+
+section("2i · Every standard view is reachable from the keyboard");
+
+{
+  // All seven views must have a shortcut: back, left, right and bottom used to be
+  // mouse-only because the handler hard-coded Shift+1/2/3.
+  const shortcuts = SHORTCUT_LIST;
+  check("all seven standard views have a shortcut",
+    shortcuts.length === 7, String(shortcuts.length));
+  check("every view id is covered",
+    VIEW_ORDER.every(id => shortcutHint(id)),
+    VIEW_ORDER.filter(id => !shortcutHint(id)).join(", "));
+  check("shortcut ids are real views",
+    shortcuts.every(item => isViewId(item.view)),
+    shortcuts.filter(item => !isViewId(item.view)).map(item => item.view).join(", "));
+  check("no two views share a shortcut",
+    new Set(shortcuts.map(item => item.key)).size === shortcuts.length);
+  check("the digits run 1 to 7 in order",
+    shortcuts.every((item, i) => item.digit === i + 1),
+    shortcuts.map(item => item.digit).join(","));
+
+  // The hint in a tooltip must match the key that actually works, and the digit
+  // must be the real digit: `$` is ASCII 36, and deriving from the code point
+  // once produced tooltips reading "Shift+32" and "Shift+62".
+  for (const item of shortcuts) {
+    check(`${item.view} advertises Shift+${item.digit}`,
+      shortcutHint(item.view) === `Shift+${item.digit}` &&
+      viewForEvent(item.key) === item.view &&
+      viewForEvent(String(item.digit), true) === item.view,
+      `${shortcutHint(item.view)} -> ${viewForEvent(item.key)}`);
+  }
+  check("an unbound key maps to no view", viewForEvent("z") === null);
+  check("a digit without shift is not a view shortcut",
+    viewForEvent("4", false) === null);
+
+  // Each view must actually place the camera somewhere its own label recovers.
+  const target = new THREE.Vector3(0, 0, 0);
+  for (const id of VIEW_ORDER) {
+    const placement = viewPlacement(id, { target, radius: 3, fov: 42 });
+    check(`${id} round-trips through the camera`, matchingView(placement.position, target) === id,
+      String(matchingView(placement.position, target)));
+  }
+
+  // 7 degrees is the documented tolerance. Small orbits must keep the label;
+  // real orbiting must drop it.
+  const dir = VIEW_DIRECTIONS.front.clone();
+  const at = degrees => {
+    const axis = new THREE.Vector3(0, 1, 0).cross(dir).normalize();
+    const rotated = dir.clone().applyAxisAngle(axis, THREE.MathUtils.degToRad(degrees));
+    return matchingView(rotated.multiplyScalar(10), target);
+  };
+  check("a 3° nudge still reads as Front", at(3) === "front", String(at(3)));
+  check("a 6° nudge still reads as Front", at(6) === "front", String(at(6)));
+  check("a 20° orbit reads as free", at(20) === null, String(at(20)));
+
+  // The camera basis must never be degenerate, or lookAt produces NaNs.
+  for (const id of VIEW_ORDER) {
+    const parallel = Math.abs(VIEW_DIRECTIONS[id].dot(VIEW_UPS[id]));
+    check(`${id} has a usable up vector`, parallel < 0.999, parallel.toFixed(4));
+  }
 }
 
 section("3 · Playground: objects in the real scene");

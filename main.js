@@ -23,7 +23,9 @@ import { HandOverlay } from "./handOverlay.js";
 import { HandSkeleton3D } from "./handSkeleton3d.js";
 import { Playground, PRIMITIVES } from "./playground.js";
 import { chimes } from "./chimes.js";
-import { VIEW_LABELS } from "./cameraViews.js";
+import {
+  VIEW_LABELS, VIEW_SHORTCUTS, viewForEvent, shortcutHint
+} from "./cameraViews.js";
 import { HandDepthRegistry } from "./handDepth.js";
 import { HandIdentityTracker } from "./handIdentity.js";
 import {
@@ -1082,8 +1084,16 @@ function setupViewCube() {
   // by hand, so the indicator never lies about the current orientation.
   workspace.onCameraChange = () => updateViewCube();
 
-  const shortcuts = { 1: "front", 2: "top", 3: "iso" };
-  dom.viewCube.dataset.shortcuts = JSON.stringify(shortcuts);
+  // Every face advertises its own shortcut in its tooltip, generated from the
+  // same map the keyboard handler uses, so the two can never disagree.
+  for (const face of faces) {
+    const hint = shortcutHint(face.dataset.view);
+    if (hint) {
+      face.title = `${VIEW_LABELS[face.dataset.view] || face.dataset.view} view · ${hint}`;
+      face.dataset.shortcut = hint;
+    }
+  }
+  dom.viewCube.dataset.shortcuts = JSON.stringify(VIEW_SHORTCUTS);
   updateViewCube();
 }
 
@@ -4071,19 +4081,16 @@ function setupShortcuts() {
         toggleCameraView();
         break;
       // Standard views. Digits are taken by the interaction modes, so the
-      // view shortcuts are Shift+digit.
-      case "!":
+      // view shortcuts are Shift+digit. Before this, only Shift+1/2/3 existed
+      // and back, left, right and bottom were mouse-only.
+      case "!": case "@": case "#": case "$": case "%": case "^": case "&": {
         event.preventDefault();
-        setStandardView("front");
+        // viewForEvent also accepts a bare digit with shiftKey, so remapped and
+        // non-US layouts reach the same seven views.
+        const view = viewForEvent(event.key, event.shiftKey);
+        if (view) setStandardView(view);
         break;
-      case "@":
-        event.preventDefault();
-        setStandardView("top");
-        break;
-      case "#":
-        event.preventDefault();
-        setStandardView("iso");
-        break;
+      }
       case "m":
         // Voice: M for microphone, leaving V for the camera view.
         event.preventDefault();

@@ -79,6 +79,65 @@ export const VIEW_LABELS = {
 /** The order the controller lays its buttons out in. */
 export const VIEW_ORDER = ["front", "back", "left", "right", "top", "bottom", "iso"];
 
+/**
+ * Keyboard shortcut per standard view.
+ *
+ * Digits 1–5 are taken by the interaction modes, so views live on Shift+digit
+ * through the shifted characters those keys produce. Before this map existed the
+ * handler hard-coded only Shift+1/2/3, which left back, left, right and bottom
+ * reachable by mouse only -- a keyboard user simply could not get to them.
+ *
+ * The digit is stored explicitly rather than derived from the character's code:
+ * `$` is ASCII 36, not "Shift+4", and deriving it that way produced tooltips
+ * reading "Shift+32" and "Shift+62".
+ */
+export const VIEW_SHORTCUTS = Object.freeze({
+  "!": { view: "front", digit: 1 },
+  "@": { view: "top", digit: 2 },
+  "#": { view: "iso", digit: 3 },
+  "$": { view: "right", digit: 4 },
+  "%": { view: "left", digit: 5 },
+  "^": { view: "back", digit: 6 },
+  "&": { view: "bottom", digit: 7 }
+});
+
+/** Every shortcut as `{ key, view, digit }`, in digit order. */
+export const SHORTCUT_LIST = Object.freeze(
+  Object.entries(VIEW_SHORTCUTS)
+    .map(([key, entry]) => ({ key, view: entry.view, digit: entry.digit }))
+    .sort((a, b) => a.digit - b.digit)
+);
+
+/** @returns {string|null} the view id a keyboard event's key maps to. */
+export function viewForShortcut(key) {
+  if (typeof key !== "string") return null;
+  const entry = VIEW_SHORTCUTS[key];
+  return entry ? entry.view : null;
+}
+
+/**
+ * Resolve a keyboard event to a view.
+ *
+ * Accepts both the shifted character (`$`) and a reported digit with shiftKey
+ * set (`4`), because layouts and key remappers differ in which they send.
+ */
+export function viewForEvent(key, shiftKey = false) {
+  const direct = viewForShortcut(key);
+  if (direct) return direct;
+  if (!shiftKey) return null;
+  const digit = Number(key);
+  if (!Number.isInteger(digit)) return null;
+  const entry = SHORTCUT_LIST.find(item => item.digit === digit);
+  return entry ? entry.view : null;
+}
+
+/** Human-readable shortcut hint, for tooltips and the settings panel. */
+export function shortcutHint(id) {
+  const entry = SHORTCUT_LIST.find(item => item.view === id);
+  return entry ? `Shift+${entry.digit}` : "";
+}
+
+
 export function isViewId(id) {
   return Object.prototype.hasOwnProperty.call(VIEW_DIRECTIONS, id);
 }
@@ -170,6 +229,14 @@ export function safeUp(direction, up) {
  * that hemisphere — an orbiting camera should show no active preset.
  *
  * @returns {string|null}
+ */
+/**
+ * Which standard view the camera is near, or null.
+ *
+ * `tolerance` is in RADIANS of angular error from the axis. The default is
+ * seven degrees: tight enough that an orbit reads as free, loose enough that the
+ * small settling wobble after an animated view change does not flicker the
+ * indicator to FREE and back.
  */
 export function matchingView(position, target, { tolerance = 0.12 } = {}) {
   if (!position || !target) return null;
