@@ -29,6 +29,9 @@ import { HandIdentityTracker } from "./handIdentity.js";
 import {
   CalibrationSession, DEFAULT_THRESHOLDS, POSES, POSE_DURATION_MS
 } from "./calibration.js";
+import {
+  HAND_ROLES, DEFAULT_ROLE, normaliseRole, selectRoleHand, assessHandSettings, describeRole
+} from "./handOptions.js";
 import { OneEuroFilter } from "./gestures.js";
 import { VoiceControl, VOICE_STATUS, COLOR_PALETTE, parseCommand } from "./voiceControl.js";
 import { MODES, getMode, isMode, instructionFor } from "./interactionModes.js";
@@ -375,6 +378,7 @@ function setupChrome() {
 
   setupSettingsUI();
   updateProfileHint(settings.gesture.trackingProfile);
+  updateHandRoleHint();
   applyNonSceneSettings();
 }
 
@@ -1967,28 +1971,19 @@ function pickPointer(states, activeHand = null) {
     return { hand: { ...hand, indexTip: tip, pinched: Boolean(hand.pinched) }, state: hand };
   }
 
-  let best = null;
-  let bestScore = -Infinity;
-  for (const hand of states) {
-    if (!hand) continue;
-    let score = 0;
-    if (hand.pinched) score += 10;
-    // A hand with a complete landmark set is likelier to be in frame.
-    const points = hand.landmarks?.length || 0;
-    score += Math.min(points, 21) / 21;
-    if (hand.present === false) score -= 5;
-    if (score > bestScore) {
-      bestScore = score;
-      best = hand;
-    }
+  // No solver opinion: fall back to the configured hand role, so the reticle
+  // follows the hand the user nominated instead of the first one in the array.
+  // Previously this loop ignored the role entirely and could pick a hand the
+  // solver had deliberately excluded.
+  const roleHand = selectRoleHand(states, { role: settings.gesture.handRole });
+  if (roleHand) {
+    const tip = roleHand.landmarks?.[8] || roleHand.indexTip || roleHand.pinch || null;
+    return {
+      hand: { ...roleHand, indexTip: tip, pinched: Boolean(roleHand.pinched) },
+      state: roleHand
+    };
   }
-
-  if (!best) return null;
-  const tip = best.landmarks?.[8] || best.indexTip || best.pinch || null;
-  return {
-    hand: { ...best, indexTip: tip, pinched: Boolean(best.pinched) },
-    state: best
-  };
+  return null;
 }
 
 /**
@@ -3337,6 +3332,7 @@ const BINDINGS = [
   ["set-pinch", "gesture", "pinchThreshold", "number", "val-pinch", 2],
   ["set-release", "gesture", "pinchRelease", "number", "val-release", 2],
   ["set-tracking-profile", "gesture", "trackingProfile", "select", "val-profile"],
+  ["set-hand-role", "gesture", "handRole", "select"],
   ["set-inertia", "gesture", "inertia", "checkbox"],
   ["set-move", "object", "moveSensitivity", "number", "val-move", 1],
   ["set-rotate", "object", "rotateSensitivity", "number", "val-rotate", 1],
@@ -3366,6 +3362,61 @@ function updateProfileHint(profileId) {
     precision: "Settles ~470 ms with the least jitter. Best for fine placement."
   }[profileId] || "";
   hint.textContent = text;
+}
+
+/**
+ * Explain the selected hand role, and surface configuration problems.
+ *
+ * The warnings are the point: "detection confidence above tracking confidence"
+ * is a legal pair of sliders that quietly makes hands flicker. The app used to
+ * let the user do that and just look broken.
+ */
+function updateHandRoleHint() {
+  const hint = document.getElementById("hint-hand-role");
+  if (hint) {
+    const role = normaliseRole(settings.gesture.handRole);
+    const entry = HAND_ROLES.find(item => item.id === role);
+    hint.textContent = entry ? entry.detail : "";
+  }
+  renderHandWarnings();
+}
+
+/** Draw the current configuration warnings, with a one-click fix each. */
+function renderHandWarnings() {
+  const box = document.getElementById("hand-warnings");
+  if (!box) return;
+
+  const warnings = assessHandSettings(
+    {
+      detection: settings.tracking.minDetectionConfidence,
+      tracking: settings.tracking.minTrackingConfidence,
+      maxHands: settings.tracking.maxHands
+    },
+    { role: settings.gesture.handRole, twoHandGesture: true }
+  );
+
+  box.replaceChildren();
+  box.hidden = warnings.length === 0;
+
+  for (const warning of warnings) {
+    const item = document.createElement("div");
+    item.className = "warn-item";
+    item.dataset.warn = warning.id;
+    item.append(document.createTextNode(warning.message));
+
+    if (warning.fix) {
+      const fix = document.createElement("button");
+      fix.type = "button";
+      fix.className = "warn-fix";
+      fix.textContent = "Fix";
+      fix.addEventListener("click", () => {
+        store.update(warning.fix.section, warning.fix.values);
+        toast("Applied the suggested setting", "", 2000);
+      });
+      item.append(fix);
+    }
+    box.append(item);
+  }
 }
 
 function setupSettingsUI() {
@@ -3398,6 +3449,8 @@ function setupSettingsUI() {
 
       store.update(section, { [key]: next });
       if (key === "trackingProfile") updateProfileHint(next);
+      if (key === "handRole") updateHandRoleHint();
+      if (section === "tracking") renderHandWarnings();
       if (valueId) {
         const target = document.getElementById(valueId);
         if (target) {
@@ -3583,7 +3636,8 @@ function applySettings({ section, keys } = {}) {
       moveSensitivity: settings.object.moveSensitivity,
       rotateSensitivity: settings.object.rotateSensitivity,
       scaleSensitivity: settings.object.scaleSensitivity,
-      zSensitivity: settings.object.depthSensitivity
+      zSensitivity: settings.object.depthSensitivity,
+      handRole: settings.gesture.handRole
     });
   }
 

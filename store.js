@@ -50,6 +50,11 @@ export const DEFAULT_SETTINGS = {
      */
     trackingProfile: "balanced",
     /**
+     * Which hand may drive the reticle (§10): auto | left | right | any.
+     * Excluded hands are still tracked and can still join a two-hand gesture.
+     */
+    handRole: "auto",
+    /**
      * Per-user pinch calibration from §9, or null when never calibrated.
      *
      * The defaults above are a reasonable starting point for most hands, but

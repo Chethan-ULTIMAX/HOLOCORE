@@ -62,6 +62,9 @@ import { HandIdentityTracker } from "../handIdentity.js";
 import {
   CalibrationSession, fitThresholds, DEFAULT_THRESHOLDS
 } from "../calibration.js";
+import {
+  HAND_ROLES, DEFAULT_ROLE, normaliseRole, selectRoleHand, assessHandSettings
+} from "../handOptions.js";
 import { palmSpan, palmSpan2D } from "../handCoordinates.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -789,6 +792,84 @@ section("2g · Pinch calibration fits thresholds to the user's own hands");
     pinchCalibration: null
   });
   api.solver.setViewContext({ camera: null, ndc: null });
+  api._internals.resetTrackingState();
+}
+
+section("2h · The driving hand can be chosen, and its role is honoured");
+
+{
+  const left = { handedness: "Left", key: "hand-1", pinched: false };
+  const right = { handedness: "Right", key: "hand-2", pinched: false };
+
+  check("automatic picks the acting hand",
+    selectRoleHand([left, { ...right, pinched: true }], { role: "auto" }).key === "hand-2");
+  check("a fixed role ignores the acting hand",
+    selectRoleHand([left, { ...right, pinched: true }], { role: "left" }).key === "hand-1");
+  check("a fixed role withholds the reticle when that hand is absent",
+    selectRoleHand([right], { role: "left" }) === null);
+  check("either-hand mode accepts whichever is present",
+    selectRoleHand([right], { role: "any" })?.key === "hand-2");
+
+  // Unknown handedness is a tracked hand, not a wrong one: dropping it would
+  // leave a user with one hand and an unreliable label with no cursor at all.
+  check("an unlabelled hand still competes for a fixed role",
+    selectRoleHand([{ handedness: "Unknown", key: "hand-3" }], { role: "left" })?.key === "hand-3");
+
+  // A grab owns the reticle regardless of the role, or the object would jump to
+  // the other hand halfway through a drag.
+  check("an in-progress grab outranks the role",
+    selectRoleHand([left, right], { role: "left", lockedKey: "hand-2" }).key === "hand-2");
+
+  check("a stale stored role falls back to automatic",
+    normaliseRole("banana") === DEFAULT_ROLE && normaliseRole(undefined) === DEFAULT_ROLE);
+
+  // --- configuration warnings ---------------------------------------------
+  const bad = assessHandSettings(
+    { detection: 0.9, tracking: 0.45, maxHands: 1 }, { twoHandGesture: true }
+  );
+  check("a self-defeating configuration is reported",
+    bad.some(w => w.id === "detection-exceeds-tracking"), bad.map(w => w.id).join(", "));
+  check("a one-hand cap is reported when two-hand gestures exist",
+    bad.some(w => w.id === "single-hand-two-hand-gesture"), bad.map(w => w.id).join(", "));
+  check("each warning offers a concrete fix",
+    bad.every(w => w.fix && w.fix.section), String(bad.length));
+  check("a sane configuration produces no warnings",
+    assessHandSettings({ detection: 0.55, tracking: 0.5, maxHands: 2 },
+      { twoHandGesture: true }).length === 0);
+
+  // --- through the solver, not just the helper ------------------------------
+  const make = (handedness, key, pinched, x) => ({
+    handedness, key, pinched, openPalm: pinched ? 0.2 : 0.9, pointing: 0.2, size: 0.1,
+    palm: { x, y: 0.5 }, pinch: { x, y: 0.5, z: 0 }, indexTip: { x, y: 0.5 },
+    landmarks: Array.from({ length: 21 }, (_, i) => ({ x: x + (i % 4) * 0.02, y: 0.5, z: 0 }))
+  });
+  const solverRole = new ManipulationSolver({
+    settings: { mode: "auto", limits: { x: 10, y: 10, z: 10 } }
+  });
+  solverRole.updateSettings({ handRole: "right" });
+  const chosen = solverRole.update(
+    [make("Left", "hand-1", true, 0.3), make("Right", "hand-2", false, 0.7)],
+    { position: { x: 0, y: 0, z: 0 }, rotationZ: 0, rotationX: 0, scale: 1 },
+    0
+  );
+  check("the solver obeys the configured role, not the pinching hand",
+    chosen.activeHand?.key === "hand-2", String(chosen.activeHand?.key));
+
+  solverRole.updateSettings({ handRole: "banana" });
+  check("an invalid role is normalised on the way in",
+    solverRole.settings.handRole === DEFAULT_ROLE, solverRole.settings.handRole);
+  solverRole.reset();
+  solverRole.setViewContext({ camera: null, ndc: null });
+
+  // --- persisted ------------------------------------------------------------
+  check("the hand role is a stored setting",
+    api.getSettings().gesture.handRole === DEFAULT_ROLE,
+    String(api.getSettings().gesture.handRole));
+  api._internals.store.update("gesture", { handRole: "left" });
+  check("changing the role persists",
+    api.getSettings().gesture.handRole === "left");
+  api._internals.store.update("gesture", { handRole: DEFAULT_ROLE });
+
   api._internals.resetTrackingState();
 }
 

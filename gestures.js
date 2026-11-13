@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { DragPlane } from "./dragPlane.js";
 import { palmSpan, palmSpan2D } from "./handCoordinates.js";
+import { roleAffinity, normaliseRole } from "./handOptions.js";
 
 /**
  * HOLOCORE — gestures.js
@@ -419,6 +420,8 @@ export function describeGesture(hand, handsCount) {
 /* ------------------------------------------------------------------------- */
 
 const DEFAULTS = {
+  // Which hand may drive the reticle (§10). "auto" is the historical behaviour.
+  handRole: "auto",
   moveSensitivity: 1.0,
   rotateSensitivity: 1.0,
   scaleSensitivity: 1.0,
@@ -525,7 +528,12 @@ export function orderPair(hands) {
     .map(entry => entry.hand);
 }
 
-export function resolveActiveHand(hands, { lockedKey = null, keyOf = null, pinchFrames = null } = {}) {
+export function resolveActiveHand(hands, {
+  lockedKey = null,
+  keyOf = null,
+  pinchFrames = null,
+  handRole = "auto"
+} = {}) {
   const list = Array.isArray(hands) ? hands.filter(Boolean) : [];
   if (!list.length) return { hand: null, index: -1, key: null };
 
@@ -533,15 +541,31 @@ export function resolveActiveHand(hands, { lockedKey = null, keyOf = null, pinch
     keyOf ? keyOf(hand, index) : (hand.key ?? hand.handedness ?? `hand-${index}`);
 
   // 1. A locked hand keeps driving. Losing it entirely is handled by the
-  //    caller, which resets the lock when the hand leaves.
+  //    caller, which resets the lock when the hand leaves. The lock outranks the
+  //    role: a grab that swapped hands mid-drag would move the object by the
+  //    other hand's displacement.
   if (lockedKey) {
     const index = list.findIndex((hand, i) => keyFor(hand, i) === lockedKey);
     if (index >= 0) return { hand: list[index], index, key: lockedKey };
   }
 
+  // 0. The configured hand role narrows the field. Hands it excludes are still
+  //    tracked and still available for a two-hand gesture; they just cannot hold
+  //    the reticle. An empty field means the user asked for a hand that is not in
+  //    frame, and the honest answer is "none" rather than quietly using the other.
+  const eligible = list
+    .map((hand, index) => ({ hand, index }))
+    .filter(({ hand }) => roleAffinity(hand, handRole) > 0);
+
+  if (!eligible.length) {
+    // Unknown handedness still scores above zero, so this only happens when the
+    // user selected left/right and that hand genuinely is not present.
+    return { hand: null, index: -1, key: null };
+  }
+
   // 2. A pinching hand, preferring the one that has been pinching longest.
   const pinching = [];
-  list.forEach((hand, index) => {
+  eligible.forEach(({ hand, index }) => {
     if (!hand.pinched) return;
     const frames = pinchFrames?.get?.(keyFor(hand, index)) ?? Infinity;
     pinching.push({ hand, index, key: keyFor(hand, index), frames });
@@ -551,9 +575,10 @@ export function resolveActiveHand(hands, { lockedKey = null, keyOf = null, pinch
     return pinching[0];
   }
 
-  // 3/4. Nothing is pinching: the first hand is the aiming hand. Hover only,
-  //      and hovering never transforms anything.
-  return { hand: list[0], index: 0, key: keyFor(list[0], 0) };
+  // 3/4. Nothing is pinching: the first eligible hand is the aiming hand. Hover
+  //      only, and hovering never transforms anything.
+  const first = eligible[0];
+  return { hand: first.hand, index: first.index, key: keyFor(first.hand, first.index) };
 }
 
 /**
@@ -603,6 +628,11 @@ export class ManipulationSolver {
 
   updateSettings(settings = {}) {
     Object.assign(this.settings, settings);
+    // A stale or misspelled role must not lock the user out of their own hands:
+    // normalise here, once, rather than trusting every caller.
+    if (settings.handRole !== undefined) {
+      this.settings.handRole = normaliseRole(settings.handRole);
+    }
     this._syncLimits();
   }
 
@@ -701,7 +731,8 @@ export class ManipulationSolver {
     const keyOf = (hand, index) => hand.key ?? hand.handedness ?? `hand-${index}`;
     const active = resolveActiveHand(hands, {
       lockedKey: this.activeKey,
-      keyOf
+      keyOf,
+      handRole: this.settings.handRole
     });
     this.activeHand = active.hand;
 
