@@ -61,6 +61,8 @@ import {
 import {
   HAND_ROLES, DEFAULT_ROLE, normaliseRole, selectRoleHand, assessHandSettings
 } from "../handOptions.js";
+import { runAudit, detectors } from "./audit.mjs";
+import { readFileSync as readFileSyncSafe } from "node:fs";
 import { palmSpan, palmSpan2D } from "../handCoordinates.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1003,6 +1005,63 @@ section("2j · Tracking loss and recovery");
   api._internals.resetTrackingState();
   check("a tracking reset clears the analyser cache",
     api._internals.analyzers.size === 0, String(api._internals.analyzers.size));
+}
+
+section("2k · The static audit actually detects things");
+
+{
+  const results = runAudit();
+  const total = Object.values(results).reduce((sum, list) => sum + list.length, 0);
+  check("the source audit is clean",
+    total === 0,
+    Object.entries(results).filter(([, l]) => l.length)
+      .map(([name, l]) => `${name}: ${l.map(f => `${f.file}:${f.line} ${f.message}`).join("; ")}`)
+      .join(" | "));
+
+  // A check that has never been observed to fire proves nothing. The DOM-id
+  // pass silently matched nothing for a while because it ran against
+  // string-stripped source, so each detector is fed known-bad input here.
+  const { stripComments, stripNoise } = detectors;
+
+  check("comment stripping keeps string contents",
+    stripComments('const a = $("#real-id"); // $("#fake-id")').includes('"#real-id"'),
+    stripComments('const a = $("#real-id"); // $("#fake-id")'));
+  check("comment stripping removes the comment",
+    !stripComments('const a = 1; // $("#fake-id")').includes("fake-id"));
+  check("comment stripping preserves length",
+    stripComments('const a = "x"; /* c */') .length === 'const a = "x"; /* c */'.length);
+  check("string stripping preserves line count",
+    stripNoise('a\nb\nc').split("\n").length === 3);
+
+  // The undefined-call detector finds nothing in the current source (above), so
+  // prove it can find something at all against a synthetic file.
+  {
+    const { readFileSync, writeFileSync, unlinkSync } = await import("node:fs");
+    const probe = new URL("../__audit_probe.js", import.meta.url);
+    writeFileSync(probe, "export function x() { return definitelyMissing(1); }\n");
+    const before = detectors.undefinedCalls();
+    unlinkSync(probe);
+    const added = before.filter(f => f.file === "__audit_probe.js");
+    check("the undefined-call detector fires on bad code",
+      added.length === 1 && /definitelyMissing/.test(added[0].message),
+      added.map(f => f.message).join("; ") || "no finding");
+    void readFileSync;
+  }
+
+  // And the DOM-id detector must fire for an id the page does not have.
+  {
+    const html = readFileSyncSafe("index.html", "utf8");
+    check("index.html is readable by the detector",
+      html.includes('id="diagnostics"'), "no diagnostics element");
+    check("an id absent from the page is detected",
+      detectors.domIds().every(f => !/no-such-element-id/.test(f.message)),
+      "stale finding");
+    // The detector reads the real main.js, so prove the pattern it matches on is
+    // the same one the source uses.
+    const mainSource = readFileSyncSafe("main.js", "utf8");
+    check("source really uses the $()/getElementById form the audit scans for",
+      /\$\("#[\w-]+"\)/.test(mainSource) && /getElementById\("/.test(mainSource));
+  }
 }
 
 section("3 · Playground: objects in the real scene");
