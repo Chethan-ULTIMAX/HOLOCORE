@@ -282,6 +282,57 @@ if (skeleton) {
     rig.joints[0].scale.x > 0, rig.joints[0].scale.x.toFixed(3));
 }
 
+section("2b · Analysis runs once per camera observation");
+
+{
+  const tracker = api.tracker;
+  const hand = syntheticHand(false);
+
+  // One observation, many display frames. The analyser must not see the same
+  // landmarks more than once, no matter how fast the monitor is.
+  tracker.publishHands({ hands: [hand], handedness: ["Right"] });
+  api._internals.processHands(performance.now() / 1000);
+  const afterFirst = api._internals.tipSampleCount();
+  const duplicateBefore = api._internals.duplicateFrameCount();
+
+  for (let i = 0; i < 5; i++) {
+    api._internals.processHands(performance.now() / 1000 + i * 0.001);
+  }
+  check("duplicate display frames do not re-filter the observation",
+    api._internals.tipSampleCount() === afterFirst,
+    `${afterFirst} -> ${api._internals.tipSampleCount()}`);
+  check("duplicate display frames are counted, not hidden",
+    api._internals.duplicateFrameCount() === duplicateBefore + 5,
+    String(api._internals.duplicateFrameCount() - duplicateBefore));
+
+  // A genuinely new observation must be analysed.
+  tracker.publishHands({ hands: [hand], handedness: ["Right"] });
+  api._internals.processHands(performance.now() / 1000);
+  check("a new observation is analysed",
+    api._internals.tipSampleCount() === afterFirst + 1,
+    String(api._internals.tipSampleCount()));
+
+  // Pinch activation must be driven by observations, not display frames: five
+  // duplicate frames may not satisfy a two-frame pinch gate on their own.
+  const open = syntheticHand(false);
+  tracker.publishHands({ hands: [open], handedness: ["Right"] });
+  api._internals.processHands(0);
+  const pinchedBefore = api._internals.pinchFrameValue();
+  for (let i = 0; i < 5; i++) api._internals.processHands(i * 0.016);
+  check("display frames cannot advance pinch hysteresis",
+    api._internals.pinchFrameValue() === pinchedBefore,
+    `${String(pinchedBefore)} -> ${String(api._internals.pinchFrameValue())}`);
+
+  // processHands gives the shared solver a camera and a pointer. Later sections
+  // deliberately exercise the no-camera fallback, so restore that precondition
+  // instead of leaving this section's context behind.
+  api.solver.setViewContext({ camera: null, ndc: null });
+  api.solver.reset();
+  api.tracker.publishHands({ hands: [] });
+  api._internals.processHands(0);
+  api.solver.setViewContext({ camera: null, ndc: null });
+}
+
 section("3 · Playground: objects in the real scene");
 
 const playground = api?.getPlayground?.();
@@ -585,7 +636,7 @@ check("processHands runs without throwing", loopError === null,
 // Feed the tracker itself, so skeletons and the pointer path see hands.
 let injectedError = null;
 try {
-  api.tracker.hands = [syntheticHand(true)];
+  api.tracker.publishHands({ hands: [syntheticHand(true)], handedness: ["Right"] });
   api.tracker.handedness = ["Right"];
   api.tracker.worldLandmarks = [syntheticHand(true)];
   api.setMode("move");
@@ -606,7 +657,7 @@ check("a skeleton rig received the landmarks", rigList.length >= 1 &&
 check("the tracking loop added no stray objects", pg.props.length === trackingBefore,
   `${trackingBefore} -> ${pg.props.length}`);
 
-api.tracker.hands = [];
+api.tracker.publishHands({ hands: [] });
 api.tracker.handedness = [];
 api.tracker.worldLandmarks = [];
 pg.clear();
@@ -986,17 +1037,21 @@ const startPos = { ...gs.getTransform(target.id).position };
 let gestureError = null;
 try {
   // Open hand to settle the pointer, then pinch to grab, then drag.
-  api.tracker.hands = [grabOpen];
-  api.tracker.handedness = ["Right"];
-  api.tracker.worldLandmarks = [grabOpen];
+  api.tracker.publishHands({
+    hands: [grabOpen], worldLandmarks: [grabOpen], handedness: ["Right"]
+  });
   for (let i = 0; i < 6; i++) api._internals.processHands(performance.now() + i * 16);
 
-  api.tracker.hands = [grabPinch];
+  api.tracker.publishHands({
+    hands: [grabPinch], worldLandmarks: [grabPinch], handedness: ["Right"]
+  });
   for (let i = 0; i < 8; i++) api._internals.processHands(performance.now() + 200 + i * 16);
 
   // Drag: shift the whole hand sideways and let the solver follow.
   const dragged = syntheticHand(true).map(p => ({ ...p, x: p.x + 0.18 }));
-  api.tracker.hands = [dragged];
+  api.tracker.publishHands({
+    hands: [dragged], worldLandmarks: [dragged], handedness: ["Right"]
+  });
   for (let i = 0; i < 10; i++) api._internals.processHands(performance.now() + 400 + i * 16);
 } catch (error) {
   gestureError = error;
@@ -1012,7 +1067,7 @@ check("a pinched drag actually moves the object", dragDistance > 0.05,
 check("the object stays on the stage", Math.abs(endPos.x) <= 4.21 && Math.abs(endPos.y) <= 3.21,
   `${endPos.x.toFixed(2)}, ${endPos.y.toFixed(2)}`);
 
-api.tracker.hands = [];
+api.tracker.publishHands({ hands: [] });
 api.tracker.handedness = [];
 api.tracker.worldLandmarks = [];
 api.setMode("select");

@@ -222,6 +222,10 @@ const state = {
   /** Hands-free depth: latest reading, and the Z the gesture started from. */
   depth: null,
   depthStart: null,
+  /** Observation sequence already analysed, so duplicate display frames are cheap. */
+  analyzedSeq: -1,
+  lastAnalysis: null,
+  duplicateFrames: 0,
   /** Full-workspace camera vs. small preview card. */
   cameraView: "workspace",
   /** True while the workspace video element is actually showing frames. */
@@ -1619,24 +1623,63 @@ function processHands(now) {
   const handedness = tracker.handedness || [];
   const activeStates = [];
 
-  overlayHands.length = 0;
-  overlayPinched.length = 0;
+  // ---- analysis runs once per camera observation, not once per display frame
+  //
+  // This used to run on every animation frame with whatever landmarks the
+  // tracker happened to hold, so a 120 Hz monitor re-fed the same 30 Hz
+  // observation to the filters four times. One Euro Filter received four
+  // identical samples at four different display timestamps, which inflated its
+  // frequency estimate and made smoothing behave differently on every machine.
+  // Pinch hysteresis, activation counters and velocity had the same problem.
+  //
+  // The tracker increments `observationSeq` once per processed camera frame; a
+  // duplicate sequence means "nothing new to analyse", so we reuse the previous
+  // state and only re-render it. Interpolation between the last two states is
+  // deliberately not done: it would make the skeleton lead the hand it is
+  // supposed to be attached to.
+  const observationSeq = tracker.observationSeq ?? 0;
+  const isNewObservation = observationSeq !== state.analyzedSeq;
 
-  hands.forEach((landmarks, index) => {
-    const side = handedness[index] || "Unknown";
-    let analyzer = analyzers.get(side);
-    if (!analyzer) {
-      analyzer = new HandAnalyzer(analyzerSettings());
-      analyzers.set(side, analyzer);
+  if (isNewObservation) {
+    state.analyzedSeq = observationSeq;
+    // Observation timestamps, in seconds, for observation-interval filtering.
+    // This is the camera frame's arrival time, not the display clock.
+    const observationSeconds = Number.isFinite(tracker.observationMs)
+      ? tracker.observationMs / 1000
+      : now;
+
+    overlayHands.length = 0;
+    overlayPinched.length = 0;
+    activeStates.length = 0;
+
+    hands.forEach((landmarks, index) => {
+      const side = handedness[index] || "Unknown";
+      let analyzer = analyzers.get(side);
+      if (!analyzer) {
+        analyzer = new HandAnalyzer(analyzerSettings());
+        analyzers.set(side, analyzer);
+      }
+      const handState = analyzer.update(landmarks, side, observationSeconds);
+      activeStates.push(handState);
+      overlayHands.push({ state: handState, side, landmarks });
+      overlayPinched.push(handState.pinched);
+    });
+
+    if (hands.length === 0) {
+      for (const analyzer of analyzers.values()) analyzer.reset();
     }
-    const handState = analyzer.update(landmarks, side, now);
-    activeStates.push(handState);
-    overlayHands.push({ state: handState, side, landmarks });
-    overlayPinched.push(handState.pinched);
-  });
 
-  if (hands.length === 0) {
-    for (const analyzer of analyzers.values()) analyzer.reset();
+    // Cache the analysis so duplicate display frames can reuse it verbatim.
+    state.lastAnalysis = { activeStates, hands, handedness };
+  } else {
+    // Same camera frame: reuse the analysed state rather than re-filtering it.
+    const cached = state.lastAnalysis;
+    if (!cached) {
+      // First frame before any observation has landed.
+      return;
+    }
+    for (const hand of cached.activeStates) activeStates.push(hand);
+    state.duplicateFrames = (state.duplicateFrames || 0) + 1;
   }
 
   // ---- draw both overlays ---------------------------------------------------
@@ -3724,6 +3767,23 @@ window.HOLOCORE = {
     },
     // Drives the real per-frame hand pipeline with supplied landmarks, so the
     // tracking loop can be exercised without a camera.
-    processHands
+    processHands,
+
+    // --- observation-pipeline introspection (tests and diagnostics) ---------
+    // These read live pipeline state; none of them change behaviour.
+    /** Total samples the tip filter has been fed, across all analysed hands. */
+    tipSampleCount: () => {
+      let total = 0;
+      for (const hand of state.lastAnalysis?.activeStates || []) {
+        total += hand?.tipSamples ?? 0;
+      }
+      return total || [...analyzers.values()].reduce((n, a) => n + (a.tipFilter.samples || 0), 0);
+    },
+    duplicateFrameCount: () => state.duplicateFrames || 0,
+    pinchFrameValue: () => {
+      const hands = state.lastAnalysis?.activeStates || [];
+      return hands.map(hand => hand?.pinched ?? null).join(",");
+    },
+    analyzedSeq: () => state.analyzedSeq
   }
 };

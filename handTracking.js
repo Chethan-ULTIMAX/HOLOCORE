@@ -80,6 +80,10 @@ export class HandTracker {
     this.handedness = [];
     this.lastVideoTime = -1;
     this.frameCount = 0;
+    /** Increments once per processed camera frame; never repeats. */
+    this.observationSeq = 0;
+    /** Arrival time of the newest observation, in milliseconds. */
+    this.observationMs = null;
     this.droppedFrames = 0;
     this.fps = 0;
     this.inferenceMs = 0;
@@ -323,13 +327,18 @@ export class HandTracker {
     this.fps = span > 0 ? Math.round(((this._fpsSamples.length - 1) / span) * 1000) : 0;
 
     const landmarks = result?.landmarks || [];
-    this.hands = landmarks;
     // Metric landmarks (metres, wrist-relative) give the 3D skeleton its real
     // shape and foreshortening. They are reported alongside the normalised
     // image landmarks and are what lets a rotating hand read as 3D rather than
     // as a flat billboard.
-    this.worldLandmarks = result?.worldLandmarks || [];
-    this.handedness = (result?.handednesses || []).map(entry => entry?.[0]?.categoryName || "Unknown");
+    this.publishHands({
+      hands: landmarks,
+      worldLandmarks: result?.worldLandmarks || [],
+      handedness: (result?.handednesses || []).map(
+        entry => entry?.[0]?.categoryName || "Unknown"
+      ),
+      observationMs: started
+    });
 
     if (landmarks.length > 0) {
       this._lostSince = null;
@@ -345,6 +354,40 @@ export class HandTracker {
     }
 
     this.onFrame(this.getState());
+  }
+
+  /**
+   * Publish a set of hands as a new observation.
+   *
+   * This is the single entry point for "new tracking data exists". It is called
+   * by `_processFrame()` once per camera frame, and can also be called by a
+   * replay source or a test that needs to simulate camera frames faithfully.
+   *
+   * Every published set gets a monotonically increasing sequence number, so the
+   * application can analyse each observation exactly once no matter how many
+   * display frames happen in between.
+   *
+   * @param {object} observation
+   * @param {Array} observation.hands normalised landmarks, per hand
+   * @param {Array} [observation.worldLandmarks] metric landmarks, per hand
+   * @param {string[]} [observation.handedness]
+   * @param {number} [observation.observationMs] arrival time, milliseconds
+   * @returns {number} the new sequence number
+   */
+  publishHands({
+    hands = [],
+    worldLandmarks = [],
+    handedness = [],
+    observationMs = null
+  } = {}) {
+    this.hands = hands;
+    this.worldLandmarks = worldLandmarks;
+    this.handedness = handedness;
+    // Arrival time, not the display clock: this is what observation-interval
+    // filtering and pose-age diagnostics must measure against.
+    this.observationMs = observationMs ?? performance.now();
+    this.observationSeq += 1;
+    return this.observationSeq;
   }
 
   /* --------------------------------------------------------------------- */

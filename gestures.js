@@ -284,10 +284,12 @@ export class OneEuroPoint {
   }
 
   reset() {
+    this.samples = 0;
     this.fx.reset(); this.fy.reset(); this.fz.reset();
   }
 
   filter(point, t) {
+    this.samples = (this.samples || 0) + 1;
     return {
       x: this.fx.filter(point.x, t),
       y: this.fy.filter(point.y, t),
