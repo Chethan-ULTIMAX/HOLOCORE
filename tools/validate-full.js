@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as THREE from "three";
 import { VoiceControl } from "../voiceControl.js";
-import { ManipulationSolver, OneEuroFilter } from "../gestures.js";
+import { ManipulationSolver, OneEuroFilter, orderPair } from "../gestures.js";
 import {
   ratioToTravel,
   HandDepthTracker,
@@ -2125,6 +2125,156 @@ section("5t · Depth is calibrated, not guessed");
     check("landmark z has no influence on depth",
       Math.abs(ra.travel - rb.travel) < 1e-9 && ra.reference === rb.reference,
       `${ra.travel} vs ${rb.travel}`);
+  }
+}
+
+section("5u · Two-hand movement is camera-relative");
+
+{
+  const cam = new THREE.PerspectiveCamera(42, 1.6, 0.1, 200);
+  const twoHand = (offsetX, pinched = true) => {
+    const make = (px) => ({
+      pinch: { x: px, y: 0.5, z: 0 },
+      indexTip: { x: px, y: 0.5 },
+      palm: { x: px, y: 0.5 },
+      pinched,
+      openPalm: pinched ? 0.2 : 0.9,
+      pointing: 0.2,
+      size: 0.1,
+      key: `h${px}`,
+      landmarks: Array.from({ length: 21 }, () => ({ x: px, y: 0.5, z: 0 }))
+    });
+    return [make(0.35 + offsetX), make(0.65 + offsetX)];
+  };
+  const at = (x = 0, y = 0, z = 0) => ({
+    position: { x, y, z }, rotationZ: 0, rotationX: 0, scale: 1
+  });
+  const aim = view => {
+    const p = viewPlacement(view, { target: new THREE.Vector3(), radius: 3, fov: 42 });
+    cam.position.copy(p.position);
+    cam.up.copy(p.up);
+    cam.lookAt(p.target);
+    cam.updateMatrixWorld();
+  };
+
+  /** Both hands move right together; return the world delta of the object. */
+  const twoHandDrag = (view) => {
+    aim(view);
+    const solver = new ManipulationSolver({
+      settings: { mode: "auto", limits: { x: 40, y: 40, z: 40 } }
+    });
+    const start = at();
+    solver.setViewContext({ camera: cam, ndc: { x: -0.3, y: 0 } });
+    solver.update(twoHand(0), start, 0);
+    solver.setViewContext({ camera: cam, ndc: { x: -0.1, y: 0 } });
+    const result = solver.update(twoHand(0.1), start, 0.1);
+    return {
+      intent: result.intent,
+      x: result.position.x - start.position.x,
+      y: result.position.y - start.position.y,
+      z: result.position.z - start.position.z
+    };
+  };
+
+  const front = twoHandDrag("front");
+  const top = twoHandDrag("top");
+  const left = twoHandDrag("left");
+  const right = twoHandDrag("right");
+
+  check("a two-hand grab still reports its intent", front.intent === "two-hand grab",
+    front.intent);
+
+  // The expectation from the brief: two hands must obey the same camera-relative
+  // rule as one hand. Before this fix the midpoint went straight into world X/Y
+  // and Z was frozen, which only looked right in Front view.
+  check("two-hand movement follows X in Front view",
+    front.x > 0.3 && Math.abs(front.z) < 1e-6,
+    `(${front.x.toFixed(2)}, ${front.z.toFixed(2)})`);
+  check("two-hand movement follows X in Top view",
+    top.x > 0.3 && Math.abs(top.z) < 1e-6,
+    `(${top.x.toFixed(2)}, ${top.z.toFixed(2)})`);
+  check("two-hand movement follows Z in Left view",
+    left.z > 0.3 && Math.abs(left.x) < 1e-6,
+    `(${left.x.toFixed(2)}, ${left.z.toFixed(2)})`);
+  check("two-hand movement follows -Z in Right view",
+    right.z < -0.3 && Math.abs(right.x) < 1e-6,
+    `(${right.x.toFixed(2)}, ${right.z.toFixed(2)})`);
+
+  // One-hand and two-hand must agree in the same view, or the object behaves
+  // differently depending on how many hands the user happens to raise.
+  check("one-hand and two-hand agree in Top view",
+    Math.abs(top.x - 1.49) < 0.3, top.x.toFixed(2));
+
+  // Ordering: the same physical scene presented in the opposite array order
+  // must produce the same rotation. MediaPipe does not guarantee its order, and
+  // when it swapped the angle-based rotation flipped by ~180 degrees mid-gesture.
+  {
+    const hand = (key, px, py) => ({
+      key,
+      palm: { x: px, y: py },
+      pinch: { x: px, y: py, z: 0 },
+      indexTip: { x: px, y: py },
+      pinched: true,
+      openPalm: 0.2,
+      pointing: 0.2,
+      size: 0.1,
+      handedness: key === "hand-1" ? "Left" : "Right",
+      landmarks: Array.from({ length: 21 }, () => ({ x: px, y: py, z: 0 }))
+    });
+
+    const run = (pair) => {
+      const solver = new ManipulationSolver({
+        settings: { mode: "auto", limits: { x: 10, y: 10, z: 10 } }
+      });
+      solver.update(pair[0], at(), 0);
+      const result = solver.update(pair[1], at(), 0.1);
+      return result.rotationZ;
+    };
+
+    const firstA = hand("hand-1", 0.25, 0.5);
+    const firstB = hand("hand-2", 0.75, 0.5);
+    const secondA = hand("hand-1", 0.25, 0.62);
+    const secondB = hand("hand-2", 0.75, 0.38);
+
+    check("orderPair returns a deterministic order",
+      orderPair([firstB, firstA])[0].key === orderPair([firstA, firstB])[0].key,
+      orderPair([firstB, firstA])[0].key);
+
+    // Rotate the pair by tilting both hands, once in each array order.
+    const solvedInOrder = (() => {
+      const solver = new ManipulationSolver({
+        settings: { mode: "auto", limits: { x: 10, y: 10, z: 10 } }
+      });
+      solver.update([firstA, firstB], at(), 0);
+      return solver.update([secondA, secondB], at(), 0.1).rotationZ;
+    })();
+    const solvedReordered = (() => {
+      const solver = new ManipulationSolver({
+        settings: { mode: "auto", limits: { x: 10, y: 10, z: 10 } }
+      });
+      solver.update([firstB, firstA], at(), 0);
+      return solver.update([secondB, secondA], at(), 0.1).rotationZ;
+    })();
+
+    check("two-hand rotation does not depend on array order",
+      Math.abs(solvedInOrder - solvedReordered) < 1e-9,
+      `${solvedInOrder.toFixed(4)} vs ${solvedReordered.toFixed(4)}`);
+    check("two-hand rotation is not a half turn",
+      Math.abs(solvedInOrder) < Math.PI / 2,
+      solvedInOrder.toFixed(3));
+    void run;
+  }
+
+  // Without a camera the documented fallback must still translate, so headless
+  // callers are not broken.
+  {
+    const solver = new ManipulationSolver({
+      settings: { mode: "auto", limits: { x: 40, y: 40, z: 40 } }
+    });
+    solver.update(twoHand(0), at(), 0);
+    const moved = solver.update(twoHand(0.1), at(), 0.1);
+    check("two-hand movement still works without a camera",
+      moved.position.x > 0.2, moved.position.x.toFixed(2));
   }
 }
 

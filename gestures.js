@@ -497,6 +497,34 @@ export const TRANSFORM_INTENTS = new Set([
   "two-hand grab", "frame", "scale + rotate + translate"
 ]);
 
+/**
+ * Put a two-hand pair in a stable order.
+ *
+ * Sorted by identity key, so the pair means the same thing in every frame
+ * regardless of the order MediaPipe returned them in. Falls back to handedness,
+ * then to position, so it still works for hands without keys.
+ *
+ * @param {Array<object>} hands
+ * @returns {Array<object>} exactly two entries (or fewer, if fewer were given)
+ */
+export function orderPair(hands) {
+  const list = Array.isArray(hands) ? hands.filter(Boolean) : [];
+  if (list.length < 2) return list;
+
+  const sortKey = (hand, index) => {
+    if (hand.key) return `0:${hand.key}`;
+    if (hand.handedness && hand.handedness !== "Unknown") return `1:${hand.handedness}`;
+    // Last resort: which side of the frame the palm is on.
+    return `2:${(hand.palm?.x ?? 0).toFixed(3)}-${index}`;
+  };
+
+  return list
+    .map((hand, index) => ({ hand, sortKey: sortKey(hand, index) }))
+    .sort((x, y) => (x.sortKey < y.sortKey ? -1 : x.sortKey > y.sortKey ? 1 : 0))
+    .slice(0, 2)
+    .map(entry => entry.hand);
+}
+
 export function resolveActiveHand(hands, { lockedKey = null, keyOf = null, pinchFrames = null } = {}) {
   const list = Array.isArray(hands) ? hands.filter(Boolean) : [];
   if (!list.length) return { hand: null, index: -1, key: null };
@@ -1062,7 +1090,15 @@ export class ManipulationSolver {
   }
 
   _updateTwoHand(hands, objectState) {
-    const [a, b] = hands;
+    // Order the pair deterministically before doing any geometry.
+    //
+    // `const [a, b] = hands` used the tracker's array order, which MediaPipe does
+    // not guarantee. When it swapped, `angle` flipped by ~180 degrees, and
+    // because the rotation is measured from a captured `angle`, that showed up as
+    // the object spinning half a turn in the middle of a two-hand gesture.
+    // Ordering by stable identity instead means the pair has a fixed meaning: `a`
+    // is always the same physical hand.
+    const [a, b] = orderPair(hands);
 
     // Normalise both hands into a common, mirrored image space.
     const mid = { x: (a.palm.x + b.palm.x) / 2, y: (a.palm.y + b.palm.y) / 2 };
@@ -1115,6 +1151,20 @@ export class ManipulationSolver {
       };
       this.velocity = { x: 0, y: 0, roll: 0, scale: 0 };
       this._setMode("frame");
+      // Capture the two-hand drag plane from the midpoint, with the same
+      // frozen camera basis the one-hand path uses. A two-hand move used to
+      // translate the midpoint straight into world X/Y and hold Z fixed, so it
+      // behaved differently from a one-hand drag in every view but Front.
+      this.dragPlane.release();
+      if (this.camera && this.pointerNdc) {
+        this.dragPlane.begin({
+          camera: this.camera,
+          ndc: this.pointerNdc,
+          grabPoint: new THREE.Vector3(
+            objectState.position.x, objectState.position.y, objectState.position.z
+          )
+        });
+      }
     }
 
     const ref = this.frame;
@@ -1132,13 +1182,31 @@ export class ManipulationSolver {
 
     const rotationZ = ref.objectStart.rotationZ + dAngle;
 
-    // Translation from the midpoint, scaled to the viewport.
-    const sensitivity = 6.2 * this.settings.moveSensitivity;
-    const position = {
-      x: clamp(ref.objectStart.position.x + (mid.x - ref.mid.x) * sensitivity, -this.limits.x, this.limits.x),
-      y: clamp(ref.objectStart.position.y - (mid.y - ref.mid.y) * sensitivity, -this.limits.y, this.limits.y),
-      z: ref.objectStart.position.z
-    };
+    // Translation from the midpoint, in the camera's screen plane when a camera
+    // is available, so a two-hand move obeys the same rule as a one-hand grab:
+    // right is right on screen in every view, not world +X.
+    const start = ref.objectStart.position;
+    let position;
+    if (this.dragPlane.active && this.pointerNdc) {
+      const delta = this.dragPlane.delta(
+        this.camera, this.pointerNdc, this._dragTmp || (this._dragTmp = new THREE.Vector3())
+      );
+      position = delta
+        ? {
+            x: clamp(start.x + delta.x, -this.limits.x, this.limits.x),
+            y: clamp(start.y + delta.y, -this.limits.y, this.limits.y),
+            z: clamp(start.z + delta.z, -this.limits.z, this.limits.z)
+          }
+        : { ...start };
+    } else {
+      // Documented fallback for callers with no camera: world X/Y, Z held.
+      const sensitivity = 6.2 * this.settings.moveSensitivity;
+      position = {
+        x: clamp(start.x + (mid.x - ref.mid.x) * sensitivity, -this.limits.x, this.limits.x),
+        y: clamp(start.y - (mid.y - ref.mid.y) * sensitivity, -this.limits.y, this.limits.y),
+        z: start.z
+      };
+    }
 
     this.velocity.x = position.x - objectState.position.x;
     this.velocity.y = position.y - objectState.position.y;
