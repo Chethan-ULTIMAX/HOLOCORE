@@ -494,6 +494,111 @@ section("2d · Hands keep stable identities across frames");
     `${palmSpan(flat).toFixed(5)} vs ${palmSpan(rotated).toFixed(5)}`);
 }
 
+section("2e · Hover raycasting is not repeated when nothing changed");
+
+{
+  const ws = api.getWorkspace();
+  let raycasts = 0;
+  const realRaycast = ws.raycast.bind(ws);
+  ws.raycast = ndc => { raycasts += 1; return realRaycast(ndc); };
+
+  // processHands consumes raw MediaPipe landmark ARRAYS, not analysed hand
+  // states: pinch, openPalm and friends are derived by the analyser from these
+  // 21 points. They have to be anatomically plausible because pinch strength is
+  // normalised by palm scale.
+  const landmarks = (x) => {
+    const points = Array.from({ length: 21 }, () => ({ x, y: 0.5, z: 0 }));
+    points[0] = { x: x + 0.50, y: 0.72, z: 0 };            // wrist
+    const columns = [0.42, 0.45, 0.50, 0.55, 0.60];         // thumb..pinky
+    [1, 5, 9, 13, 17].forEach((joint, i) => {
+      points[joint] = { x: x + columns[i], y: 0.55, z: 0 };
+      points[joint + 1] = { x: x + columns[i], y: 0.48, z: 0 };
+      points[joint + 2] = { x: x + columns[i], y: 0.42, z: 0 };
+      if (i > 0) points[joint + 3] = { x: x + columns[i], y: 0.37, z: 0 };
+    });
+    points[4] = { x: x + 0.42, y: 0.51, z: 0 };            // thumb tip
+    return points;
+  };
+
+  // Feed one observation through the real pipeline. Timestamps must be on the
+  // SAME clock the rest of the suite uses -- a filter that has already seen a
+  // later timestamp treats every subsequent sample as going backwards.
+  let clock = performance.now();
+  const frame = (x) => {
+    clock += 33;
+    api.tracker.publishHands({
+      hands: [landmarks(x)], handedness: ["Right"], observationMs: clock
+    });
+    api._internals.processHands(clock / 1000);
+  };
+
+  // A pointer that does not move must not re-raycast. Duplicate display frames
+  // are not re-analysed at all, so the count has to stay flat.
+  frame(0.5);
+  const first = raycasts;
+  for (let i = 0; i < 6; i++) api._internals.processHands(clock / 1000 + i * 0.001);
+  check("a stationary pointer does not re-raycast", raycasts === first,
+    `${first} -> ${raycasts}`);
+
+  // A deliberate reach must re-raycast.
+  raycasts = 0;
+  frame(0.35);
+  check("moving the pointer raycasts again", raycasts >= 1, String(raycasts));
+
+  // Sub-threshold jitter must not re-raycast: that is the point of the dead band.
+  //
+  // The pointer has to be allowed to settle first. One Euro filtering means the
+  // tip keeps travelling for a few frames after the hand has stopped, so measuring
+  // jitter straight after a reach measures the filter catching up, not jitter.
+  for (let i = 0; i < 30; i++) frame(0.35);
+
+  // Image-x maps into NDC with roughly 12x gain (cover-fit and stage aspect), so
+  // "sub-threshold" has to be measured in NDC, not guessed in image space. 2e-5
+  // of image movement is about 0.0002 in NDC -- an order of magnitude inside the
+  // 0.004 dead band, and well below real hand tremor.
+  const settled = api._internals.hoverNdc();
+  raycasts = 0;
+  for (let i = 1; i <= 6; i++) frame(0.35 + i * 0.00002);
+  const drift = Math.abs((api._internals.hoverNdc()?.x ?? 0) - settled.x);
+  check("test jitter really is below the dead band", drift < 0.004, drift.toFixed(5));
+  check("sub-threshold jitter does not re-raycast", raycasts === 0, String(raycasts));
+  // A scene change invalidates the cached hit even if the pointer is still.
+  {
+    const before = raycasts;
+    void before;
+    const prop = api.getPlayground().addPrimitive("cube");
+    frame(0.35 + 7 * 0.0004);
+    check("adding an object invalidates the cached hover target",
+      raycasts >= 1, String(raycasts));
+    api.getPlayground().remove(prop.id);
+  }
+
+  // Malformed observations are rejected at the boundary rather than crashing
+  // inside the pinch maths.
+  {
+    const before = api.tracker.observationSeq;
+    api.tracker.publishHands({
+      hands: [null, [{ x: 1, y: 1 }]], handedness: ["Right", "Left"],
+      observationMs: clock
+    });
+    check("a malformed observation is rejected, not forwarded",
+      api.tracker.hands.length === 0 && api.tracker.rejectedHands === 2,
+      `${api.tracker.hands.length} kept, ${api.tracker.rejectedHands} rejected`);
+    check("rejecting a payload still advances the observation counter",
+      api.tracker.observationSeq === before + 1);
+  }
+
+  ws.raycast = realRaycast;
+  api.tracker.publishHands({ hands: [], handedness: [], observationMs: clock });
+  api._internals.processHands(clock / 1000);
+
+  // A tracking reset is the honest way to end this section: identity, analysers,
+  // depth history and the solver are all process-wide, and production resets on
+  // camera stop/start for the same reason.
+  api.solver.setViewContext({ camera: null, ndc: null });
+  api._internals.resetTrackingState();
+}
+
 section("3 · Playground: objects in the real scene");
 
 const playground = api?.getPlayground?.();

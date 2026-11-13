@@ -380,9 +380,22 @@ export class HandTracker {
     handedness = [],
     observationMs = null
   } = {}) {
-    this.hands = hands;
-    this.worldLandmarks = worldLandmarks;
-    this.handedness = handedness;
+    // Defensive: `hands = []` only covers an omitted argument. A caller that
+    // passes null, or a landmark list that is not an array of 21 points, must not
+    // reach the analysers -- a malformed frame used to surface as
+    // "Cannot read properties of undefined" from deep inside the pinch maths,
+    // which is a hard crash with no indication of where the bad data came from.
+    const validHands = Array.isArray(hands)
+      ? hands.filter(landmarks => Array.isArray(landmarks) && landmarks.length >= 21)
+      : [];
+    const validWorld = Array.isArray(worldLandmarks) ? worldLandmarks : [];
+
+    this.hands = validHands;
+    this.worldLandmarks = validWorld;
+    this.handedness = validHands.map((_, index) =>
+      Array.isArray(handedness) ? (handedness[index] || "Unknown") : "Unknown"
+    );
+    this.rejectedHands = (Array.isArray(hands) ? hands.length : 0) - validHands.length;
     // Arrival time, not the display clock: this is what observation-interval
     // filtering and pose-age diagnostics must measure against.
     this.observationMs = observationMs ?? performance.now();

@@ -72,6 +72,7 @@ export class Playground {
     if (!this.group.parent) scene.add(this.group);
 
     this.props = [];
+    this.revision = 0;
     this.byId = new Map();
     this.selectedId = null;
     this.onSelect = onSelect || (() => {});
@@ -90,6 +91,17 @@ export class Playground {
   /* --------------------------------------------------------------------- */
 
   /** Spawn a primitive. Returns the prop. */
+  /**
+   * Increments whenever the set of props changes identity (add, remove, clear).
+   *
+   * Cheap consumers -- hover picking, for one -- use it to know that a cached hit
+   * from a previous frame may refer to an object that no longer exists or has
+   * moved, without having to compare the whole prop list.
+   */
+  _bumpRevision() {
+    this.revision = (this.revision || 0) + 1;
+  }
+
   addPrimitive(kind = "cube", { position = null } = {}) {
     const definition = PRIMITIVES.find(p => p.id === kind) || PRIMITIVES[0];
     const style = PALETTE[this._counter % PALETTE.length];
@@ -125,6 +137,7 @@ export class Playground {
 
     this._counter++;
     this._register(prop);
+    this._bumpRevision();
     return prop;
   }
 
@@ -297,6 +310,7 @@ export class Playground {
 
     this.props = this.props.filter(p => p.id !== prop.id);
     this.byId.delete(prop.id);
+    this._bumpRevision();
     if (this.selectedId === prop.id) {
       const next = this.props[this.props.length - 1] || null;
       this.selectedId = next?.id || null;

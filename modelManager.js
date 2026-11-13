@@ -1363,6 +1363,20 @@ export class Workspace {
       this._applyTransform();
     }
 
+    // Camera drift during a hand drag is genuinely disorienting: the object is
+    // held in a plane frozen against the camera basis, so if the camera rotates
+    // the object stops following the hand even though neither moved relative to
+    // the other. Auto-rotation therefore pauses while a hand is manipulating and
+    // resumes afterwards, without losing the user's setting.
+    const wantedAutoRotate = this.settings.autoRotate;
+    if (this._handActive && this.controls.autoRotate) {
+      this.controls.autoRotate = false;
+      this._autoRotateSuppressed = true;
+    } else if (!this._handActive && this._autoRotateSuppressed) {
+      this.controls.autoRotate = Boolean(wantedAutoRotate);
+      this._autoRotateSuppressed = false;
+    }
+
     this.controls.update();
 
     // ---- render, with the hands drawn late -------------------------------
@@ -1453,6 +1467,17 @@ export class Workspace {
    * main.js hands over the hand-skeleton root here once the rigs exist, so the
    * render loop knows what to hold back for the second pass.
    */
+  /**
+   * Tell the workspace whether a hand is currently manipulating something.
+   *
+   * Used to pause camera auto-rotation for the duration of the gesture. Mouse
+   * and keyboard camera controls stay available throughout: they are deliberate
+   * acts, and the drag plane is captured once so an orbit cannot move the object.
+   */
+  setHandActive(active) {
+    this._handActive = Boolean(active);
+  }
+
   setLateLayer(object3d) {
     // Detach the previous layer before swapping, so a replaced skeleton is not
     // left parented to the late scene where nothing will ever update it.

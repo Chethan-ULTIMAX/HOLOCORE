@@ -204,6 +204,14 @@ let settings = store.get();
  * How far a grabbed playground object may be dragged. Shared with the gesture
  * solver so the clamp is applied once, at the same limit, in both places.
  */
+/**
+ * How far the pointer must move, in NDC, before the hover raycast is repeated.
+ *
+ * NDC spans the viewport, so 0.004 is roughly 2.5 px on a 1280 px stage: below
+ * that the hit cannot change, and re-raycasting is wasted work.
+ */
+const HOVER_NDC_EPSILON = 0.004;
+
 const STAGE_BOUNDS = Object.freeze({ x: 4.2, y: 3.2, z: 3.6 });
 
 const state = {
@@ -1128,9 +1136,16 @@ async function toggleCamera() {
   if (tracker.status === TRACKER_STATUS.ACTIVE || tracker.status === TRACKER_STATUS.HANDS ||
       tracker.status === TRACKER_STATUS.LOST) {
     tracker.stop();
+    // Forget the hands that were being tracked. Otherwise the analysers, rigs and
+    // filter history from the old session survive into the new one, and a filter
+    // that last saw a hand minutes ago treats the first new sample as a huge
+    // jump -- the skeleton snaps across the stage before settling.
+    resetTrackingState();
     updateTrackingUI(tracker.getState());
     return;
   }
+  // Same reason on the way in: a restart is a new session, not a continuation.
+  resetTrackingState();
   const trackerState = await tracker.start({ deviceId: settings.camera.deviceId || undefined });
   if (trackerState.status === TRACKER_STATUS.ERROR) {
     showCameraError(trackerState.error);
@@ -1623,6 +1638,32 @@ const MANIPULATING_INTENTS = new Set([
   "scale + rotate + translate"
 ]);
 
+/**
+ * Forget every per-hand piece of state.
+ *
+ * Tracker identity, analyser filter history, depth calibration and skeleton rigs
+ * are all keyed to a physical hand and are meant to survive brief losses (see
+ * §14). They therefore also survive a tracking mode change, a camera switch or a
+ * source reset, where starting from a clean slate is what the user expects.
+ *
+ * Callers: switching camera source, ending a session, and any test that wants a
+ * deterministic starting point.
+ */
+function resetTrackingState({ keepSettings = true } = {}) {
+  handIdentity.reset();
+  analyzers.clear();
+  depthRegistry.reset();
+  state.analyzedSeq = null;
+  state.lastAnalysis = null;
+  state.duplicateFrames = 0;
+  skeleton3d?.reset?.();
+  solver?.reset?.();
+  if (!keepSettings) return;
+
+  overlayHands.length = 0;
+  overlayPinched.length = 0;
+}
+
 function processHands(now) {
   // Nothing is being manipulated when there is no pipeline at all. Returning
   // early used to leave the playground's "a hand is acting" flag stuck on from
@@ -1831,6 +1872,10 @@ function processHands(now) {
   solver.setViewContext({ camera: workspace?.camera || null, ndc: solverPointer });
 
   const result = solver.update(activeStates, objectState, now);
+
+  // Pause camera auto-rotation for the duration of a transform. A drifting camera
+  // makes an object held in a frozen drag plane stop tracking the hand.
+  workspace?.setHandActive?.(MANIPULATING_INTENTS.has(result.intent));
   state.gestureMode = result.mode;
   state.intent = result.intent;
 
@@ -2336,17 +2381,43 @@ function updatePointer(pointer, states, result) {
 
   const ndc = landmarkNdc(tip);
 
-  // Playground objects take priority over engineering components: if the user
-  // spawned or imported something, they expect to be able to grab it.
-  const propHit = playground
-    ? playground.pick({ x: ndc.x, y: ndc.y }, workspace.camera)
-    : null;
+  // Hover raycasting is the most expensive thing in this function, and it used to
+  // run twice per display frame -- once against the playground and once against
+  // the assembly -- even when nothing had moved and even during a drag when the
+  // result is discarded anyway.
+  //
+  // Two cheap guards:
+  //   - during a transform the hover target cannot change, so skip entirely;
+  //   - when the pointer has barely moved, the previous hit is still valid.
+  const dragging = result?.intent === "translate" || result?.intent === "rotate" ||
+    result?.intent === "scale" || result?.intent === "two-hand grab";
 
-  const hit = propHit || workspace.raycast({ x: ndc.x, y: ndc.y });
+  // The dead band may only reuse a hit if it was computed against the same scene.
+  // A prop added, removed or cleared invalidates every cached hit, because the
+  // thing that was under the pointer may no longer exist.
+  const sceneRevision = playground?.revision ?? 0;
+  const last = state.hoverNdc;
+  const moved = !last
+    || state.hoverRevision !== sceneRevision
+    || Math.hypot(ndc.x - last.x, ndc.y - last.y) > HOVER_NDC_EPSILON;
+  const mayRaycast = !dragging && moved;
 
-  // Hover highlight follows the pointer, but never while dragging.
-  const dragging = result?.intent === "translate" || result?.intent === "rotate";
-  if (!dragging) {
+  // Keep the previous hover target while dragging or while the pointer is inside
+  // the dead band. The rest of this function (the reticle, its label, the mode
+  // target) still has to run every display frame: those are what the user sees.
+  if (mayRaycast) {
+    state.hoverNdc = { x: ndc.x, y: ndc.y };
+    state.hoverRevision = sceneRevision;
+
+    // Playground objects take priority over engineering components: if the user
+    // spawned or imported something, they expect to be able to grab it.
+    const propHit = playground
+      ? playground.pick({ x: ndc.x, y: ndc.y }, workspace.camera)
+      : null;
+
+    const hit = propHit || workspace.raycast({ x: ndc.x, y: ndc.y });
+
+    // Hover highlight follows the pointer.
     if (hit !== state.pointerTarget) {
       state.pointerTarget = hit;
       state.pointerKind = propHit ? "prop" : hit ? "part" : null;
@@ -2354,7 +2425,12 @@ function updatePointer(pointer, states, result) {
       if (hit) hoverFromHand(pointer.hand, hit);
       playground?.highlight(propHit);
     }
+  } else {
+    state.hoverSkipped = (state.hoverSkipped || 0) + 1;
   }
+
+  const propHit = state.pointerKind === "prop" ? state.pointerTarget : null;
+  const hit = state.pointerTarget;
 
   // Always resolve the *hovered* part's own name — inspector.lastComponent
   // belongs to the current selection and would mislabel a different part.
@@ -3858,6 +3934,10 @@ window.HOLOCORE = {
       const hands = state.lastAnalysis?.activeStates || [];
       return hands.map(hand => hand?.pinched ?? null).join(",");
     },
-    analyzedSeq: () => state.analyzedSeq
+    analyzedSeq: () => state.analyzedSeq,
+    // Identity and analyser state are process-wide, exactly like the tracker and
+    // the solver. A test that wants a clean slate should reset all of them.
+    resetTrackingState,
+    hoverNdc: () => ({ ...state.hoverNdc })
   }
 };
