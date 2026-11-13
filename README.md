@@ -36,10 +36,13 @@ Open <http://localhost:8000>. Allow the camera when prompted if you want gesture
 | Command | What it does |
 | --- | --- |
 | `npm start` | Static server on port 8000, bound to `0.0.0.0` |
-| `npm run validate` | 407 headless checks: data, geometry, gestures, modes, solver, explode, assistant, wiring, on-screen placement |
-| `npm run validate:ui` | 100 jsdom checks of the DOM, interface, cascade and camera layer |
+| `npm run validate` | 497 headless checks: data, geometry, gestures, modes, solver, explode, assistant, wiring, on-screen placement |
+| `npm run validate:anatomy` | 80 numerical checks of the hand model and coordinate contract |
+| `npm run validate:ui` | 107 jsdom checks of the DOM, interface, cascade and camera layer |
 | `npm run validate:boot` | 48 jsdom checks of the full application boot path |
-| `npm run validate:all` | All three harnesses |
+| `npm run validate:full` | 447 full-stack checks against the real application in jsdom |
+| `npm run audit` | Static audit: undefined calls, missing DOM ids, unknown settings keys |
+| `npm run validate:all` | All of the above, audit included |
 | `npm run preview` | Renders the eight assemblies to `tools/preview/*.png` |
 | `npm run preview:parts` | Same, but each part in its own colour (`*-parts.png`) |
 
@@ -224,7 +227,7 @@ Everything in `tools/` runs headlessly in Node — there is **no browser and no 
 which is both the point and the limitation.
 
 ```bash
-npm run validate:all      # 407 + 100 + 48 checks
+npm run validate:all      # 497 + 80 + 107 + 48 + 447 checks, plus the audit
 npm run validate          # data, geometry, gestures, modes, explode, assistant, wiring, workspace
 ```
 
@@ -288,11 +291,33 @@ cannot prove the shaded pixels, which needs a GPU. Cover-fit maths is separately
 portrait and landscape sources: a 4:3 camera in a 16:9 box crops 250 px off the top, and a
 portrait camera crops the sides, and the overlay follows the crop in both directions.
 
+### Diagnostics
+
+The bottom-right of the viewport has a collapsible **DIAGNOSTICS** panel with two columns:
+**RENDER** and **TRACKING**. Every value in both is read from live state at sample time — there
+are no success constants and no cached state.
+
+The RENDER column answers "is geometry on screen?". The TRACKING column answers "is the hand
+data arriving, and is it current?" — the second question matters because a frozen skeleton and a
+stationary hand are indistinguishable without it.
+
+| Field | Source |
+| --- | --- |
+| TRACKER | tracker status, from the same state the status chip uses |
+| CAMERA FPS | frames actually processed, not the display rate |
+| INFERENCE | MediaPipe inference time for the last frame |
+| DELEGATE | GPU or CPU, as reported by the runtime |
+| HANDS / IDENTITY | tracked hands with their stable keys, and whether identity is intact |
+| DUPLICATE FRAMES | display frames that reused an analysis instead of repeating it |
+| REJECTED | observations dropped at the boundary as malformed |
+| OBS LAG | how far behind real time the analysed frame is; red past 250 ms |
+
+The open panel is capped and laid out in two columns so it stays clear of the standard-view cube
+above it; `tools/validate-ui.js` computes that from the real stylesheet rather than trusting it.
+
 ### Render diagnostics
 
-The bottom-right of the viewport has a collapsible **RENDER DIAGNOSTICS** panel. Every value in
-it is read from the live scene graph at sample time — there are no success constants and no
-cached state:
+The RENDER column covers rendering proper:
 
 | Field | Source |
 | --- | --- |

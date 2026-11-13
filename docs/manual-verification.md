@@ -26,7 +26,7 @@ Run with `npm start` and open `http://localhost:8080` in Chrome or Edge, on
 | Orbit back near Front by hand | The `FRONT` face lights up again |
 | Spawn a cube, drag it well off-centre, then click **FRONT** | The selected cube is centred, not the launch vehicle behind it |
 | Select nothing, click **FRONT** | The whole model is framed |
-| Press `Shift+1`, `Shift+2`, `Shift+3` | Front, Top, Isometric |
+| Press `Shift+1` … `Shift+7` | Front, Top, Isometric, Right, Left, Back, Bottom — one per view, and each face's tooltip names its own shortcut |
 | Narrow the window under 820 px with the Properties drawer open | The cube fades out rather than sitting under the panel |
 
 ## 2. Camera-relative dragging (§4) — 5 minutes, mouse
@@ -117,8 +117,66 @@ width and back.
 - **No orthographic camera.** The brief made it optional; the hand projection
   pipeline assumes perspective and adapting it was out of scope for a pass that
   must not rebuild the architecture.
-- **Smoothing adds ~100 ms of latency by design.** It is time-based, so a lower
-  frame rate does not make it lag further, but it is still latency.
+- **Smoothing adds latency by design.** Measured on the filter alone: ~198 ms to
+  settle in Responsive, ~400 ms in Balanced, ~467 ms in Precision. It is
+  time-based, so a lower frame rate does not make it lag further, but it is still
+  latency. The second pass reports the full numbers in
+  [`upgrade-pass-2.md`](upgrade-pass-2.md).
 - **Depth by hand moves playground props only.** A selected model component can
   be moved with the gizmo but not with the palm-size gesture, and the gesture
   refuses to arm rather than pretending to work.
+
+---
+
+## Added by the second pass
+
+These are the items the second upgrade pass introduced that need a human. Each
+one exists because a headless test can prove the data flow and not the
+experience.
+
+### 8. Pinch calibration (§9) — 2 minutes
+
+| Step | Expected |
+|---|---|
+| Open Settings → Pinch calibration → **Calibrate pinch** with the camera running | A first step appears: "1 of 2 · Open hand", with a countdown and a progress bar |
+| Hold an open relaxed hand for the countdown | Progress fills; the sample count climbs; it moves to step 2 on its own |
+| Hold a deliberate pinch | Second pose fills, then the panel reads "Calibrated" with the fitted pair |
+| Read the fitted numbers | Close to the shipped 0.62 / 0.44 for an ordinary hand; a different value is fine and is the point |
+| Point a finger instead of pinching during step 2 | The panel refuses with "the poses looked too similar" and the thresholds do not change |
+| Press **Cancel** mid-capture | Capture stops, thresholds unchanged |
+| Press **Re-arm now** | Filters reset, object recentres, and the calibrated thresholds are **kept** |
+| Press **Clear** | Thresholds return to the shipped defaults |
+
+### 9. Driving hand (§10) — 1 minute
+
+| Step | Expected |
+|---|---|
+| Settings → Hand tracking → Driving hand → **Left hand drives** | Hint text explains it; the reticle follows the left hand only |
+| Raise only the right hand | No reticle, and no jumping to the wrong hand |
+| Raise both and make a two-hand gesture | It still works: the right hand is excluded from the reticle, not from the gesture |
+| Set detection confidence to 0.9 | An amber warning appears with a **Fix** button |
+| Press **Fix** | The setting changes and the warning disappears |
+
+### 10. Diagnostics (§8) — 30 seconds
+
+| Step | Expected |
+|---|---|
+| Open the diagnostics panel | Two columns: RENDER and TRACKING. No row is clipped, nothing scrolls |
+| Check it does not overlap the view cube | The panel's top edge stays below the cube in the bottom right |
+| Cover the camera for a second, then uncover | TRACKER goes red, OBS LAG climbs, then both recover |
+
+### 11. Tracking loss (§14) — 30 seconds
+
+| Step | Expected |
+|---|---|
+| Mid-drag, move your hand out of frame | The object stops where it was, not where it would have gone |
+| Read the toast | "Tracking lost — move your hands into view", once, not repeatedly |
+| Bring the hand back | "Tracking recovered"; a fresh grab starts from the hand's new position, with no jump |
+
+### 12. Two-hand behaviour (§5.2, §4.3) — 1 minute
+
+| Step | Expected |
+|---|---|
+| Switch to Top view, two-hand drag to the right | The object moves right on screen, not towards the camera |
+| Switch to Left view, two-hand drag to the right | The object moves away from the camera, along the axis the screen shows |
+| Two-hand rotate with the hands flickering in and out of detection | The rotation stays continuous; it does not flip half a turn |
