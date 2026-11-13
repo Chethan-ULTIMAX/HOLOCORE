@@ -59,6 +59,9 @@ import {
 } from "../trackingProfiles.js";
 import { HandSkeleton3D } from "../handSkeleton3d.js";
 import { HandIdentityTracker } from "../handIdentity.js";
+import {
+  CalibrationSession, fitThresholds, DEFAULT_THRESHOLDS
+} from "../calibration.js";
 import { palmSpan, palmSpan2D } from "../handCoordinates.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -654,6 +657,137 @@ section("2f · Diagnostics report the live tracking pipeline");
   check("no hands means no identity claim",
     read("diag-track-identity") === "—", read("diag-track-identity"));
 
+  api.solver.setViewContext({ camera: null, ndc: null });
+  api._internals.resetTrackingState();
+}
+
+section("2g · Pinch calibration fits thresholds to the user's own hands");
+
+{
+  // --- pure fitting ---------------------------------------------------------
+  const steady = (value, count = 80) =>
+    Array.from({ length: count }, (_, i) => value + Math.sin(i * 0.7) * 0.01);
+
+  const fitted = fitThresholds({ open: steady(0.88), pinch: steady(0.24) });
+  check("calibration fits from two steady poses", fitted.ok === true,
+    fitted.ok ? "" : fitted.message);
+  check("the threshold sits between the poses",
+    fitted.threshold < 0.88 && fitted.threshold > 0.24, fitted.threshold.toFixed(3));
+  check("release is below the threshold, so the gate has hysteresis",
+    fitted.release < fitted.threshold - 0.03,
+    `${fitted.release.toFixed(3)} vs ${fitted.threshold.toFixed(3)}`);
+  // The fitted value is derived from the measurement, not clamped towards the
+  // built-in default. With this hand it lands close to the default; with the
+  // shifted hand below it does not, and that is the property that matters.
+  check("the fitted threshold is derived from the measurement",
+    Math.abs(fitted.threshold - (0.88 - (0.88 - 0.24) * 0.42)) < 0.02,
+    `${fitted.threshold.toFixed(3)} derived, ${DEFAULT_THRESHOLDS.threshold} default`);
+
+  // A user whose hands read lower across the board must get lower thresholds:
+  // this is the whole point, and a hardcoded pair would fail here.
+  const shifted = fitThresholds({ open: steady(0.62), pinch: steady(0.18) });
+  check("a user with a weaker signal gets weaker thresholds",
+    shifted.ok && shifted.threshold < fitted.threshold,
+    `${shifted.threshold} vs ${fitted.threshold}`);
+
+  // --- refusals, each with a distinguishable reason -------------------------
+  const few = fitThresholds({ open: [0.9, 0.9], pinch: [0.2, 0.2] });
+  check("too few samples is refused", few.ok === false && few.reason === "too-few-samples",
+    few.reason);
+
+  const noisy = fitThresholds({
+    open: Array.from({ length: 60 }, (_, i) => (i % 2 ? 0.95 : 0.15)),
+    pinch: steady(0.2)
+  });
+  check("a shaky hand is refused rather than averaged",
+    noisy.ok === false && noisy.reason === "too-noisy", noisy.reason);
+
+  const overlapping = fitThresholds({ open: steady(0.55), pinch: steady(0.50) });
+  check("overlapping poses are refused",
+    overlapping.ok === false && overlapping.reason === "poses-overlap", overlapping.reason);
+  check("a refusal explains itself in plain language",
+    typeof overlapping.message === "string" && overlapping.message.length > 20,
+    overlapping.message);
+
+  // --- the session state machine -------------------------------------------
+  let clock = 0;
+  const session = new CalibrationSession({ clock: () => clock });
+  session.start();
+  for (let i = 0; i < 90; i++) { clock += 33; session.sample(0.86); }
+  check("the session moves to the second pose on its own",
+    session.poseIndex === 1 && session.pose.id === "pinch", session.pose?.id);
+
+  for (let i = 0; i < 90; i++) { clock += 33; session.sample(0.22); }
+  const done = session.snapshot();
+  check("the session finishes after both poses", done.finished === true);
+  check("the session produces usable thresholds", done.result?.ok === true,
+    done.result?.ok ? "" : done.result?.message);
+
+  // Cancelling must not leave a half-finished capture that later commits.
+  const cancelled = new CalibrationSession({ clock: () => clock });
+  cancelled.start();
+  cancelled.sample(0.9);
+  cancelled.cancel();
+  check("cancelling abandons the capture",
+    cancelled.active === false && cancelled.result === null);
+
+  // --- through the real app ------------------------------------------------
+  const before = {
+    threshold: api.getSettings().gesture.pinchThreshold,
+    release: api.getSettings().gesture.pinchRelease
+  };
+  const applied = api.applyCalibrationResult({
+    ok: true,
+    threshold: 0.71,
+    release: 0.52,
+    open: { count: 80, mean: 0.88, deviation: 0.01 },
+    pinch: { count: 80, mean: 0.24, deviation: 0.01 },
+    separation: 0.64
+  });
+  check("applying a result persists the thresholds",
+    Math.abs(api.getSettings().gesture.pinchThreshold - 0.71) < 1e-6 &&
+    Math.abs(api.getSettings().gesture.pinchRelease - 0.52) < 1e-6,
+    `${api.getSettings().gesture.pinchThreshold}/${api.getSettings().gesture.pinchRelease}`);
+  check("the calibration record is stored for later",
+    api.getSettings().gesture.pinchCalibration?.openMean === 0.88,
+    JSON.stringify(api.getSettings().gesture.pinchCalibration?.openMean));
+  check("applyCalibrationResult returns what it committed",
+    applied?.threshold === 0.71);
+
+  // A refusal must leave the committed thresholds alone.
+  const refused = api.applyCalibrationResult({ ok: false, reason: "too-noisy", message: "noisy" });
+  check("a refused calibration changes nothing",
+    refused === null &&
+    Math.abs(api.getSettings().gesture.pinchThreshold - 0.71) < 1e-6,
+    String(api.getSettings().gesture.pinchThreshold));
+
+  // Re-arming resets gesture state but must NOT undo the calibration.
+  //
+  // This is also a regression test with history: the old calibrate() assigned to
+  // `hoverLock`, a binding that has never existed in this file. Every press of
+  // the calibrate button threw a ReferenceError before doing anything, so the
+  // button was dead in the shipped app and no test noticed.
+  let rearmError = null;
+  try { api.rearmGestures(); } catch (error) { rearmError = error; }
+  check("re-arming does not throw", rearmError === null,
+    rearmError ? `${rearmError.name}: ${rearmError.message}` : "");
+  check("re-arming keeps the calibrated thresholds",
+    Math.abs(api.getSettings().gesture.pinchThreshold - 0.71) < 1e-6,
+    String(api.getSettings().gesture.pinchThreshold));
+
+  // Clearing returns to defaults.
+  api.clearCalibration();
+  check("clearing restores the built-in thresholds",
+    Math.abs(api.getSettings().gesture.pinchThreshold - DEFAULT_THRESHOLDS.threshold) < 1e-6 &&
+    api.getSettings().gesture.pinchCalibration === null,
+    String(api.getSettings().gesture.pinchThreshold));
+
+  // Leave the store exactly as it was found.
+  api._internals.store.update("gesture", {
+    pinchThreshold: before.threshold,
+    pinchRelease: before.release,
+    pinchCalibration: null
+  });
   api.solver.setViewContext({ camera: null, ndc: null });
   api._internals.resetTrackingState();
 }

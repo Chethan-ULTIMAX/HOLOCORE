@@ -26,6 +26,9 @@ import { chimes } from "./chimes.js";
 import { VIEW_LABELS } from "./cameraViews.js";
 import { HandDepthRegistry } from "./handDepth.js";
 import { HandIdentityTracker } from "./handIdentity.js";
+import {
+  CalibrationSession, DEFAULT_THRESHOLDS, POSES, POSE_DURATION_MS
+} from "./calibration.js";
 import { OneEuroFilter } from "./gestures.js";
 import { VoiceControl, VOICE_STATUS, COLOR_PALETTE, parseCommand } from "./voiceControl.js";
 import { MODES, getMode, isMode, instructionFor } from "./interactionModes.js";
@@ -267,6 +270,15 @@ const animator = new Animator();
 const analyzers = new Map(); // keyed by stable hand identity
 /** Assigns stable keys to hands so nothing downstream depends on array order. */
 const handIdentity = new HandIdentityTracker();
+
+/**
+ * The two-pose pinch calibration capture.
+ *
+ * The session is pure state; it is fed raw pinch strength from the tracking loop
+ * and renders itself into the settings panel. Keeping it out of the DOM means the
+ * flow is tested exactly as it runs.
+ */
+const calibration = new CalibrationSession();
 let overlayWorkspace = null;
 const overlayHands = [];
 const overlayPinched = [];
@@ -1721,6 +1733,7 @@ function processHands(now) {
     // a handedness label that can collide or read "Unknown".
     const identity = handIdentity.assign(hands, handedness);
 
+    let rawPinchSample = -1;
     hands.forEach((landmarks, index) => {
       const side = handedness[index] || "Unknown";
       const key = identity.keys[index];
@@ -1732,12 +1745,27 @@ function processHands(now) {
         analyzers.set(key, analyzer);
       }
       const handState = analyzer.update(landmarks, side, observationSeconds);
+
+      // Calibration watches RAW pinch strength, not the gated state, because the
+      // gate is what it is trying to fit. Take the strongest hand in frame so the
+      // user does not have to keep their other hand out of shot.
+      if (calibration.active) {
+        rawPinchSample = Math.max(rawPinchSample, handState.pinchStrength ?? 0);
+      }
       // Attach the identity so every consumer agrees about which hand this is.
       handState.key = key;
       activeStates.push(handState);
       overlayHands.push({ state: handState, side, landmarks, key });
       overlayPinched.push(handState.pinched);
     });
+
+    // Feed the calibration capture once per observation, with the strongest hand.
+    // Sampling per HAND would weight the average towards whoever raised two.
+    if (calibration.active) {
+      const snapshot = calibration.sample(rawPinchSample >= 0 ? rawPinchSample : null);
+      if (snapshot.finished) applyCalibrationResult(snapshot.result);
+      else renderCalibration(snapshot);
+    }
 
     // Drop analysers and depth state for hands that are genuinely gone.
     const liveKeys = identity.keys;
@@ -3412,7 +3440,10 @@ function setupSettingsUI() {
   }
 
   document.getElementById("refresh-devices")?.addEventListener("click", refreshCameraList);
-  document.getElementById("calibrate-btn")?.addEventListener("click", calibrate);
+  document.getElementById("calibrate-btn")?.addEventListener("click", startCalibration);
+  document.getElementById("calibrate-cancel-btn")?.addEventListener("click", cancelCalibration);
+  document.getElementById("calibrate-clear-btn")?.addEventListener("click", clearCalibration);
+  document.getElementById("rearm-btn")?.addEventListener("click", rearmGestures);
   document.getElementById("reset-settings-btn")?.addEventListener("click", () => {
     store.reset();
     toast("Settings reset to defaults", "accent", 2600);
@@ -3608,12 +3639,31 @@ function applyQuality(quality) {
 /* CALIBRATION                                                              */
 /* ------------------------------------------------------------------------- */
 
-function calibrate() {
+/**
+ * Re-arm the gesture engine: forget held state, reset filters, recentre.
+ *
+ * Does NOT touch pinch thresholds. Those describe the user's hands and are set
+ * by calibration; throwing them away on every re-arm would undo the calibration
+ * whenever someone nudged the webcam.
+ */
+function rearmGestures() {
   for (const analyzer of analyzers.values()) analyzer.reset();
   solver.reset();
   overlayHands.length = 0;
   overlayPinched.length = 0;
-  hoverLock = null;
+
+  // Drop the cached hover hit as well as the highlight it produced. The cache is
+  // what "holds" the hover steady between raycasts, so clearing it is what
+  // re-arms hovering after a reset.
+  //
+  // (There used to be a `hoverLock = null;` here. No such binding has ever
+  // existed, so this function threw a ReferenceError on every press and the
+  // calibrate button did nothing at all. It was reachable, not theoretical: the
+  // tests below call it.)
+  state.hoverNdc = null;
+  state.hoverRevision = null;
+  state.pointerTarget = null;
+  state.pointerKind = null;
 
   if (workspace) {
     workspace.setHover(null);
@@ -3621,15 +3671,182 @@ function calibrate() {
   }
   if (tracker) tracker.resetTracking();
 
+  setCalibrationLog(
+    `Re-armed ${new Date().toLocaleTimeString()} · filters reset · grab released · ` +
+    `object re-centred · thresholds ${settings.gesture.pinchThreshold.toFixed(2)}/` +
+    `${settings.gesture.pinchRelease.toFixed(2)}`
+  );
+}
+
+function setCalibrationLog(text, tone = "ok") {
   const log = document.getElementById("calibration-log");
-  if (log) {
-    const now = new Date();
-    log.textContent =
-      `Calibrated ${now.toLocaleTimeString()} · filters reset · grab released · ` +
-      `object re-centred · thresholds ${settings.gesture.pinchThreshold.toFixed(2)}/` +
-      `${settings.gesture.pinchRelease.toFixed(2)}`;
+  if (!log) return;
+  log.textContent = text;
+  log.dataset.tone = tone;
+}
+
+/* ------------------------------------------------------------------------- */
+/* PINCH CALIBRATION (§9)                                                    */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Start the two-pose capture.
+ *
+ * Refuses without a running camera: the whole point is to measure the user's own
+ * hands, and a capture that can never receive a sample would just sit there
+ * looking broken.
+ */
+function startCalibration() {
+  if (!tracker || tracker.status === TRACKER_STATUS.INACTIVE ||
+      tracker.status === TRACKER_STATUS.ERROR) {
+    setCalibrationLog("Start the camera first — calibration measures your hands.", "bad");
+    toast("Calibration needs the camera running", "", 2600);
+    return null;
   }
-  toast("Gesture engine calibrated — filters reset, object re-centred", "accent", 3200);
+
+  calibration.start();
+  const snapshot = calibration.snapshot();
+  renderCalibration(snapshot);
+  setCalibrationLog("Calibration started — hold each pose for the countdown.", "info");
+  return snapshot;
+}
+
+function cancelCalibration() {
+  calibration.cancel();
+  renderCalibration(calibration.snapshot());
+  setCalibrationLog("Calibration cancelled — thresholds unchanged.", "info");
+  return null;
+}
+
+/**
+ * Draw the current calibration step into the settings panel.
+ *
+ * @param {object} snapshot from CalibrationSession
+ */
+function renderCalibration(snapshot) {
+  const step = document.getElementById("calibrate-step");
+  if (!step) return;
+
+  const started = snapshot.active || snapshot.finished;
+  step.dataset.active = started ? "true" : "false";
+  delete step.dataset.tone;
+
+  const cancelButton = document.getElementById("calibrate-cancel-btn");
+  if (cancelButton) cancelButton.hidden = !snapshot.active;
+
+  const label = document.getElementById("calibrate-pose-label");
+  const countNode = document.getElementById("calibrate-count");
+  const bar = document.getElementById("calibrate-progress");
+  const hint = document.getElementById("calibrate-hint");
+
+  if (snapshot.active) {
+    const pose = snapshot.pose || POSES[0];
+    const remaining = Math.max(0, Math.ceil((1 - snapshot.progress) * (POSE_DURATION_MS / 1000)));
+    if (label) label.textContent = `${snapshot.poseIndex + 1} of ${snapshot.poseCount} · ${pose.label}`;
+    if (countNode) countNode.textContent = `${snapshot.samples} samples · ${remaining}s`;
+    if (bar) bar.style.width = `${Math.round(snapshot.progress * 100)}%`;
+    if (hint) hint.textContent = `${pose.instruction}. ${pose.detail}`;
+    return;
+  }
+
+  if (snapshot.finished && snapshot.result) {
+    const result = snapshot.result;
+    if (result.ok) {
+      step.dataset.tone = "ok";
+      if (label) label.textContent = "Calibrated";
+      if (countNode) countNode.textContent =
+        `${result.threshold.toFixed(2)} / ${result.release.toFixed(2)}`;
+      if (bar) bar.style.width = "100%";
+      if (hint) hint.textContent =
+        `Your open hand reads ${result.open.mean.toFixed(2)}, a pinch ` +
+        `${result.pinch.mean.toFixed(2)}. Thresholds fitted between them.`;
+    } else {
+      step.dataset.tone = "bad";
+      if (label) label.textContent = "Not calibrated";
+      if (countNode) countNode.textContent = "";
+      if (bar) bar.style.width = "0%";
+      if (hint) hint.textContent = result.message;
+    }
+    return;
+  }
+
+  if (label) label.textContent = "—";
+  if (countNode) countNode.textContent = "";
+  if (bar) bar.style.width = "0%";
+  if (hint) hint.textContent = "";
+}
+
+/**
+ * Commit a fitted result, or explain why nothing was committed.
+ *
+ * Refusals are not failures to hide: the log says what was wrong so the user can
+ * fix the pose instead of pressing the button again and hoping.
+ */
+function applyCalibrationResult(result) {
+  renderCalibration(calibration.snapshot());
+
+  if (!result?.ok) {
+    setCalibrationLog(result?.message || "Calibration could not read your hands.", "bad");
+    toast("Calibration did not take — thresholds unchanged", "", 3200);
+    return null;
+  }
+
+  const thresholds = { threshold: result.threshold, release: result.release };
+  store.update("gesture", {
+    pinchThreshold: thresholds.threshold,
+    pinchRelease: thresholds.release,
+    pinchCalibration: {
+      threshold: thresholds.threshold,
+      release: thresholds.release,
+      openMean: Number(result.open.mean.toFixed(3)),
+      pinchMean: Number(result.pinch.mean.toFixed(3)),
+      separation: Number(result.separation.toFixed(3)),
+      samples: { open: result.open.count, pinch: result.pinch.count },
+      calibratedAt: new Date().toISOString()
+    }
+  });
+
+  for (const analyzer of analyzers.values()) {
+    analyzer.updateSettings({
+      pinchThreshold: thresholds.threshold,
+      pinchRelease: thresholds.release
+    });
+  }
+
+  setCalibrationLog(
+    `Calibrated ${new Date().toLocaleTimeString()} · pinch ${thresholds.threshold.toFixed(2)} / ` +
+    `release ${thresholds.release.toFixed(2)} · from ${result.open.count + result.pinch.count} samples`
+  );
+  toast(`Pinch calibrated — ${thresholds.threshold.toFixed(2)} / ${thresholds.release.toFixed(2)}`,
+    "accent", 3200);
+  return thresholds;
+}
+
+/**
+ * Return to the built-in thresholds and forget the stored calibration.
+ *
+ * Needed because calibration can make things worse for some hands, and without
+ * a way back the only escape would be resetting every other setting too.
+ */
+function clearCalibration() {
+  calibration.cancel();
+  store.update("gesture", {
+    pinchThreshold: DEFAULT_THRESHOLDS.threshold,
+    pinchRelease: DEFAULT_THRESHOLDS.release,
+    pinchCalibration: null
+  });
+  for (const analyzer of analyzers.values()) {
+    analyzer.updateSettings({
+      pinchThreshold: DEFAULT_THRESHOLDS.threshold,
+      pinchRelease: DEFAULT_THRESHOLDS.release
+    });
+  }
+  renderCalibration(calibration.snapshot());
+  setCalibrationLog(
+    `Cleared · back to defaults ${DEFAULT_THRESHOLDS.threshold.toFixed(2)} / ` +
+    `${DEFAULT_THRESHOLDS.release.toFixed(2)}`
+  );
+  toast("Pinch calibration cleared", "", 2400);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3976,7 +4193,13 @@ window.HOLOCORE = {
   resetEnvironment,
   refreshSceneOutliner,
   switchModel,
-  calibrate,
+  startCalibration,
+  cancelCalibration,
+  clearCalibration,
+  rearmGestures,
+  applyCalibrationResult,
+  renderCalibration,
+  calibration,
   toast,
   setMode,
   setExplodeAmount,

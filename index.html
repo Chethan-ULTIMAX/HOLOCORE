@@ -645,16 +645,39 @@
       </section>
 
       <section class="settings-group">
-        <h3>Calibration & reset</h3>
+        <h3>Pinch calibration</h3>
         <p class="settings-note">
-          Calibration re-arms the gesture engine: it forgets any held grab, resets the
-          smoothing filters and returns the object to a neutral pose. Use it whenever
-          the object feels offset from your hands — for a new user, a moved webcam, or
-          after tracking loss.
+          Pinch thresholds are a guess until they have met your hands. Calibration
+          watches you hold an open hand, then a pinch, and fits the thresholds between
+          the two — useful if pinches feel too hard to trigger, or trigger on their own.
+          Camera mode required.
         </p>
-        <button class="btn btn-sm" id="calibrate-btn">Calibrate now</button>
-        <button class="btn btn-sm btn-ghost" id="reset-settings-btn">Reset all settings</button>
+        <div class="calibrate-row">
+          <button class="btn btn-sm" id="calibrate-btn">Calibrate pinch</button>
+          <button class="btn btn-sm btn-ghost" id="calibrate-cancel-btn" hidden>Cancel</button>
+          <button class="btn btn-sm btn-ghost" id="calibrate-clear-btn">Clear</button>
+        </div>
+        <div class="calibrate-step" id="calibrate-step" data-active="false" aria-live="polite">
+          <div class="calibrate-pose">
+            <span id="calibrate-pose-label">—</span>
+            <span class="calibrate-count" id="calibrate-count"></span>
+          </div>
+          <div class="calibrate-bar"><i id="calibrate-progress"></i></div>
+          <div class="calibrate-hint" id="calibrate-hint"></div>
+        </div>
         <div class="calibration-log" id="calibration-log"></div>
+      </section>
+
+      <section class="settings-group">
+        <h3>Re-arm gesture engine</h3>
+        <p class="settings-note">
+          Re-arming forgets any held grab, resets the smoothing filters and returns the
+          object to a neutral pose. Use it whenever the object feels offset from your
+          hands — for a new user, a moved webcam, or after tracking loss. It does not
+          change your pinch thresholds.
+        </p>
+        <button class="btn btn-sm" id="rearm-btn">Re-arm now</button>
+        <button class="btn btn-sm btn-ghost" id="reset-settings-btn">Reset all settings</button>
       </section>
 
       <section class="settings-group">

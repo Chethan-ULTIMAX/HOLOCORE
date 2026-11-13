@@ -837,6 +837,8 @@ const requiredIds = [
   "camera-toggle", "camera-video", "camera-overlay", "camera-activate", "camera-stop",
   "camera-retry", "inspector-root", "chat-form", "chat-input", "model-list", "part-list",
   "set-pinch", "set-tracking-profile", "set-move", "set-camera-device", "calibrate-btn",
+  "calibrate-cancel-btn", "calibrate-clear-btn", "calibrate-step", "calibrate-progress",
+  "rearm-btn",
   "reset-settings-btn", "tool-explode", "tool-isolate", "tool-focus", "tool-reset",
   "fullscreen-toggle", "status-camera", "status-hands", "status-gesture"
 ];

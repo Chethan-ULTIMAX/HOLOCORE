@@ -48,7 +48,16 @@ export const DEFAULT_SETTINGS = {
      * which mapped its value onto the filter backwards. A saved numeric value
      * from an older version is migrated to the nearest profile on load.
      */
-    trackingProfile: "balanced"
+    trackingProfile: "balanced",
+    /**
+     * Per-user pinch calibration from §9, or null when never calibrated.
+     *
+     * The defaults above are a reasonable starting point for most hands, but
+     * hand size, camera distance and lighting all shift the raw pinch signal.
+     * Calibration measures the user's own open and closed values and fits the
+     * thresholds between them.
+     */
+    pinchCalibration: null
   },
   object: {
     moveSensitivity: 1,
