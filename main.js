@@ -1485,6 +1485,7 @@ function startLoop() {
       document.body.classList.toggle("is-interacting", interacting);
       if (dom.stageKeys) dom.stageKeys.style.opacity = interacting ? "0" : "";
     }
+    // Milliseconds from the render loop, converted to seconds exactly here.
     processHands(now / 1000);
     updateHud(dt);
 
@@ -1674,9 +1675,11 @@ function processHands(now) {
         activity,
         fit,
         dt: state.frameDelta ?? 1 / 60,
-        // Monotonic seconds for the per-joint filters, so smoothing is
-        // time-based rather than assuming a fixed frame rate.
-        now: now / 1000
+        // `now` is ALREADY seconds: processHands() takes a seconds timestamp and
+        // startLoop() converts milliseconds exactly once. Dividing by 1000 again
+        // made the joint filters estimate 1000 Hz instead of 30 Hz, which clamped
+        // dt at its 1 ms floor and settled the skeleton 7.8x too slowly.
+        now
       }
     );
   }
@@ -1742,7 +1745,7 @@ function processHands(now) {
 
   // ---- hands-free depth --------------------------------------------------
   // Runs after the gizmo so the Z handle exists before travel is applied.
-  updateHandDepth(now / 1000);
+  updateHandDepth(now);
 
   // A pinch that lands on a gizmo handle drags that handle, and only that
   // handle: doing this before the solver is what stops a handle grab from also

@@ -312,7 +312,12 @@ export class HandAnalyzer {
       smoothing: 0.5,
       ...settings
     };
-    this.point = new OneEuroPoint(this._filterOptions());
+    // Two different physical points must never share filter history. Using one
+    // OneEuroPoint for both meant a stationary fingertip was dragged towards the
+    // pinch midpoint (and vice versa) on every frame -- measured at 3.3% of the
+    // gap per exchange, which reads as a hand that will not hold still.
+    this.tipFilter = new OneEuroPoint(this._filterOptions());
+    this.pinchFilter = new OneEuroPoint(this._filterOptions());
     this.pinchGate = new HysteresisGate({
       on: this.settings.pinchThreshold,
       off: this.settings.pinchRelease,
@@ -338,7 +343,8 @@ export class HandAnalyzer {
       this.pinchGate.setThresholds(this.settings.pinchThreshold, this.settings.pinchRelease);
     }
     if (settings.smoothing !== undefined) {
-      this.point.configure(this._filterOptions());
+      this.tipFilter.configure(this._filterOptions());
+      this.pinchFilter.configure(this._filterOptions());
     }
   }
 
@@ -350,8 +356,9 @@ export class HandAnalyzer {
   update(landmarks, handedness, t) {
     const rawPinch = pinchStrength(landmarks);
     const pinched = this.pinchGate.update(rawPinch);
-    const tip = this.point.filter(indexTip(landmarks), t);
-    const pinch = this.point.filter(pinchPoint(landmarks), t);
+    // Each point keeps its own history and its own timestamp stream.
+    const tip = this.tipFilter.filter(indexTip(landmarks), t);
+    const pinch = this.pinchFilter.filter(pinchPoint(landmarks), t);
     const palm = palmCenter(landmarks);
     const ext = fingerExtensions(landmarks);
 
@@ -378,7 +385,8 @@ export class HandAnalyzer {
   }
 
   reset() {
-    this.point.reset();
+    this.tipFilter.reset();
+    this.pinchFilter.reset();
     this.pinchGate.reset(false);
     this.state = null;
   }
@@ -471,6 +479,18 @@ const DEFAULTS = {
  *        survive before it can steal the role
  * @returns {{hand: object, index: number, key: string|null}}
  */
+/**
+ * Intents that represent an object actually being transformed.
+ *
+ * A hovering hand produces `point`; a settled hand produces `hold` or `none`.
+ * None of those may claim the controller lock, because a hand that is merely
+ * visible is not in charge of anything.
+ */
+export const TRANSFORM_INTENTS = new Set([
+  "translate", "rotate", "scale", "explode",
+  "two-hand grab", "frame", "scale + rotate + translate"
+]);
+
 export function resolveActiveHand(hands, { lockedKey = null, keyOf = null, pinchFrames = null } = {}) {
   const list = Array.isArray(hands) ? hands.filter(Boolean) : [];
   if (!list.length) return { hand: null, index: -1, key: null };
@@ -539,6 +559,8 @@ export class ManipulationSolver {
     // gesture cannot migrate to the other hand mid-drag.
     this.activeKey = null;
     this.activeHand = null;
+    /** True only while a transform is in progress; gates the controller lock. */
+    this.grabbing = false;
     // Camera-relative translation. The plane is captured once per grab and held
     // for its duration, so a camera nudge mid-drag cannot move the object.
     this.dragPlane = new DragPlane();
@@ -642,12 +664,22 @@ export class ManipulationSolver {
 
     // One resolved active hand per frame, shared by every mode and reported to
     // the caller so the reticle and the solver can never disagree.
+    const keyOf = (hand, index) => hand.key ?? hand.handedness ?? `hand-${index}`;
     const active = resolveActiveHand(hands, {
       lockedKey: this.activeKey,
-      keyOf: (hand, index) => hand.key ?? hand.handedness ?? `hand-${index}`
+      keyOf
     });
-    this.activeKey = active.key;
     this.activeHand = active.hand;
+
+    // The lock has a lifecycle: a real grab takes it, the grab holds it, and
+    // releasing gives it back. Assigning it unconditionally on every update --
+    // which is what this used to do -- meant a hand that was merely hovering
+    // claimed the lock permanently, and the other hand could never take over
+    // even after the first hand stopped doing anything at all.
+    //
+    // `this.grabbing` is true only while a transform is in progress; it is set
+    // by the update paths below and cleared by _release().
+    if (!this.grabbing) this.activeKey = null;
 
     const mode = this.modeId;
     let outcome;
@@ -663,6 +695,13 @@ export class ManipulationSolver {
     } else {
       outcome = this._updateModal(mode, hands, state, active);
     }
+
+    // A transform in progress owns the lock, so a second pinching hand cannot
+    // steal the object mid-drag. Any other outcome leaves it free.
+    const transforming = TRANSFORM_INTENTS.has(outcome.intent);
+    this.grabbing = transforming;
+    if (transforming && active.key) this.activeKey = active.key;
+    if (!transforming) this.activeKey = null;
 
     // Publish the hand that drove this frame. The pointer prefers it, so the
     // reticle is drawn on the hand that is actually moving the object.
