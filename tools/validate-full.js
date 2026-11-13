@@ -58,6 +58,8 @@ import {
   normaliseProfile
 } from "../trackingProfiles.js";
 import { HandSkeleton3D } from "../handSkeleton3d.js";
+import { HandIdentityTracker } from "../handIdentity.js";
+import { palmSpan, palmSpan2D } from "../handCoordinates.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -418,6 +420,78 @@ section("2c · Tracking profiles are measured, not asserted");
   sk.updateSettings({ profile: "responsive" });
   check("profile changes can go back", sk.smoothers.profile === "responsive");
   sk.dispose();
+}
+
+section("2d · Hands keep stable identities across frames");
+
+{
+  const tracker = new HandIdentityTracker();
+  const mk = (cx, cy = 0.5) => Array.from({ length: 21 }, (_, i) => ({
+    x: cx + (i % 3) * 0.01, y: cy + (i % 2) * 0.01, z: 0
+  }));
+
+  const left = mk(0.25);
+  const right = mk(0.75);
+
+  let result = tracker.assign([left, right], ["Left", "Right"]);
+  const leftKey = result.keys[0];
+  const rightKey = result.keys[1];
+  check("two hands get distinct identities", leftKey !== rightKey,
+    `${leftKey}, ${rightKey}`);
+
+  // The whole point: reordering MediaPipe's array must not swap identities.
+  result = tracker.assign([right, left], ["Right", "Left"]);
+  check("reordering the array preserves identity",
+    result.keys[0] === rightKey && result.keys[1] === leftKey,
+    `${result.keys.join(",")}`);
+
+  // Handedness is a hint, not the identity: losing the labels must not
+  // reassign anything.
+  result = tracker.assign([left, right], ["Unknown", "Unknown"]);
+  check("losing handedness labels preserves identity",
+    result.keys[0] === leftKey && result.keys[1] === rightKey,
+    result.keys.join(","));
+
+  // Both hands reporting the SAME label -- the case that made analysers share
+  // one filter history.
+  result = tracker.assign([left, right], ["Left", "Left"]);
+  check("duplicate handedness labels do not merge identities",
+    result.keys[0] === leftKey && result.keys[1] === rightKey,
+    result.keys.join(","));
+
+  // A hand that briefly disappears keeps its identity on return.
+  tracker.assign([left], ["Left"]);
+  tracker.assign([left], ["Left"]);
+  result = tracker.assign([left, right], ["Left", "Right"]);
+  check("a hand keeps its identity after briefly leaving",
+    result.keys[0] === leftKey && result.keys[1] === rightKey,
+    result.keys.join(","));
+
+  // A genuinely new hand at a new position gets a new identity, not a recycled
+  // one -- otherwise it would inherit a dead hand's filter history.
+  const newcomer = tracker.assign([left, mk(0.05, 0.9)], ["Left", "Right"]);
+  check("a newcomer gets a fresh identity", newcomer.keys[1] !== rightKey,
+    `${rightKey} -> ${newcomer.keys[1]}`);
+
+  tracker.reset();
+  check("reset clears every identity", tracker.size === 0);
+}
+
+{
+  // Depth must not react to palm rotation. The 2D span is deliberately blind to
+  // z, while the 3D span is not; using the wrong one is what made a rotating
+  // palm read as a hand moving towards the camera.
+  const flat = Array.from({ length: 21 }, (_, i) => ({
+    x: 0.5 + Math.cos(i) * 0.05, y: 0.5 + Math.sin(i) * 0.05, z: 0
+  }));
+  const rotated = flat.map((p, i) => ({ ...p, z: Math.sin(i * 0.7) * 0.06 }));
+
+  check("2D palm span ignores rotation",
+    Math.abs(palmSpan2D(flat) - palmSpan2D(rotated)) < 1e-12,
+    `${palmSpan2D(flat).toFixed(5)} vs ${palmSpan2D(rotated).toFixed(5)}`);
+  check("3D palm span does react to rotation",
+    Math.abs(palmSpan(flat) - palmSpan(rotated)) > 1e-3,
+    `${palmSpan(flat).toFixed(5)} vs ${palmSpan(rotated).toFixed(5)}`);
 }
 
 section("3 · Playground: objects in the real scene");

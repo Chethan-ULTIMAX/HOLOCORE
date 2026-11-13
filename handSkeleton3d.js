@@ -714,7 +714,7 @@ export class HandSkeleton3D {
    * @param {object} options { pinched: boolean[], activity: number[] }
    */
   update(landmarks, worldLandmarks, handedness, {
-    pinched = [], activity = [], fit = null, dt = 1 / 60, now = null
+    pinched = [], activity = [], fit = null, dt = 1 / 60, now = null, keys = null
   } = {}) {
     if (!this.visible) {
       // Nothing to draw: drop filter history so a resumed stream does not ease
@@ -738,7 +738,10 @@ export class HandSkeleton3D {
       const effectiveSide = this.mirror
         ? (String(side).toLowerCase() === "left" ? "right" : String(side).toLowerCase() === "right" ? "left" : side)
         : side;
-      const key = `${effectiveSide}-${handIndex}`;
+      // Prefer the stable identity from the application. Falling back to
+      // side+index keeps this class usable on its own, but it is exactly the
+      // key that loses history when the tracker reorders its results.
+      const key = keys?.[handIndex] || `${effectiveSide}-${handIndex}`;
       seen.add(key);
 
       const rig = this._rigFor(key, effectiveSide);

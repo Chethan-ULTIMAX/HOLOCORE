@@ -25,6 +25,7 @@ import { Playground, PRIMITIVES } from "./playground.js";
 import { chimes } from "./chimes.js";
 import { VIEW_LABELS } from "./cameraViews.js";
 import { HandDepthRegistry } from "./handDepth.js";
+import { HandIdentityTracker } from "./handIdentity.js";
 import { OneEuroFilter } from "./gestures.js";
 import { VoiceControl, VOICE_STATUS, COLOR_PALETTE, parseCommand } from "./voiceControl.js";
 import { MODES, getMode, isMode, instructionFor } from "./interactionModes.js";
@@ -246,7 +247,9 @@ const state = {
 };
 
 const animator = new Animator();
-const analyzers = new Map(); // keyed by handedness slot
+const analyzers = new Map(); // keyed by stable hand identity
+/** Assigns stable keys to hands so nothing downstream depends on array order. */
+const handIdentity = new HandIdentityTracker();
 let overlayWorkspace = null;
 const overlayHands = [];
 const overlayPinched = [];
@@ -1662,18 +1665,36 @@ function processHands(now) {
     overlayPinched.length = 0;
     activeStates.length = 0;
 
+    // Stable identities first. Everything downstream -- analyser history,
+    // skeleton rigs, pinch state, depth calibration, controller selection --
+    // keys off these, so they must not depend on MediaPipe's array order or on
+    // a handedness label that can collide or read "Unknown".
+    const identity = handIdentity.assign(hands, handedness);
+
     hands.forEach((landmarks, index) => {
       const side = handedness[index] || "Unknown";
-      let analyzer = analyzers.get(side);
+      const key = identity.keys[index];
+      // One analyser per PHYSICAL hand, not per handedness label. Keying by
+      // label made both hands share filter history whenever the labels matched.
+      let analyzer = analyzers.get(key);
       if (!analyzer) {
         analyzer = new HandAnalyzer(analyzerSettings());
-        analyzers.set(side, analyzer);
+        analyzers.set(key, analyzer);
       }
       const handState = analyzer.update(landmarks, side, observationSeconds);
+      // Attach the identity so every consumer agrees about which hand this is.
+      handState.key = key;
       activeStates.push(handState);
-      overlayHands.push({ state: handState, side, landmarks });
+      overlayHands.push({ state: handState, side, landmarks, key });
       overlayPinched.push(handState.pinched);
     });
+
+    // Drop analysers and depth state for hands that are genuinely gone.
+    const liveKeys = identity.keys;
+    for (const key of [...analyzers.keys()]) {
+      if (!liveKeys.includes(key)) analyzers.delete(key);
+    }
+    depthRegistry.retain(liveKeys);
 
     if (hands.length === 0) {
       for (const analyzer of analyzers.values()) analyzer.reset();
@@ -1724,6 +1745,9 @@ function processHands(now) {
       tracker.worldLandmarks || [],
       handedness,
       {
+        // Stable identities: a rig and its filter history belong to a physical
+        // hand, not to a position in MediaPipe's result array.
+        keys: activeStates.map(hand => hand.key),
         pinched: overlayPinched,
         activity,
         fit,
@@ -2173,18 +2197,28 @@ function projectedTarget() {
  * hand and noise in the size estimate do not push the object around.
  */
 function updateHandDepth(now) {
-  // A selected model component is not a playground prop, so there is nothing for
-  // the box branch below to move; do not arm the gesture and pretend otherwise.
-  const usingProp = Boolean(playground?.selectedId);
-  if (!workspace?.gizmo || !usingProp) {
+  // Depth must move something it can actually move through the normal transform
+  // APIs. Both a playground prop and a selected component qualify; neither is
+  // modified by writing mesh coordinates directly.
+  const prop = playground?.selectedId ? playground.byId.get(playground.selectedId) : null;
+  const component = !prop && state.partId ? state.partId : null;
+
+  if (!workspace?.gizmo || (!prop && !component)) {
     depthRegistry.reset();
     state.depth = null;
     state.depthStart = null;
     return null;
   }
 
-  const hand = overlayHands?.[0]?.state;
-  if (!hand) {
+  // Follow the designated active hand, identified stably. Using overlayHands[0]
+  // meant depth tracked whichever hand MediaPipe happened to list first, and
+  // calling the registry with a fallback key gave every hand one calibration.
+  const activeState = solver.activeHand || null;
+  const hand = activeState?.key
+    ? overlayHands.find(entry => entry.state?.key === activeState.key)?.state || activeState
+    : activeState || overlayHands?.[0]?.state || null;
+
+  if (!hand?.key) {
     depthRegistry.reset();
     state.depth = null;
     state.depthStart = null;
@@ -2192,19 +2226,27 @@ function updateHandDepth(now) {
   }
 
   const settings = store.get?.() || {};
-  const result = depthRegistry.update(hand.key || "hand-0", hand, now, {
+  const result = depthRegistry.update(hand.key, hand, now, {
     sensitivity: settings.object?.depthSensitivity ?? 1,
     invert: Boolean(settings.object?.depthInvert)
   });
   state.depth = result;
 
-  // Capture the starting Z the first frame travel begins, so depth is applied to
-  // a fixed reference rather than accumulating frame by frame.
-  if (result.active) {
+  // Capture the starting position the first frame travel begins, so depth is
+  // applied to a fixed reference rather than accumulating frame by frame.
+  if (result?.active) {
     if (!state.depthStart) {
-      const prop = playground.byId.get(playground.selectedId);
-      const pos = prop ? playground.getTransform(prop.id).position : null;
-      if (pos) state.depthStart = { x: pos.x, y: pos.y, z: pos.z };
+      if (prop) {
+        const pos = playground.getTransform(prop.id).position;
+        state.depthStart = { x: pos.x, y: pos.y, z: pos.z };
+      } else {
+        // Components translate by an offset from their exploded/home position.
+        const part = workspace.getPart(component);
+        const offset = part ? workspace.partTransforms?.get(part)?.offset : null;
+        state.depthStart = offset
+          ? { x: offset.x, y: offset.y, z: offset.z }
+          : { x: 0, y: 0, z: 0 };
+      }
     }
   } else {
     state.depthStart = null;
@@ -2212,21 +2254,19 @@ function updateHandDepth(now) {
 
   if (!result?.active || !result.engaged) return result;
 
-  // Apply the travel as a Z-handle drag. The gizmo's drag machinery already
-  // converts a delta into a constrained one, so depth stays on Z.
-  const prop = playground.byId.get(playground.selectedId);
-  if (!prop) return result;
-
   const base = state.depthStart;
   if (!base) return result;
 
-  const position = {
-    x: base.x,
-    y: base.y,
-    z: clamp(base.z + result.travel, -STAGE_BOUNDS.z, STAGE_BOUNDS.z)
-  };
-  playground.setTransform(prop.id, { position });
-  updateObjectHud?.();
+  const z = clamp(base.z + result.travel, -STAGE_BOUNDS.z, STAGE_BOUNDS.z);
+  if (prop) {
+    playground.setTransform(prop.id, { position: { x: base.x, y: base.y, z } });
+    updateObjectHud?.();
+  } else {
+    workspace.setPartTransform(component, { offset: { x: base.x, y: base.y, z } });
+    // Keep the inspector's position readout honest while the hand moves it.
+    // updateProperties() is the inspector's own refresh path.
+    inspector?.updateProperties?.();
+  }
   return result;
 }
 
