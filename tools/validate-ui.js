@@ -431,13 +431,68 @@ section("5b · Render diagnostics panel");
   check("no diagnostic value is hardcoded in the markup", prefilled.length === 0,
     prefilled.join(", "));
 
+  // The grid lives in a column inside the panel body, not directly in the panel:
+  // render and tracking sit side by side so the open panel stays short enough not
+  // to cover the standard-view cube.
   check("the diagnostics grid is inside the panel",
-    grid?.parentElement === diag);
+    diag?.contains(grid) === true);
+  check("the grid is inside a two-column body",
+    grid?.parentElement?.parentElement?.classList.contains("diag-body") === true,
+    grid?.parentElement?.className);
+  check("both diagnostic columns are present",
+    diag?.querySelectorAll(".diag-col").length === 2,
+    String(diag?.querySelectorAll(".diag-col").length));
+
+  // Every tracking readout must exist and start empty, for the same reason as
+  // the render readouts above.
+  const trackingIds = [
+    "diag-track-status", "diag-track-fps", "diag-track-inference", "diag-track-delegate",
+    "diag-track-hands", "diag-track-identity", "diag-track-duplicate", "diag-track-rejected",
+    "diag-track-lag"
+  ];
+  const missingTracking = trackingIds.filter(id => !document.getElementById(id));
+  check("the tracking readouts exist", missingTracking.length === 0,
+    missingTracking.join(", "));
+  const prefillTracking = trackingIds.filter(id => {
+    const text = document.getElementById(id)?.textContent.trim();
+    return text && text !== "—";
+  });
+  check("no tracking value is hardcoded in the markup", prefillTracking.length === 0,
+    prefillTracking.join(", "));
 
   const diagCss = css.slice(css.indexOf(".diag {"), css.indexOf(".diag {") + 900);
   check("the panel is a fixed overlay above the scene", /position:\s*absolute/.test(diagCss));
   check("the panel only expands when opened",
-    /\.diag\[data-open="true"\] \.diag-grid/.test(css));
+    /\.diag\[data-open="true"\] \.diag-body/.test(css));
+
+  // Geometry, not just presence: the open panel must clear the view cube, which
+  // sits at bottom: 96px with three 31px rows and 2 gaps (101px tall, so its top
+  // edge is 197px above the bottom). The panel is anchored 18px from the bottom,
+  // so its collapse height has to stay under 179px or they overlap.
+  const cubeRule = css.slice(css.indexOf(".view-cube {"), css.indexOf(".view-cube {") + 700);
+  const cubeBottom = Number((cubeRule.match(/bottom:\s*(\d+)px/) || [])[1]);
+  const cell = Number((cubeRule.match(/--cell:\s*(\d+)px/) || [])[1]);
+  const gap = Number((cubeRule.match(/gap:\s*(\d+)px/) || [])[1]);
+  const cubeHeight = cell * 3 + gap * 2;
+  check("the view cube geometry was read from the stylesheet",
+    cubeBottom === 96 && cell === 31 && cubeHeight === 99,
+    `${cubeBottom} + ${cubeHeight}`);
+
+  // Slice only to the end of the rule: a fixed-size window would run past it into
+  // unrelated declarations and could pick up the wrong max-height.
+  const bodyStart = css.indexOf(".diag-body {");
+  const bodyRule = css.slice(bodyStart, css.indexOf("}", bodyStart) + 1);
+  const maxHeight = Number((bodyRule.match(/max-height:\s*(\d+)px/) || [])[1]);
+  // The panel is anchored 18px off the bottom; its toggle header is about 30px.
+  // Body + header + anchor must stay under the cube's top edge.
+  const PANEL_BOTTOM = 18;
+  const PANEL_HEADER = 30;
+  const panelTop = PANEL_BOTTOM + PANEL_HEADER + maxHeight;
+  check("the open panel is capped below the view cube",
+    Number.isFinite(maxHeight) && panelTop < cubeBottom + cubeHeight,
+    `panel top ${panelTop}px vs cube top ${cubeBottom + cubeHeight}px`);
+  check("the panel is wide enough for two columns",
+    /width:\s*392px/.test(diagCss));
 }
 
 section("5c · Camera mode must not break hand tracking");

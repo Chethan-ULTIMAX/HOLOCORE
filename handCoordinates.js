@@ -149,7 +149,37 @@ export function worldLandmarksToOffsets(world, out, { scale, mirror }) {
 export const PALM_LANDMARKS = [5, 9, 13, 17];
 
 /**
- * Mean wrist-to-knuckle distance, over whichever knuckles are present.
+ * Apparent palm size in the IMAGE plane, using x and y only.
+ *
+ * This is the correct input for a depth proxy. `palmSpan` includes z, which is
+ * right for measuring the hand's 3D geometry but wrong for judging how large it
+ * appears: MediaPipe's z is relative and changes as much when the palm rotates
+ * as when it moves closer. Dropping z means turning the palm no longer changes
+ * the depth estimate.
+ *
+ * @param {Array<{x:number,y:number}>} points 21 normalised landmarks
+ * @returns {number} mean wrist-to-knuckle distance in normalised image units
+ */
+export function palmSpan2D(points) {
+  if (!points || points.length < 21) return 0;
+  const wrist = points[0];
+  if (!wrist) return 0;
+  let total = 0;
+  let count = 0;
+  for (const index of PALM_LANDMARKS) {
+    const point = points[index];
+    if (!point) continue;
+    total += Math.hypot(point.x - wrist.x, point.y - wrist.y);
+    count += 1;
+  }
+  return count ? total / count : 0;
+}
+
+/**
+ * Mean wrist-to-knuckle distance in 3D, over whichever knuckles are present.
+ *
+ * Used for geometry scaling and for the skeleton's anatomy. Deliberately still
+ * includes z -- see `palmSpan2D` for why depth must not use this.
  * Returns 0 when the data is unusable.
  */
 export function palmSpan(points) {

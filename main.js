@@ -23,8 +23,17 @@ import { HandOverlay } from "./handOverlay.js";
 import { HandSkeleton3D } from "./handSkeleton3d.js";
 import { Playground, PRIMITIVES } from "./playground.js";
 import { chimes } from "./chimes.js";
-import { VIEW_LABELS } from "./cameraViews.js";
+import {
+  VIEW_LABELS, VIEW_SHORTCUTS, viewForEvent, shortcutHint
+} from "./cameraViews.js";
 import { HandDepthRegistry } from "./handDepth.js";
+import { HandIdentityTracker } from "./handIdentity.js";
+import {
+  CalibrationSession, DEFAULT_THRESHOLDS, POSES, POSE_DURATION_MS
+} from "./calibration.js";
+import {
+  HAND_ROLES, DEFAULT_ROLE, normaliseRole, selectRoleHand, assessHandSettings, describeRole
+} from "./handOptions.js";
 import { OneEuroFilter } from "./gestures.js";
 import { VoiceControl, VOICE_STATUS, COLOR_PALETTE, parseCommand } from "./voiceControl.js";
 import { MODES, getMode, isMode, instructionFor } from "./interactionModes.js";
@@ -107,6 +116,15 @@ const dom = {
   voicePhrase: $("#voice-phrase"),
   sceneOutliner: $("#scene-outliner"),
   diagnostics: $("#diagnostics"),
+  diagTrackStatus: $("#diag-track-status"),
+  diagTrackFps: $("#diag-track-fps"),
+  diagTrackInference: $("#diag-track-inference"),
+  diagTrackDelegate: $("#diag-track-delegate"),
+  diagTrackHands: $("#diag-track-hands"),
+  diagTrackIdentity: $("#diag-track-identity"),
+  diagTrackDuplicate: $("#diag-track-duplicate"),
+  diagTrackRejected: $("#diag-track-rejected"),
+  diagTrackLag: $("#diag-track-lag"),
   diagToggle: $("#diag-toggle"),
   diagGrid: $("#diag-grid"),
   diagModel: $("#diag-model"),
@@ -203,6 +221,14 @@ let settings = store.get();
  * How far a grabbed playground object may be dragged. Shared with the gesture
  * solver so the clamp is applied once, at the same limit, in both places.
  */
+/**
+ * How far the pointer must move, in NDC, before the hover raycast is repeated.
+ *
+ * NDC spans the viewport, so 0.004 is roughly 2.5 px on a 1280 px stage: below
+ * that the hit cannot change, and re-raycasting is wasted work.
+ */
+const HOVER_NDC_EPSILON = 0.004;
+
 const STAGE_BOUNDS = Object.freeze({ x: 4.2, y: 3.2, z: 3.6 });
 
 const state = {
@@ -222,11 +248,16 @@ const state = {
   /** Hands-free depth: latest reading, and the Z the gesture started from. */
   depth: null,
   depthStart: null,
+  /** Observation sequence already analysed, so duplicate display frames are cheap. */
+  analyzedSeq: -1,
+  lastAnalysis: null,
+  duplicateFrames: 0,
   /** Full-workspace camera vs. small preview card. */
   cameraView: "workspace",
   /** True while the workspace video element is actually showing frames. */
   cameraLive: false,
   diagnosticsOpen: false,
+  trackingWasLost: false,
   /** Per-part transform captured when a MOVE/ROTATE/SCALE gesture begins. */
   gestureTarget: null,
   gestureStart: null,
@@ -242,7 +273,18 @@ const state = {
 };
 
 const animator = new Animator();
-const analyzers = new Map(); // keyed by handedness slot
+const analyzers = new Map(); // keyed by stable hand identity
+/** Assigns stable keys to hands so nothing downstream depends on array order. */
+const handIdentity = new HandIdentityTracker();
+
+/**
+ * The two-pose pinch calibration capture.
+ *
+ * The session is pure state; it is fed raw pinch strength from the tracking loop
+ * and renders itself into the settings panel. Keeping it out of the DOM means the
+ * flow is tested exactly as it runs.
+ */
+const calibration = new CalibrationSession();
 let overlayWorkspace = null;
 const overlayHands = [];
 const overlayPinched = [];
@@ -270,7 +312,10 @@ function finishBoot() {
 /* TOASTS                                                                    */
 /* ------------------------------------------------------------------------- */
 
+let toastProbe = null;
+
 function toast(message, kind = "", duration = 3200) {
+  toastProbe?.(message, kind);
   if (!dom.toastStack) return;
   const el = document.createElement("div");
   el.className = `toast ${kind}`.trim();
@@ -338,6 +383,8 @@ function setupChrome() {
   inspector.setModel(state.modelId);
 
   setupSettingsUI();
+  updateProfileHint(settings.gesture.trackingProfile);
+  updateHandRoleHint();
   applyNonSceneSettings();
 }
 
@@ -371,9 +418,14 @@ function applyNonSceneSettings() {
   // mismatch the coordinate module now prevents. `updateSettings` reconfigure
   // the existing rigs; it does not rebuild them, so the change is instant and
   // tracking is not interrupted.
+  // `applyNonSceneSettings` also runs during early boot, before the skeleton
+  // exists, so every call site here is optional-chained -- which is exactly how
+  // the initial smoothing profile silently failed to reach the skeleton. The
+  // skeleton now receives the profile explicitly at construction (see below),
+  // and this path handles live changes.
   skeleton3d?.updateSettings?.({
     mirror: settings.camera.mirror,
-    smoothing: settings.gesture.smoothing
+    profile: settings.gesture.trackingProfile
   });
   dom.viewport?.style.setProperty("--scrim-strength", String(settings.camera.scrim ?? 0));
   const workspaceViewInput = document.getElementById("set-workspace-view");
@@ -541,7 +593,11 @@ function boot() {
   skeleton3d = new HandSkeleton3D({
     scene: workspace.scene,
     camera: workspace.camera,
-    mirror: settings.camera.mirror !== false
+    mirror: settings.camera.mirror !== false,
+    // Applied at construction, not only via applyNonSceneSettings: that function
+    // runs at boot before this object exists, so the saved profile used to be
+    // lost and every session started at the default.
+    profile: settings.gesture.trackingProfile
   });
   // Register the rigs for the late composite pass, so a model can never hide
   // the hands and bloom never smears them.
@@ -1032,8 +1088,16 @@ function setupViewCube() {
   // by hand, so the indicator never lies about the current orientation.
   workspace.onCameraChange = () => updateViewCube();
 
-  const shortcuts = { 1: "front", 2: "top", 3: "iso" };
-  dom.viewCube.dataset.shortcuts = JSON.stringify(shortcuts);
+  // Every face advertises its own shortcut in its tooltip, generated from the
+  // same map the keyboard handler uses, so the two can never disagree.
+  for (const face of faces) {
+    const hint = shortcutHint(face.dataset.view);
+    if (hint) {
+      face.title = `${VIEW_LABELS[face.dataset.view] || face.dataset.view} view · ${hint}`;
+      face.dataset.shortcut = hint;
+    }
+  }
+  dom.viewCube.dataset.shortcuts = JSON.stringify(VIEW_SHORTCUTS);
   updateViewCube();
 }
 
@@ -1111,9 +1175,16 @@ async function toggleCamera() {
   if (tracker.status === TRACKER_STATUS.ACTIVE || tracker.status === TRACKER_STATUS.HANDS ||
       tracker.status === TRACKER_STATUS.LOST) {
     tracker.stop();
+    // Forget the hands that were being tracked. Otherwise the analysers, rigs and
+    // filter history from the old session survive into the new one, and a filter
+    // that last saw a hand minutes ago treats the first new sample as a huge
+    // jump -- the skeleton snaps across the stage before settling.
+    resetTrackingState();
     updateTrackingUI(tracker.getState());
     return;
   }
+  // Same reason on the way in: a restart is a new session, not a continuation.
+  resetTrackingState();
   const trackerState = await tracker.start({ deviceId: settings.camera.deviceId || undefined });
   if (trackerState.status === TRACKER_STATUS.ERROR) {
     showCameraError(trackerState.error);
@@ -1340,8 +1411,38 @@ const STATUS_CLASS = {
   [TRACKER_STATUS.STOPPED]: ["CAMERA OFF", ""]
 };
 
+/**
+ * Was tracking lost, and has it come back?
+ *
+ * The status chip shows the current state, but a loss is easy to miss: the app
+ * simply stops responding to hands, which is indistinguishable from a gesture
+ * engine that has stopped working. Tell the user once when it happens and again
+ * when it recovers, and say what to do about it.
+ */
+function handleTrackingTransition(trackerState) {
+  const status = trackerState.status;
+  const wasLost = state.trackingWasLost === true;
+
+  if (status === TRACKER_STATUS.LOST && !wasLost) {
+    state.trackingWasLost = true;
+    setCalibrationLog(
+      "Tracking lost — no hands seen for a moment. Step back so your hands are " +
+      "in frame, and check the lighting. Gestures resume on their own.",
+      "bad"
+    );
+    toast("Tracking lost — move your hands into view", "warn", 3000);
+    return;
+  }
+
+  if (status !== TRACKER_STATUS.LOST && wasLost) {
+    state.trackingWasLost = false;
+    toast("Tracking recovered", "", 1600);
+  }
+}
+
 function updateTrackingUI(trackerState) {
   if (!trackerState) return;
+  handleTrackingTransition(trackerState);
 
   const [label, cls] = STATUS_CLASS[trackerState.status] || ["UNKNOWN", ""];
   dom.trackingState.textContent = label;
@@ -1485,6 +1586,7 @@ function startLoop() {
       document.body.classList.toggle("is-interacting", interacting);
       if (dom.stageKeys) dom.stageKeys.style.opacity = interacting ? "0" : "";
     }
+    // Milliseconds from the render loop, converted to seconds exactly here.
     processHands(now / 1000);
     updateHud(dt);
 
@@ -1605,6 +1707,32 @@ const MANIPULATING_INTENTS = new Set([
   "scale + rotate + translate"
 ]);
 
+/**
+ * Forget every per-hand piece of state.
+ *
+ * Tracker identity, analyser filter history, depth calibration and skeleton rigs
+ * are all keyed to a physical hand and are meant to survive brief losses (see
+ * §14). They therefore also survive a tracking mode change, a camera switch or a
+ * source reset, where starting from a clean slate is what the user expects.
+ *
+ * Callers: switching camera source, ending a session, and any test that wants a
+ * deterministic starting point.
+ */
+function resetTrackingState({ keepSettings = true } = {}) {
+  handIdentity.reset();
+  analyzers.clear();
+  depthRegistry.reset();
+  state.analyzedSeq = null;
+  state.lastAnalysis = null;
+  state.duplicateFrames = 0;
+  skeleton3d?.reset?.();
+  solver?.reset?.();
+  if (!keepSettings) return;
+
+  overlayHands.length = 0;
+  overlayPinched.length = 0;
+}
+
 function processHands(now) {
   // Nothing is being manipulated when there is no pipeline at all. Returning
   // early used to leave the playground's "a hand is acting" flag stuck on from
@@ -1618,24 +1746,97 @@ function processHands(now) {
   const handedness = tracker.handedness || [];
   const activeStates = [];
 
-  overlayHands.length = 0;
-  overlayPinched.length = 0;
+  // ---- analysis runs once per camera observation, not once per display frame
+  //
+  // This used to run on every animation frame with whatever landmarks the
+  // tracker happened to hold, so a 120 Hz monitor re-fed the same 30 Hz
+  // observation to the filters four times. One Euro Filter received four
+  // identical samples at four different display timestamps, which inflated its
+  // frequency estimate and made smoothing behave differently on every machine.
+  // Pinch hysteresis, activation counters and velocity had the same problem.
+  //
+  // The tracker increments `observationSeq` once per processed camera frame; a
+  // duplicate sequence means "nothing new to analyse", so we reuse the previous
+  // state and only re-render it. Interpolation between the last two states is
+  // deliberately not done: it would make the skeleton lead the hand it is
+  // supposed to be attached to.
+  const observationSeq = tracker.observationSeq ?? 0;
+  const isNewObservation = observationSeq !== state.analyzedSeq;
 
-  hands.forEach((landmarks, index) => {
-    const side = handedness[index] || "Unknown";
-    let analyzer = analyzers.get(side);
-    if (!analyzer) {
-      analyzer = new HandAnalyzer(analyzerSettings());
-      analyzers.set(side, analyzer);
+  if (isNewObservation) {
+    state.analyzedSeq = observationSeq;
+    // Observation timestamps, in seconds, for observation-interval filtering.
+    // This is the camera frame's arrival time, not the display clock.
+    const observationSeconds = Number.isFinite(tracker.observationMs)
+      ? tracker.observationMs / 1000
+      : now;
+
+    overlayHands.length = 0;
+    overlayPinched.length = 0;
+    activeStates.length = 0;
+
+    // Stable identities first. Everything downstream -- analyser history,
+    // skeleton rigs, pinch state, depth calibration, controller selection --
+    // keys off these, so they must not depend on MediaPipe's array order or on
+    // a handedness label that can collide or read "Unknown".
+    const identity = handIdentity.assign(hands, handedness);
+
+    let rawPinchSample = -1;
+    hands.forEach((landmarks, index) => {
+      const side = handedness[index] || "Unknown";
+      const key = identity.keys[index];
+      // One analyser per PHYSICAL hand, not per handedness label. Keying by
+      // label made both hands share filter history whenever the labels matched.
+      let analyzer = analyzers.get(key);
+      if (!analyzer) {
+        analyzer = new HandAnalyzer(analyzerSettings());
+        analyzers.set(key, analyzer);
+      }
+      const handState = analyzer.update(landmarks, side, observationSeconds);
+
+      // Calibration watches RAW pinch strength, not the gated state, because the
+      // gate is what it is trying to fit. Take the strongest hand in frame so the
+      // user does not have to keep their other hand out of shot.
+      if (calibration.active) {
+        rawPinchSample = Math.max(rawPinchSample, handState.pinchStrength ?? 0);
+      }
+      // Attach the identity so every consumer agrees about which hand this is.
+      handState.key = key;
+      activeStates.push(handState);
+      overlayHands.push({ state: handState, side, landmarks, key });
+      overlayPinched.push(handState.pinched);
+    });
+
+    // Feed the calibration capture once per observation, with the strongest hand.
+    // Sampling per HAND would weight the average towards whoever raised two.
+    if (calibration.active) {
+      const snapshot = calibration.sample(rawPinchSample >= 0 ? rawPinchSample : null);
+      if (snapshot.finished) applyCalibrationResult(snapshot.result);
+      else renderCalibration(snapshot);
     }
-    const handState = analyzer.update(landmarks, side, now);
-    activeStates.push(handState);
-    overlayHands.push({ state: handState, side, landmarks });
-    overlayPinched.push(handState.pinched);
-  });
 
-  if (hands.length === 0) {
-    for (const analyzer of analyzers.values()) analyzer.reset();
+    // Drop analysers and depth state for hands that are genuinely gone.
+    const liveKeys = identity.keys;
+    for (const key of [...analyzers.keys()]) {
+      if (!liveKeys.includes(key)) analyzers.delete(key);
+    }
+    depthRegistry.retain(liveKeys);
+
+    if (hands.length === 0) {
+      for (const analyzer of analyzers.values()) analyzer.reset();
+    }
+
+    // Cache the analysis so duplicate display frames can reuse it verbatim.
+    state.lastAnalysis = { activeStates, hands, handedness };
+  } else {
+    // Same camera frame: reuse the analysed state rather than re-filtering it.
+    const cached = state.lastAnalysis;
+    if (!cached) {
+      // First frame before any observation has landed.
+      return;
+    }
+    for (const hand of cached.activeStates) activeStates.push(hand);
+    state.duplicateFrames = (state.duplicateFrames || 0) + 1;
   }
 
   // ---- draw both overlays ---------------------------------------------------
@@ -1670,13 +1871,18 @@ function processHands(now) {
       tracker.worldLandmarks || [],
       handedness,
       {
+        // Stable identities: a rig and its filter history belong to a physical
+        // hand, not to a position in MediaPipe's result array.
+        keys: activeStates.map(hand => hand.key),
         pinched: overlayPinched,
         activity,
         fit,
         dt: state.frameDelta ?? 1 / 60,
-        // Monotonic seconds for the per-joint filters, so smoothing is
-        // time-based rather than assuming a fixed frame rate.
-        now: now / 1000
+        // `now` is ALREADY seconds: processHands() takes a seconds timestamp and
+        // startLoop() converts milliseconds exactly once. Dividing by 1000 again
+        // made the joint filters estimate 1000 Hz instead of 30 Hz, which clamped
+        // dt at its 1 ms floor and settled the skeleton 7.8x too slowly.
+        now
       }
     );
   }
@@ -1742,7 +1948,7 @@ function processHands(now) {
 
   // ---- hands-free depth --------------------------------------------------
   // Runs after the gizmo so the Z handle exists before travel is applied.
-  updateHandDepth(now / 1000);
+  updateHandDepth(now);
 
   // A pinch that lands on a gizmo handle drags that handle, and only that
   // handle: doing this before the solver is what stops a handle grab from also
@@ -1751,6 +1957,10 @@ function processHands(now) {
   solver.setViewContext({ camera: workspace?.camera || null, ndc: solverPointer });
 
   const result = solver.update(activeStates, objectState, now);
+
+  // Pause camera auto-rotation for the duration of a transform. A drifting camera
+  // makes an object held in a frozen drag plane stop tracking the hand.
+  workspace?.setHandActive?.(MANIPULATING_INTENTS.has(result.intent));
   state.gestureMode = result.mode;
   state.intent = result.intent;
 
@@ -1805,28 +2015,19 @@ function pickPointer(states, activeHand = null) {
     return { hand: { ...hand, indexTip: tip, pinched: Boolean(hand.pinched) }, state: hand };
   }
 
-  let best = null;
-  let bestScore = -Infinity;
-  for (const hand of states) {
-    if (!hand) continue;
-    let score = 0;
-    if (hand.pinched) score += 10;
-    // A hand with a complete landmark set is likelier to be in frame.
-    const points = hand.landmarks?.length || 0;
-    score += Math.min(points, 21) / 21;
-    if (hand.present === false) score -= 5;
-    if (score > bestScore) {
-      bestScore = score;
-      best = hand;
-    }
+  // No solver opinion: fall back to the configured hand role, so the reticle
+  // follows the hand the user nominated instead of the first one in the array.
+  // Previously this loop ignored the role entirely and could pick a hand the
+  // solver had deliberately excluded.
+  const roleHand = selectRoleHand(states, { role: settings.gesture.handRole });
+  if (roleHand) {
+    const tip = roleHand.landmarks?.[8] || roleHand.indexTip || roleHand.pinch || null;
+    return {
+      hand: { ...roleHand, indexTip: tip, pinched: Boolean(roleHand.pinched) },
+      state: roleHand
+    };
   }
-
-  if (!best) return null;
-  const tip = best.landmarks?.[8] || best.indexTip || best.pinch || null;
-  return {
-    hand: { ...best, indexTip: tip, pinched: Boolean(best.pinched) },
-    state: best
-  };
+  return null;
 }
 
 /**
@@ -2117,18 +2318,28 @@ function projectedTarget() {
  * hand and noise in the size estimate do not push the object around.
  */
 function updateHandDepth(now) {
-  // A selected model component is not a playground prop, so there is nothing for
-  // the box branch below to move; do not arm the gesture and pretend otherwise.
-  const usingProp = Boolean(playground?.selectedId);
-  if (!workspace?.gizmo || !usingProp) {
+  // Depth must move something it can actually move through the normal transform
+  // APIs. Both a playground prop and a selected component qualify; neither is
+  // modified by writing mesh coordinates directly.
+  const prop = playground?.selectedId ? playground.byId.get(playground.selectedId) : null;
+  const component = !prop && state.partId ? state.partId : null;
+
+  if (!workspace?.gizmo || (!prop && !component)) {
     depthRegistry.reset();
     state.depth = null;
     state.depthStart = null;
     return null;
   }
 
-  const hand = overlayHands?.[0]?.state;
-  if (!hand) {
+  // Follow the designated active hand, identified stably. Using overlayHands[0]
+  // meant depth tracked whichever hand MediaPipe happened to list first, and
+  // calling the registry with a fallback key gave every hand one calibration.
+  const activeState = solver.activeHand || null;
+  const hand = activeState?.key
+    ? overlayHands.find(entry => entry.state?.key === activeState.key)?.state || activeState
+    : activeState || overlayHands?.[0]?.state || null;
+
+  if (!hand?.key) {
     depthRegistry.reset();
     state.depth = null;
     state.depthStart = null;
@@ -2136,19 +2347,27 @@ function updateHandDepth(now) {
   }
 
   const settings = store.get?.() || {};
-  const result = depthRegistry.update(hand.key || "hand-0", hand, now, {
+  const result = depthRegistry.update(hand.key, hand, now, {
     sensitivity: settings.object?.depthSensitivity ?? 1,
     invert: Boolean(settings.object?.depthInvert)
   });
   state.depth = result;
 
-  // Capture the starting Z the first frame travel begins, so depth is applied to
-  // a fixed reference rather than accumulating frame by frame.
-  if (result.active) {
+  // Capture the starting position the first frame travel begins, so depth is
+  // applied to a fixed reference rather than accumulating frame by frame.
+  if (result?.active) {
     if (!state.depthStart) {
-      const prop = playground.byId.get(playground.selectedId);
-      const pos = prop ? playground.getTransform(prop.id).position : null;
-      if (pos) state.depthStart = { x: pos.x, y: pos.y, z: pos.z };
+      if (prop) {
+        const pos = playground.getTransform(prop.id).position;
+        state.depthStart = { x: pos.x, y: pos.y, z: pos.z };
+      } else {
+        // Components translate by an offset from their exploded/home position.
+        const part = workspace.getPart(component);
+        const offset = part ? workspace.partTransforms?.get(part)?.offset : null;
+        state.depthStart = offset
+          ? { x: offset.x, y: offset.y, z: offset.z }
+          : { x: 0, y: 0, z: 0 };
+      }
     }
   } else {
     state.depthStart = null;
@@ -2156,21 +2375,19 @@ function updateHandDepth(now) {
 
   if (!result?.active || !result.engaged) return result;
 
-  // Apply the travel as a Z-handle drag. The gizmo's drag machinery already
-  // converts a delta into a constrained one, so depth stays on Z.
-  const prop = playground.byId.get(playground.selectedId);
-  if (!prop) return result;
-
   const base = state.depthStart;
   if (!base) return result;
 
-  const position = {
-    x: base.x,
-    y: base.y,
-    z: clamp(base.z + result.travel, -STAGE_BOUNDS.z, STAGE_BOUNDS.z)
-  };
-  playground.setTransform(prop.id, { position });
-  updateObjectHud?.();
+  const z = clamp(base.z + result.travel, -STAGE_BOUNDS.z, STAGE_BOUNDS.z);
+  if (prop) {
+    playground.setTransform(prop.id, { position: { x: base.x, y: base.y, z } });
+    updateObjectHud?.();
+  } else {
+    workspace.setPartTransform(component, { offset: { x: base.x, y: base.y, z } });
+    // Keep the inspector's position readout honest while the hand moves it.
+    // updateProperties() is the inspector's own refresh path.
+    inspector?.updateProperties?.();
+  }
   return result;
 }
 
@@ -2240,17 +2457,43 @@ function updatePointer(pointer, states, result) {
 
   const ndc = landmarkNdc(tip);
 
-  // Playground objects take priority over engineering components: if the user
-  // spawned or imported something, they expect to be able to grab it.
-  const propHit = playground
-    ? playground.pick({ x: ndc.x, y: ndc.y }, workspace.camera)
-    : null;
+  // Hover raycasting is the most expensive thing in this function, and it used to
+  // run twice per display frame -- once against the playground and once against
+  // the assembly -- even when nothing had moved and even during a drag when the
+  // result is discarded anyway.
+  //
+  // Two cheap guards:
+  //   - during a transform the hover target cannot change, so skip entirely;
+  //   - when the pointer has barely moved, the previous hit is still valid.
+  const dragging = result?.intent === "translate" || result?.intent === "rotate" ||
+    result?.intent === "scale" || result?.intent === "two-hand grab";
 
-  const hit = propHit || workspace.raycast({ x: ndc.x, y: ndc.y });
+  // The dead band may only reuse a hit if it was computed against the same scene.
+  // A prop added, removed or cleared invalidates every cached hit, because the
+  // thing that was under the pointer may no longer exist.
+  const sceneRevision = playground?.revision ?? 0;
+  const last = state.hoverNdc;
+  const moved = !last
+    || state.hoverRevision !== sceneRevision
+    || Math.hypot(ndc.x - last.x, ndc.y - last.y) > HOVER_NDC_EPSILON;
+  const mayRaycast = !dragging && moved;
 
-  // Hover highlight follows the pointer, but never while dragging.
-  const dragging = result?.intent === "translate" || result?.intent === "rotate";
-  if (!dragging) {
+  // Keep the previous hover target while dragging or while the pointer is inside
+  // the dead band. The rest of this function (the reticle, its label, the mode
+  // target) still has to run every display frame: those are what the user sees.
+  if (mayRaycast) {
+    state.hoverNdc = { x: ndc.x, y: ndc.y };
+    state.hoverRevision = sceneRevision;
+
+    // Playground objects take priority over engineering components: if the user
+    // spawned or imported something, they expect to be able to grab it.
+    const propHit = playground
+      ? playground.pick({ x: ndc.x, y: ndc.y }, workspace.camera)
+      : null;
+
+    const hit = propHit || workspace.raycast({ x: ndc.x, y: ndc.y });
+
+    // Hover highlight follows the pointer.
     if (hit !== state.pointerTarget) {
       state.pointerTarget = hit;
       state.pointerKind = propHit ? "prop" : hit ? "part" : null;
@@ -2258,7 +2501,12 @@ function updatePointer(pointer, states, result) {
       if (hit) hoverFromHand(pointer.hand, hit);
       playground?.highlight(propHit);
     }
+  } else {
+    state.hoverSkipped = (state.hoverSkipped || 0) + 1;
   }
+
+  const propHit = state.pointerKind === "prop" ? state.pointerTarget : null;
+  const hit = state.pointerTarget;
 
   // Always resolve the *hovered* part's own name — inspector.lastComponent
   // belongs to the current selection and would mislabel a different part.
@@ -2817,9 +3065,89 @@ function updateDiagnostics() {
   setDiagValue(dom.diagErrors, String(glErrorCount), glErrorCount === 0);
   if (glErrorCount > 0) problems.push("gl");
 
+  updateTrackingDiagnostics(problems);
+
   panel.dataset.ok = problems.length === 0 ? "true" : "false";
   panel.dataset.open = state.diagnosticsOpen ? "true" : "false";
   dom.diagToggle?.setAttribute("aria-expanded", state.diagnosticsOpen ? "true" : "false");
+}
+
+/**
+ * Tracking half of the diagnostic panel.
+ *
+ * The render half answers "is anything on screen?"; this half answers "is the
+ * hand data arriving, and is it current?". They fail in different ways, and
+ * without the second set a frozen skeleton looks identical to a stationary hand.
+ *
+ * Every value is read from the live tracker and pipeline. When there is no
+ * tracker the fields say so rather than showing a stale or assumed value.
+ *
+ * @param {string[]} problems accumulates failure codes for the panel indicator
+ */
+function updateTrackingDiagnostics(problems) {
+  if (!dom.diagTrackStatus) return;
+
+  const t = tracker?.getState?.();
+
+  if (!t) {
+    setDiagValue(dom.diagTrackStatus, "no tracker", false);
+    setDiagValue(dom.diagTrackFps, "—", false);
+    setDiagValue(dom.diagTrackInference, "—", false);
+    setDiagValue(dom.diagTrackDelegate, "—", false);
+    setDiagValue(dom.diagTrackHands, "—", false);
+    setDiagValue(dom.diagTrackIdentity, "—", false);
+    setDiagValue(dom.diagTrackDuplicate, "—", false);
+    setDiagValue(dom.diagTrackRejected, "—", false);
+    setDiagValue(dom.diagTrackLag, "—", false);
+    problems.push("tracker");
+    return;
+  }
+
+  // Status is only "good" when the tracker is actually producing hands. ACTIVE
+  // means the camera is streaming but no hand has been seen yet, which is a
+  // normal state and not an error.
+  const producing = t.status === TRACKER_STATUS.HANDS;
+  setDiagValue(dom.diagTrackStatus, t.label || t.status, producing || t.status === TRACKER_STATUS.ACTIVE);
+
+  setDiagValue(dom.diagTrackFps,
+    Number.isFinite(t.fps) && t.fps > 0 ? t.fps.toFixed(0) : "—",
+    Number.isFinite(t.fps) && t.fps > 0);
+
+  setDiagValue(dom.diagTrackInference,
+    Number.isFinite(t.inferenceMs) && t.inferenceMs > 0 ? `${t.inferenceMs.toFixed(0)} ms` : "—",
+    !Number.isFinite(t.inferenceMs) || t.inferenceMs <= 0 || t.inferenceMs < 200);
+
+  setDiagValue(dom.diagTrackDelegate, t.delegate || "—", Boolean(t.delegate));
+
+  const liveKeys = state.lastAnalysis?.activeStates?.map(hand => hand.key) || [];
+  setDiagValue(dom.diagTrackHands,
+    t.hands > 0 && liveKeys.length
+      ? `${liveKeys.length} · ${liveKeys.join(", ")}`
+      : String(t.hands ?? 0),
+    (t.hands ?? 0) === liveKeys.length);
+
+  // Identity going missing is the fingerprint of the section 4.2 class of bug:
+  // hands are being tracked, but nothing downstream knows which hand is which.
+  const keyed = liveKeys.every(key => typeof key === "string" && key.length > 0);
+  setDiagValue(dom.diagTrackIdentity,
+    liveKeys.length ? (keyed ? "stable" : "missing") : "—",
+    liveKeys.length ? keyed : undefined);
+
+  setDiagValue(dom.diagTrackDuplicate, String(state.duplicateFrames || 0), true);
+
+  const rejected = tracker?.rejectedHands || 0;
+  setDiagValue(dom.diagTrackRejected, String(rejected), rejected === 0);
+  if (rejected > 0) problems.push("rejected");
+
+  // How far behind real time the analysed observation is. A large or growing lag
+  // means the analysis is not keeping up with the camera, which shows up as
+  // "the hands feel late" long before the frame rate drops.
+  const observationMs = tracker?.observationMs;
+  const lag = Number.isFinite(observationMs) ? performance.now() - observationMs : NaN;
+  setDiagValue(dom.diagTrackLag,
+    Number.isFinite(lag) ? `${lag.toFixed(0)} ms` : "—",
+    Number.isFinite(lag) && lag < 250);
+  if (Number.isFinite(lag) && lag >= 250) problems.push("lag");
 }
 
 function formatCompact(value) {
@@ -3047,7 +3375,8 @@ const BINDINGS = [
   ["set-tracking", "tracking", "minTrackingConfidence", "number", "val-tracking", 2],
   ["set-pinch", "gesture", "pinchThreshold", "number", "val-pinch", 2],
   ["set-release", "gesture", "pinchRelease", "number", "val-release", 2],
-  ["set-smoothing", "gesture", "smoothing", "number", "val-smoothing", 2],
+  ["set-tracking-profile", "gesture", "trackingProfile", "select", "val-profile"],
+  ["set-hand-role", "gesture", "handRole", "select"],
   ["set-inertia", "gesture", "inertia", "checkbox"],
   ["set-move", "object", "moveSensitivity", "number", "val-move", 1],
   ["set-rotate", "object", "rotateSensitivity", "number", "val-rotate", 1],
@@ -3059,6 +3388,80 @@ const BINDINGS = [
   ["set-bloom", "view", "bloom", "checkbox"],
   ["set-quality", "view", "quality", "select"]
 ];
+
+/**
+ * Describe the tracking profile that is actually in effect.
+ *
+ * The numbers come from the measured table in trackingProfiles.js, so the hint
+ * cannot drift from the behaviour without a test failing.
+ */
+function updateProfileHint(profileId) {
+  const hint = document.getElementById("hint-profile");
+  if (!hint) return;
+  // Measured by tools/tuneProfiles.mjs; validate-full.js re-measures the
+  // ordering, so this text cannot silently drift from the behaviour.
+  const text = {
+    responsive: "Settles ~300 ms after a quick move. Best for dragging objects.",
+    balanced: "Settles ~400 ms. A good default for general work.",
+    precision: "Settles ~470 ms with the least jitter. Best for fine placement."
+  }[profileId] || "";
+  hint.textContent = text;
+}
+
+/**
+ * Explain the selected hand role, and surface configuration problems.
+ *
+ * The warnings are the point: "detection confidence above tracking confidence"
+ * is a legal pair of sliders that quietly makes hands flicker. The app used to
+ * let the user do that and just look broken.
+ */
+function updateHandRoleHint() {
+  const hint = document.getElementById("hint-hand-role");
+  if (hint) {
+    const role = normaliseRole(settings.gesture.handRole);
+    const entry = HAND_ROLES.find(item => item.id === role);
+    hint.textContent = entry ? entry.detail : "";
+  }
+  renderHandWarnings();
+}
+
+/** Draw the current configuration warnings, with a one-click fix each. */
+function renderHandWarnings() {
+  const box = document.getElementById("hand-warnings");
+  if (!box) return;
+
+  const warnings = assessHandSettings(
+    {
+      detection: settings.tracking.minDetectionConfidence,
+      tracking: settings.tracking.minTrackingConfidence,
+      maxHands: settings.tracking.maxHands
+    },
+    { role: settings.gesture.handRole, twoHandGesture: true }
+  );
+
+  box.replaceChildren();
+  box.hidden = warnings.length === 0;
+
+  for (const warning of warnings) {
+    const item = document.createElement("div");
+    item.className = "warn-item";
+    item.dataset.warn = warning.id;
+    item.append(document.createTextNode(warning.message));
+
+    if (warning.fix) {
+      const fix = document.createElement("button");
+      fix.type = "button";
+      fix.className = "warn-fix";
+      fix.textContent = "Fix";
+      fix.addEventListener("click", () => {
+        store.update(warning.fix.section, warning.fix.values);
+        toast("Applied the suggested setting", "", 2000);
+      });
+      item.append(fix);
+    }
+    box.append(item);
+  }
+}
 
 function setupSettingsUI() {
   for (const [id, section, key, kind, valueId, decimals] of BINDINGS) {
@@ -3074,7 +3477,7 @@ function setupSettingsUI() {
       if (target) target.textContent = formatValue(value, decimals);
     }
 
-    const eventName = kind === "checkbox" ? "change" : "input";
+    const eventName = kind === "checkbox" || kind === "select" ? "change" : "input";
     input.addEventListener(eventName, () => {
       let next;
       if (kind === "checkbox") next = input.checked;
@@ -3089,9 +3492,16 @@ function setupSettingsUI() {
       }
 
       store.update(section, { [key]: next });
+      if (key === "trackingProfile") updateProfileHint(next);
+      if (key === "handRole") updateHandRoleHint();
+      if (section === "tracking") renderHandWarnings();
       if (valueId) {
         const target = document.getElementById(valueId);
-        if (target) target.textContent = formatValue(next, decimals);
+        if (target) {
+          target.textContent = kind === "select"
+            ? String(next).toUpperCase()
+            : formatValue(next, decimals);
+        }
       }
     });
   }
@@ -3127,7 +3537,10 @@ function setupSettingsUI() {
   }
 
   document.getElementById("refresh-devices")?.addEventListener("click", refreshCameraList);
-  document.getElementById("calibrate-btn")?.addEventListener("click", calibrate);
+  document.getElementById("calibrate-btn")?.addEventListener("click", startCalibration);
+  document.getElementById("calibrate-cancel-btn")?.addEventListener("click", cancelCalibration);
+  document.getElementById("calibrate-clear-btn")?.addEventListener("click", clearCalibration);
+  document.getElementById("rearm-btn")?.addEventListener("click", rearmGestures);
   document.getElementById("reset-settings-btn")?.addEventListener("click", () => {
     store.reset();
     toast("Settings reset to defaults", "accent", 2600);
@@ -3267,7 +3680,8 @@ function applySettings({ section, keys } = {}) {
       moveSensitivity: settings.object.moveSensitivity,
       rotateSensitivity: settings.object.rotateSensitivity,
       scaleSensitivity: settings.object.scaleSensitivity,
-      zSensitivity: settings.object.depthSensitivity
+      zSensitivity: settings.object.depthSensitivity,
+      handRole: settings.gesture.handRole
     });
   }
 
@@ -3323,12 +3737,31 @@ function applyQuality(quality) {
 /* CALIBRATION                                                              */
 /* ------------------------------------------------------------------------- */
 
-function calibrate() {
+/**
+ * Re-arm the gesture engine: forget held state, reset filters, recentre.
+ *
+ * Does NOT touch pinch thresholds. Those describe the user's hands and are set
+ * by calibration; throwing them away on every re-arm would undo the calibration
+ * whenever someone nudged the webcam.
+ */
+function rearmGestures() {
   for (const analyzer of analyzers.values()) analyzer.reset();
   solver.reset();
   overlayHands.length = 0;
   overlayPinched.length = 0;
-  hoverLock = null;
+
+  // Drop the cached hover hit as well as the highlight it produced. The cache is
+  // what "holds" the hover steady between raycasts, so clearing it is what
+  // re-arms hovering after a reset.
+  //
+  // (There used to be a `hoverLock = null;` here. No such binding has ever
+  // existed, so this function threw a ReferenceError on every press and the
+  // calibrate button did nothing at all. It was reachable, not theoretical: the
+  // tests below call it.)
+  state.hoverNdc = null;
+  state.hoverRevision = null;
+  state.pointerTarget = null;
+  state.pointerKind = null;
 
   if (workspace) {
     workspace.setHover(null);
@@ -3336,15 +3769,182 @@ function calibrate() {
   }
   if (tracker) tracker.resetTracking();
 
+  setCalibrationLog(
+    `Re-armed ${new Date().toLocaleTimeString()} · filters reset · grab released · ` +
+    `object re-centred · thresholds ${settings.gesture.pinchThreshold.toFixed(2)}/` +
+    `${settings.gesture.pinchRelease.toFixed(2)}`
+  );
+}
+
+function setCalibrationLog(text, tone = "ok") {
   const log = document.getElementById("calibration-log");
-  if (log) {
-    const now = new Date();
-    log.textContent =
-      `Calibrated ${now.toLocaleTimeString()} · filters reset · grab released · ` +
-      `object re-centred · thresholds ${settings.gesture.pinchThreshold.toFixed(2)}/` +
-      `${settings.gesture.pinchRelease.toFixed(2)}`;
+  if (!log) return;
+  log.textContent = text;
+  log.dataset.tone = tone;
+}
+
+/* ------------------------------------------------------------------------- */
+/* PINCH CALIBRATION (§9)                                                    */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Start the two-pose capture.
+ *
+ * Refuses without a running camera: the whole point is to measure the user's own
+ * hands, and a capture that can never receive a sample would just sit there
+ * looking broken.
+ */
+function startCalibration() {
+  if (!tracker || tracker.status === TRACKER_STATUS.INACTIVE ||
+      tracker.status === TRACKER_STATUS.ERROR) {
+    setCalibrationLog("Start the camera first — calibration measures your hands.", "bad");
+    toast("Calibration needs the camera running", "", 2600);
+    return null;
   }
-  toast("Gesture engine calibrated — filters reset, object re-centred", "accent", 3200);
+
+  calibration.start();
+  const snapshot = calibration.snapshot();
+  renderCalibration(snapshot);
+  setCalibrationLog("Calibration started — hold each pose for the countdown.", "info");
+  return snapshot;
+}
+
+function cancelCalibration() {
+  calibration.cancel();
+  renderCalibration(calibration.snapshot());
+  setCalibrationLog("Calibration cancelled — thresholds unchanged.", "info");
+  return null;
+}
+
+/**
+ * Draw the current calibration step into the settings panel.
+ *
+ * @param {object} snapshot from CalibrationSession
+ */
+function renderCalibration(snapshot) {
+  const step = document.getElementById("calibrate-step");
+  if (!step) return;
+
+  const started = snapshot.active || snapshot.finished;
+  step.dataset.active = started ? "true" : "false";
+  delete step.dataset.tone;
+
+  const cancelButton = document.getElementById("calibrate-cancel-btn");
+  if (cancelButton) cancelButton.hidden = !snapshot.active;
+
+  const label = document.getElementById("calibrate-pose-label");
+  const countNode = document.getElementById("calibrate-count");
+  const bar = document.getElementById("calibrate-progress");
+  const hint = document.getElementById("calibrate-hint");
+
+  if (snapshot.active) {
+    const pose = snapshot.pose || POSES[0];
+    const remaining = Math.max(0, Math.ceil((1 - snapshot.progress) * (POSE_DURATION_MS / 1000)));
+    if (label) label.textContent = `${snapshot.poseIndex + 1} of ${snapshot.poseCount} · ${pose.label}`;
+    if (countNode) countNode.textContent = `${snapshot.samples} samples · ${remaining}s`;
+    if (bar) bar.style.width = `${Math.round(snapshot.progress * 100)}%`;
+    if (hint) hint.textContent = `${pose.instruction}. ${pose.detail}`;
+    return;
+  }
+
+  if (snapshot.finished && snapshot.result) {
+    const result = snapshot.result;
+    if (result.ok) {
+      step.dataset.tone = "ok";
+      if (label) label.textContent = "Calibrated";
+      if (countNode) countNode.textContent =
+        `${result.threshold.toFixed(2)} / ${result.release.toFixed(2)}`;
+      if (bar) bar.style.width = "100%";
+      if (hint) hint.textContent =
+        `Your open hand reads ${result.open.mean.toFixed(2)}, a pinch ` +
+        `${result.pinch.mean.toFixed(2)}. Thresholds fitted between them.`;
+    } else {
+      step.dataset.tone = "bad";
+      if (label) label.textContent = "Not calibrated";
+      if (countNode) countNode.textContent = "";
+      if (bar) bar.style.width = "0%";
+      if (hint) hint.textContent = result.message;
+    }
+    return;
+  }
+
+  if (label) label.textContent = "—";
+  if (countNode) countNode.textContent = "";
+  if (bar) bar.style.width = "0%";
+  if (hint) hint.textContent = "";
+}
+
+/**
+ * Commit a fitted result, or explain why nothing was committed.
+ *
+ * Refusals are not failures to hide: the log says what was wrong so the user can
+ * fix the pose instead of pressing the button again and hoping.
+ */
+function applyCalibrationResult(result) {
+  renderCalibration(calibration.snapshot());
+
+  if (!result?.ok) {
+    setCalibrationLog(result?.message || "Calibration could not read your hands.", "bad");
+    toast("Calibration did not take — thresholds unchanged", "", 3200);
+    return null;
+  }
+
+  const thresholds = { threshold: result.threshold, release: result.release };
+  store.update("gesture", {
+    pinchThreshold: thresholds.threshold,
+    pinchRelease: thresholds.release,
+    pinchCalibration: {
+      threshold: thresholds.threshold,
+      release: thresholds.release,
+      openMean: Number(result.open.mean.toFixed(3)),
+      pinchMean: Number(result.pinch.mean.toFixed(3)),
+      separation: Number(result.separation.toFixed(3)),
+      samples: { open: result.open.count, pinch: result.pinch.count },
+      calibratedAt: new Date().toISOString()
+    }
+  });
+
+  for (const analyzer of analyzers.values()) {
+    analyzer.updateSettings({
+      pinchThreshold: thresholds.threshold,
+      pinchRelease: thresholds.release
+    });
+  }
+
+  setCalibrationLog(
+    `Calibrated ${new Date().toLocaleTimeString()} · pinch ${thresholds.threshold.toFixed(2)} / ` +
+    `release ${thresholds.release.toFixed(2)} · from ${result.open.count + result.pinch.count} samples`
+  );
+  toast(`Pinch calibrated — ${thresholds.threshold.toFixed(2)} / ${thresholds.release.toFixed(2)}`,
+    "accent", 3200);
+  return thresholds;
+}
+
+/**
+ * Return to the built-in thresholds and forget the stored calibration.
+ *
+ * Needed because calibration can make things worse for some hands, and without
+ * a way back the only escape would be resetting every other setting too.
+ */
+function clearCalibration() {
+  calibration.cancel();
+  store.update("gesture", {
+    pinchThreshold: DEFAULT_THRESHOLDS.threshold,
+    pinchRelease: DEFAULT_THRESHOLDS.release,
+    pinchCalibration: null
+  });
+  for (const analyzer of analyzers.values()) {
+    analyzer.updateSettings({
+      pinchThreshold: DEFAULT_THRESHOLDS.threshold,
+      pinchRelease: DEFAULT_THRESHOLDS.release
+    });
+  }
+  renderCalibration(calibration.snapshot());
+  setCalibrationLog(
+    `Cleared · back to defaults ${DEFAULT_THRESHOLDS.threshold.toFixed(2)} / ` +
+    `${DEFAULT_THRESHOLDS.release.toFixed(2)}`
+  );
+  toast("Pinch calibration cleared", "", 2400);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3515,19 +4115,16 @@ function setupShortcuts() {
         toggleCameraView();
         break;
       // Standard views. Digits are taken by the interaction modes, so the
-      // view shortcuts are Shift+digit.
-      case "!":
+      // view shortcuts are Shift+digit. Before this, only Shift+1/2/3 existed
+      // and back, left, right and bottom were mouse-only.
+      case "!": case "@": case "#": case "$": case "%": case "^": case "&": {
         event.preventDefault();
-        setStandardView("front");
+        // viewForEvent also accepts a bare digit with shiftKey, so remapped and
+        // non-US layouts reach the same seven views.
+        const view = viewForEvent(event.key, event.shiftKey);
+        if (view) setStandardView(view);
         break;
-      case "@":
-        event.preventDefault();
-        setStandardView("top");
-        break;
-      case "#":
-        event.preventDefault();
-        setStandardView("iso");
-        break;
+      }
       case "m":
         // Voice: M for microphone, leaving V for the camera view.
         event.preventDefault();
@@ -3691,7 +4288,13 @@ window.HOLOCORE = {
   resetEnvironment,
   refreshSceneOutliner,
   switchModel,
-  calibrate,
+  startCalibration,
+  cancelCalibration,
+  clearCalibration,
+  rearmGestures,
+  applyCalibrationResult,
+  renderCalibration,
+  calibration,
   toast,
   setMode,
   setExplodeAmount,
@@ -3721,6 +4324,31 @@ window.HOLOCORE = {
     },
     // Drives the real per-frame hand pipeline with supplied landmarks, so the
     // tracking loop can be exercised without a camera.
-    processHands
+    processHands,
+
+    // --- observation-pipeline introspection (tests and diagnostics) ---------
+    // These read live pipeline state; none of them change behaviour.
+    /** Total samples the tip filter has been fed, across all analysed hands. */
+    tipSampleCount: () => {
+      let total = 0;
+      for (const hand of state.lastAnalysis?.activeStates || []) {
+        total += hand?.tipSamples ?? 0;
+      }
+      return total || [...analyzers.values()].reduce((n, a) => n + (a.tipFilter.samples || 0), 0);
+    },
+    duplicateFrameCount: () => state.duplicateFrames || 0,
+    pinchFrameValue: () => {
+      const hands = state.lastAnalysis?.activeStates || [];
+      return hands.map(hand => hand?.pinched ?? null).join(",");
+    },
+    analyzedSeq: () => state.analyzedSeq,
+    // Identity and analyser state are process-wide, exactly like the tracker and
+    // the solver. A test that wants a clean slate should reset all of them.
+    resetTrackingState,
+    handleTrackingTransition,
+    setToastProbe: fn => { toastProbe = fn || null; },
+    updateDiagnostics,
+    getDocument: () => document,
+    hoverNdc: () => ({ ...state.hoverNdc })
   }
 };

@@ -836,7 +836,9 @@ const mainSource = readFileSync(join(root, "main.js"), "utf8");
 const requiredIds = [
   "camera-toggle", "camera-video", "camera-overlay", "camera-activate", "camera-stop",
   "camera-retry", "inspector-root", "chat-form", "chat-input", "model-list", "part-list",
-  "set-pinch", "set-smoothing", "set-move", "set-camera-device", "calibrate-btn",
+  "set-pinch", "set-tracking-profile", "set-move", "set-camera-device", "calibrate-btn",
+  "calibrate-cancel-btn", "calibrate-clear-btn", "calibrate-step", "calibrate-progress",
+  "rearm-btn", "set-hand-role", "hint-hand-role", "hand-warnings",
   "reset-settings-btn", "tool-explode", "tool-isolate", "tool-focus", "tool-reset",
   "fullscreen-toggle", "status-camera", "status-hands", "status-gesture"
 ];

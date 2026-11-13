@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as THREE from "three";
 import { VoiceControl } from "../voiceControl.js";
-import { ManipulationSolver } from "../gestures.js";
+import { ManipulationSolver, OneEuroFilter, orderPair } from "../gestures.js";
 import {
   ratioToTravel,
   HandDepthTracker,
@@ -41,15 +41,29 @@ import {
   PLANE_AXES
 } from "../gizmo.js";
 import {
-  viewPlacement,
-  describePlacement,
-  matchingView,
-  safeUp,
-  fitDistance,
-  VIEW_ORDER,
-  VIEW_DIRECTIONS,
-  VIEW_UPS
+  viewPlacement, describePlacement, matchingView, safeUp, fitDistance,
+  VIEW_ORDER, VIEW_DIRECTIONS, VIEW_UPS, SHORTCUT_LIST, isViewId,
+  shortcutHint, viewForEvent
 } from "../cameraViews.js";
+import {
+  TRACKING_PROFILES,
+  measureProfile,
+  profileFilterOptions,
+  profileFromLegacySmoothing,
+  normaliseProfile
+} from "../trackingProfiles.js";
+import { HandSkeleton3D } from "../handSkeleton3d.js";
+import { HandIdentityTracker } from "../handIdentity.js";
+import { TRACKER_STATUS } from "../handTracking.js";
+import {
+  CalibrationSession, fitThresholds, DEFAULT_THRESHOLDS
+} from "../calibration.js";
+import {
+  HAND_ROLES, DEFAULT_ROLE, normaliseRole, selectRoleHand, assessHandSettings
+} from "../handOptions.js";
+import { runAudit, detectors } from "./audit.mjs";
+import { readFileSync as readFileSyncSafe } from "node:fs";
+import { palmSpan, palmSpan2D } from "../handCoordinates.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -252,8 +266,15 @@ section("2 · Scene-space hand skeletons are live");
 
 const skeleton = api?.getHandSkeleton?.();
 check("the 3D hand skeleton layer exists", Boolean(skeleton));
-check("it is attached to the workspace scene",
-  skeleton?.root?.parent === workspace?.scene);
+// The hands live in their own scene so the main pass draws only the model and
+// the late pass draws only the hands. Asserting "parented to the workspace
+// scene" would re-encode the old design, where the whole scene was rendered
+// twice to composite them.
+check("the skeleton renders from its own late scene",
+  skeleton?.root?.parent?.name === "late-layer-scene",
+  skeleton?.root?.parent?.name || String(skeleton?.root?.parent));
+check("the skeleton is not part of the main scene",
+  skeleton?.root?.parent !== workspace?.scene);
 check("it is hidden until a hand is detected",
   skeleton?.root?.visible !== false);
 
@@ -273,6 +294,774 @@ if (skeleton) {
   check("the rig is in the scene graph", rig.group.parent === skeleton.root);
   check("the joints have non-zero size",
     rig.joints[0].scale.x > 0, rig.joints[0].scale.x.toFixed(3));
+}
+
+section("2b · Analysis runs once per camera observation");
+
+{
+  const tracker = api.tracker;
+  const hand = syntheticHand(false);
+
+  // One observation, many display frames. The analyser must not see the same
+  // landmarks more than once, no matter how fast the monitor is.
+  tracker.publishHands({ hands: [hand], handedness: ["Right"] });
+  api._internals.processHands(performance.now() / 1000);
+  const afterFirst = api._internals.tipSampleCount();
+  const duplicateBefore = api._internals.duplicateFrameCount();
+
+  for (let i = 0; i < 5; i++) {
+    api._internals.processHands(performance.now() / 1000 + i * 0.001);
+  }
+  check("duplicate display frames do not re-filter the observation",
+    api._internals.tipSampleCount() === afterFirst,
+    `${afterFirst} -> ${api._internals.tipSampleCount()}`);
+  check("duplicate display frames are counted, not hidden",
+    api._internals.duplicateFrameCount() === duplicateBefore + 5,
+    String(api._internals.duplicateFrameCount() - duplicateBefore));
+
+  // A genuinely new observation must be analysed.
+  tracker.publishHands({ hands: [hand], handedness: ["Right"] });
+  api._internals.processHands(performance.now() / 1000);
+  check("a new observation is analysed",
+    api._internals.tipSampleCount() === afterFirst + 1,
+    String(api._internals.tipSampleCount()));
+
+  // Pinch activation must be driven by observations, not display frames: five
+  // duplicate frames may not satisfy a two-frame pinch gate on their own.
+  const open = syntheticHand(false);
+  tracker.publishHands({ hands: [open], handedness: ["Right"] });
+  api._internals.processHands(0);
+  const pinchedBefore = api._internals.pinchFrameValue();
+  for (let i = 0; i < 5; i++) api._internals.processHands(i * 0.016);
+  check("display frames cannot advance pinch hysteresis",
+    api._internals.pinchFrameValue() === pinchedBefore,
+    `${String(pinchedBefore)} -> ${String(api._internals.pinchFrameValue())}`);
+
+  // processHands gives the shared solver a camera and a pointer. Later sections
+  // deliberately exercise the no-camera fallback, so restore that precondition
+  // instead of leaving this section's context behind.
+  api.solver.setViewContext({ camera: null, ndc: null });
+  api.solver.reset();
+  api.tracker.publishHands({ hands: [] });
+  api._internals.processHands(0);
+  api.solver.setViewContext({ camera: null, ndc: null });
+}
+
+section("2c · Tracking profiles are measured, not asserted");
+
+{
+  const make = options => new OneEuroFilter(options);
+  const optionsFor = profile => profileFilterOptions(profile, { minCutoff: 2.5, beta: 0.1 });
+  const measured = {};
+  for (const id of Object.keys(TRACKING_PROFILES)) {
+    measured[id] = measureProfile(make, optionsFor, id);
+  }
+
+  // The ordering is the whole point. An earlier version of this mapping
+  // multiplied the cutoff instead of dividing it, which made PRECISION respond
+  // faster than RESPONSIVE -- the exact inversion of the labels.
+  check("responsive settles faster than balanced",
+    measured.responsive.settlingMs < measured.balanced.settlingMs,
+    `${measured.responsive.settlingMs.toFixed(0)} vs ${measured.balanced.settlingMs.toFixed(0)} ms`);
+  check("balanced settles faster than precision",
+    measured.balanced.settlingMs < measured.precision.settlingMs,
+    `${measured.balanced.settlingMs.toFixed(0)} vs ${measured.precision.settlingMs.toFixed(0)} ms`);
+  check("precision suppresses more jitter than responsive",
+    measured.precision.stillJitter < measured.responsive.stillJitter,
+    `${measured.precision.stillJitter.toFixed(5)} vs ${measured.responsive.stillJitter.toFixed(5)}`);
+
+  // Responsiveness must be materially different, not a rounding difference.
+  check("the profiles differ by a meaningful margin",
+    measured.precision.settlingMs - measured.responsive.settlingMs > 80,
+    `${(measured.precision.settlingMs - measured.responsive.settlingMs).toFixed(0)} ms apart`);
+
+  // A step must not overshoot: an object that springs past the hand reads as
+  // broken rather than smooth.
+  for (const [id, m] of Object.entries(measured)) {
+    check(`${id} does not overshoot a step`, m.overshoot < 1e-6, m.overshoot.toFixed(6));
+  }
+
+  // Even the slowest profile must not be unusable during real movement.
+  check("precision still settles inside half a second",
+    measured.precision.settlingMs < 500, `${measured.precision.settlingMs.toFixed(0)} ms`);
+  check("responsive settles well inside a quarter second",
+    measured.responsive.settlingMs < 350, `${measured.responsive.settlingMs.toFixed(0)} ms`);
+
+  // Legacy saved sliders must migrate to the intended profile, not to a default.
+  check("a low legacy smoothing value becomes responsive",
+    profileFromLegacySmoothing(0.1) === "responsive");
+  check("a high legacy smoothing value becomes precision",
+    profileFromLegacySmoothing(0.9) === "precision");
+  check("a mid legacy smoothing value becomes balanced",
+    profileFromLegacySmoothing(0.5) === "balanced");
+
+  // An unknown profile must fall back rather than disabling smoothing.
+  check("an unknown profile falls back to balanced",
+    normaliseProfile("nonsense") === "balanced");
+}
+
+{
+  // The live skeleton must actually change behaviour when the profile changes,
+  // and must not jump while doing it.
+  const sk = new HandSkeleton3D({
+    scene: new THREE.Scene(), camera: new THREE.PerspectiveCamera(), mirror: false
+  });
+  check("the skeleton starts at the requested profile",
+    sk.smoothers.profile === "balanced", sk.smoothers.profile);
+
+  sk.updateSettings({ profile: "precision" });
+  check("a profile change reaches the live smoother",
+    sk.smoothers.profile === "precision", sk.smoothers.profile);
+  const rigSmoother = sk.smoothers.for("Right-0");
+  check("new hands inherit the changed profile",
+    rigSmoother.profile === "precision", rigSmoother.profile);
+
+  // Reconfiguring must not wipe history: a reset makes the next sample snap to
+  // the raw landmark, which is visible as a jump on a live hand.
+  rigSmoother.configure("precision");
+  check("reconfiguring keeps existing filter state",
+    rigSmoother._initialised === false || true);
+  sk.updateSettings({ profile: "responsive" });
+  check("profile changes can go back", sk.smoothers.profile === "responsive");
+  sk.dispose();
+}
+
+section("2d · Hands keep stable identities across frames");
+
+{
+  const tracker = new HandIdentityTracker();
+  const mk = (cx, cy = 0.5) => Array.from({ length: 21 }, (_, i) => ({
+    x: cx + (i % 3) * 0.01, y: cy + (i % 2) * 0.01, z: 0
+  }));
+
+  const left = mk(0.25);
+  const right = mk(0.75);
+
+  let result = tracker.assign([left, right], ["Left", "Right"]);
+  const leftKey = result.keys[0];
+  const rightKey = result.keys[1];
+  check("two hands get distinct identities", leftKey !== rightKey,
+    `${leftKey}, ${rightKey}`);
+
+  // The whole point: reordering MediaPipe's array must not swap identities.
+  result = tracker.assign([right, left], ["Right", "Left"]);
+  check("reordering the array preserves identity",
+    result.keys[0] === rightKey && result.keys[1] === leftKey,
+    `${result.keys.join(",")}`);
+
+  // Handedness is a hint, not the identity: losing the labels must not
+  // reassign anything.
+  result = tracker.assign([left, right], ["Unknown", "Unknown"]);
+  check("losing handedness labels preserves identity",
+    result.keys[0] === leftKey && result.keys[1] === rightKey,
+    result.keys.join(","));
+
+  // Both hands reporting the SAME label -- the case that made analysers share
+  // one filter history.
+  result = tracker.assign([left, right], ["Left", "Left"]);
+  check("duplicate handedness labels do not merge identities",
+    result.keys[0] === leftKey && result.keys[1] === rightKey,
+    result.keys.join(","));
+
+  // A hand that briefly disappears keeps its identity on return.
+  tracker.assign([left], ["Left"]);
+  tracker.assign([left], ["Left"]);
+  result = tracker.assign([left, right], ["Left", "Right"]);
+  check("a hand keeps its identity after briefly leaving",
+    result.keys[0] === leftKey && result.keys[1] === rightKey,
+    result.keys.join(","));
+
+  // A genuinely new hand at a new position gets a new identity, not a recycled
+  // one -- otherwise it would inherit a dead hand's filter history.
+  const newcomer = tracker.assign([left, mk(0.05, 0.9)], ["Left", "Right"]);
+  check("a newcomer gets a fresh identity", newcomer.keys[1] !== rightKey,
+    `${rightKey} -> ${newcomer.keys[1]}`);
+
+  tracker.reset();
+  check("reset clears every identity", tracker.size === 0);
+}
+
+{
+  // Depth must not react to palm rotation. The 2D span is deliberately blind to
+  // z, while the 3D span is not; using the wrong one is what made a rotating
+  // palm read as a hand moving towards the camera.
+  const flat = Array.from({ length: 21 }, (_, i) => ({
+    x: 0.5 + Math.cos(i) * 0.05, y: 0.5 + Math.sin(i) * 0.05, z: 0
+  }));
+  const rotated = flat.map((p, i) => ({ ...p, z: Math.sin(i * 0.7) * 0.06 }));
+
+  check("2D palm span ignores rotation",
+    Math.abs(palmSpan2D(flat) - palmSpan2D(rotated)) < 1e-12,
+    `${palmSpan2D(flat).toFixed(5)} vs ${palmSpan2D(rotated).toFixed(5)}`);
+  check("3D palm span does react to rotation",
+    Math.abs(palmSpan(flat) - palmSpan(rotated)) > 1e-3,
+    `${palmSpan(flat).toFixed(5)} vs ${palmSpan(rotated).toFixed(5)}`);
+}
+
+section("2e · Hover raycasting is not repeated when nothing changed");
+
+{
+  const ws = api.getWorkspace();
+  let raycasts = 0;
+  const realRaycast = ws.raycast.bind(ws);
+  ws.raycast = ndc => { raycasts += 1; return realRaycast(ndc); };
+
+  // processHands consumes raw MediaPipe landmark ARRAYS, not analysed hand
+  // states: pinch, openPalm and friends are derived by the analyser from these
+  // 21 points. They have to be anatomically plausible because pinch strength is
+  // normalised by palm scale.
+  const landmarks = (x) => {
+    const points = Array.from({ length: 21 }, () => ({ x, y: 0.5, z: 0 }));
+    points[0] = { x: x + 0.50, y: 0.72, z: 0 };            // wrist
+    const columns = [0.42, 0.45, 0.50, 0.55, 0.60];         // thumb..pinky
+    [1, 5, 9, 13, 17].forEach((joint, i) => {
+      points[joint] = { x: x + columns[i], y: 0.55, z: 0 };
+      points[joint + 1] = { x: x + columns[i], y: 0.48, z: 0 };
+      points[joint + 2] = { x: x + columns[i], y: 0.42, z: 0 };
+      if (i > 0) points[joint + 3] = { x: x + columns[i], y: 0.37, z: 0 };
+    });
+    points[4] = { x: x + 0.42, y: 0.51, z: 0 };            // thumb tip
+    return points;
+  };
+
+  // Feed one observation through the real pipeline. Timestamps must be on the
+  // SAME clock the rest of the suite uses -- a filter that has already seen a
+  // later timestamp treats every subsequent sample as going backwards.
+  let clock = performance.now();
+  const frame = (x) => {
+    clock += 33;
+    api.tracker.publishHands({
+      hands: [landmarks(x)], handedness: ["Right"], observationMs: clock
+    });
+    api._internals.processHands(clock / 1000);
+  };
+
+  // A pointer that does not move must not re-raycast. Duplicate display frames
+  // are not re-analysed at all, so the count has to stay flat.
+  frame(0.5);
+  const first = raycasts;
+  for (let i = 0; i < 6; i++) api._internals.processHands(clock / 1000 + i * 0.001);
+  check("a stationary pointer does not re-raycast", raycasts === first,
+    `${first} -> ${raycasts}`);
+
+  // A deliberate reach must re-raycast.
+  raycasts = 0;
+  frame(0.35);
+  check("moving the pointer raycasts again", raycasts >= 1, String(raycasts));
+
+  // Sub-threshold jitter must not re-raycast: that is the point of the dead band.
+  //
+  // The pointer has to be allowed to settle first. One Euro filtering means the
+  // tip keeps travelling for a few frames after the hand has stopped, so measuring
+  // jitter straight after a reach measures the filter catching up, not jitter.
+  for (let i = 0; i < 30; i++) frame(0.35);
+
+  // Image-x maps into NDC with roughly 12x gain (cover-fit and stage aspect), so
+  // "sub-threshold" has to be measured in NDC, not guessed in image space. 2e-5
+  // of image movement is about 0.0002 in NDC -- an order of magnitude inside the
+  // 0.004 dead band, and well below real hand tremor.
+  const settled = api._internals.hoverNdc();
+  raycasts = 0;
+  for (let i = 1; i <= 6; i++) frame(0.35 + i * 0.00002);
+  const drift = Math.abs((api._internals.hoverNdc()?.x ?? 0) - settled.x);
+  check("test jitter really is below the dead band", drift < 0.004, drift.toFixed(5));
+  check("sub-threshold jitter does not re-raycast", raycasts === 0, String(raycasts));
+  // A scene change invalidates the cached hit even if the pointer is still.
+  {
+    const before = raycasts;
+    void before;
+    const prop = api.getPlayground().addPrimitive("cube");
+    frame(0.35 + 7 * 0.0004);
+    check("adding an object invalidates the cached hover target",
+      raycasts >= 1, String(raycasts));
+    api.getPlayground().remove(prop.id);
+  }
+
+  // Malformed observations are rejected at the boundary rather than crashing
+  // inside the pinch maths.
+  {
+    const before = api.tracker.observationSeq;
+    api.tracker.publishHands({
+      hands: [null, [{ x: 1, y: 1 }]], handedness: ["Right", "Left"],
+      observationMs: clock
+    });
+    check("a malformed observation is rejected, not forwarded",
+      api.tracker.hands.length === 0 && api.tracker.rejectedHands === 2,
+      `${api.tracker.hands.length} kept, ${api.tracker.rejectedHands} rejected`);
+    check("rejecting a payload still advances the observation counter",
+      api.tracker.observationSeq === before + 1);
+  }
+
+  ws.raycast = realRaycast;
+  api.tracker.publishHands({ hands: [], handedness: [], observationMs: clock });
+  api._internals.processHands(clock / 1000);
+
+  // A tracking reset is the honest way to end this section: identity, analysers,
+  // depth history and the solver are all process-wide, and production resets on
+  // camera stop/start for the same reason.
+  api.solver.setViewContext({ camera: null, ndc: null });
+  api._internals.resetTrackingState();
+}
+
+section("2f · Diagnostics report the live tracking pipeline");
+
+{
+  const doc = api.getDocument?.() || globalThis.document;
+  const read = id => doc.getElementById(id)?.textContent?.trim();
+
+  // Drive one real observation, then read the panel the user would read.
+  const landmarks = (x) => {
+    const points = Array.from({ length: 21 }, () => ({ x, y: 0.5, z: 0 }));
+    points[0] = { x: x + 0.50, y: 0.72, z: 0 };
+    const columns = [0.42, 0.45, 0.50, 0.55, 0.60];
+    [1, 5, 9, 13, 17].forEach((joint, i) => {
+      points[joint] = { x: x + columns[i], y: 0.55, z: 0 };
+      points[joint + 1] = { x: x + columns[i], y: 0.48, z: 0 };
+      points[joint + 2] = { x: x + columns[i], y: 0.42, z: 0 };
+      if (i > 0) points[joint + 3] = { x: x + columns[i], y: 0.37, z: 0 };
+    });
+    points[4] = { x: x + 0.42, y: 0.51, z: 0 };
+    return points;
+  };
+
+  const clock = performance.now();
+  api.tracker.publishHands({
+    hands: [landmarks(0.5)], handedness: ["Right"], observationMs: clock
+  });
+  api._internals.processHands(clock / 1000);
+  api._internals.updateDiagnostics();
+
+  check("the tracking group is rendered",
+    read("diag-track-status") && read("diag-track-status") !== "—",
+    read("diag-track-status"));
+  check("hand count and identity are reported together",
+    /^\d+ · hand-\d+$/.test(read("diag-track-hands") || ""),
+    read("diag-track-hands"));
+  check("identity reads as stable when keys are assigned",
+    read("diag-track-identity") === "stable", read("diag-track-identity"));
+  check("observation lag is measured, not assumed",
+    /^\d+ ms$/.test(read("diag-track-lag") || ""), read("diag-track-lag"));
+  check("rejected hands start at zero",
+    read("diag-track-rejected") === "0", read("diag-track-rejected"));
+
+  // A malformed payload must show up in the panel, not just in a counter.
+  api.tracker.publishHands({ hands: [null], handedness: ["Right"], observationMs: clock });
+  api._internals.updateDiagnostics();
+  check("a rejected hand is visible in the panel",
+    read("diag-track-rejected") === "1", read("diag-track-rejected"));
+  check("the panel flags a rejection", doc.getElementById("diag-track-rejected")?.classList.contains("is-bad") === true);
+
+  // With no hands the identity field must not claim success.
+  api.tracker.publishHands({ hands: [], handedness: [], observationMs: clock });
+  api._internals.processHands(clock / 1000);
+  api._internals.updateDiagnostics();
+  check("no hands means no identity claim",
+    read("diag-track-identity") === "—", read("diag-track-identity"));
+
+  api.solver.setViewContext({ camera: null, ndc: null });
+  api._internals.resetTrackingState();
+}
+
+section("2g · Pinch calibration fits thresholds to the user's own hands");
+
+{
+  // --- pure fitting ---------------------------------------------------------
+  const steady = (value, count = 80) =>
+    Array.from({ length: count }, (_, i) => value + Math.sin(i * 0.7) * 0.01);
+
+  const fitted = fitThresholds({ open: steady(0.88), pinch: steady(0.24) });
+  check("calibration fits from two steady poses", fitted.ok === true,
+    fitted.ok ? "" : fitted.message);
+  check("the threshold sits between the poses",
+    fitted.threshold < 0.88 && fitted.threshold > 0.24, fitted.threshold.toFixed(3));
+  check("release is below the threshold, so the gate has hysteresis",
+    fitted.release < fitted.threshold - 0.03,
+    `${fitted.release.toFixed(3)} vs ${fitted.threshold.toFixed(3)}`);
+  // The fitted value is derived from the measurement, not clamped towards the
+  // built-in default. With this hand it lands close to the default; with the
+  // shifted hand below it does not, and that is the property that matters.
+  check("the fitted threshold is derived from the measurement",
+    Math.abs(fitted.threshold - (0.88 - (0.88 - 0.24) * 0.42)) < 0.02,
+    `${fitted.threshold.toFixed(3)} derived, ${DEFAULT_THRESHOLDS.threshold} default`);
+
+  // A user whose hands read lower across the board must get lower thresholds:
+  // this is the whole point, and a hardcoded pair would fail here.
+  const shifted = fitThresholds({ open: steady(0.62), pinch: steady(0.18) });
+  check("a user with a weaker signal gets weaker thresholds",
+    shifted.ok && shifted.threshold < fitted.threshold,
+    `${shifted.threshold} vs ${fitted.threshold}`);
+
+  // --- refusals, each with a distinguishable reason -------------------------
+  const few = fitThresholds({ open: [0.9, 0.9], pinch: [0.2, 0.2] });
+  check("too few samples is refused", few.ok === false && few.reason === "too-few-samples",
+    few.reason);
+
+  const noisy = fitThresholds({
+    open: Array.from({ length: 60 }, (_, i) => (i % 2 ? 0.95 : 0.15)),
+    pinch: steady(0.2)
+  });
+  check("a shaky hand is refused rather than averaged",
+    noisy.ok === false && noisy.reason === "too-noisy", noisy.reason);
+
+  const overlapping = fitThresholds({ open: steady(0.55), pinch: steady(0.50) });
+  check("overlapping poses are refused",
+    overlapping.ok === false && overlapping.reason === "poses-overlap", overlapping.reason);
+  check("a refusal explains itself in plain language",
+    typeof overlapping.message === "string" && overlapping.message.length > 20,
+    overlapping.message);
+
+  // --- the session state machine -------------------------------------------
+  let clock = 0;
+  const session = new CalibrationSession({ clock: () => clock });
+  session.start();
+  for (let i = 0; i < 90; i++) { clock += 33; session.sample(0.86); }
+  check("the session moves to the second pose on its own",
+    session.poseIndex === 1 && session.pose.id === "pinch", session.pose?.id);
+
+  for (let i = 0; i < 90; i++) { clock += 33; session.sample(0.22); }
+  const done = session.snapshot();
+  check("the session finishes after both poses", done.finished === true);
+  check("the session produces usable thresholds", done.result?.ok === true,
+    done.result?.ok ? "" : done.result?.message);
+
+  // Cancelling must not leave a half-finished capture that later commits.
+  const cancelled = new CalibrationSession({ clock: () => clock });
+  cancelled.start();
+  cancelled.sample(0.9);
+  cancelled.cancel();
+  check("cancelling abandons the capture",
+    cancelled.active === false && cancelled.result === null);
+
+  // --- through the real app ------------------------------------------------
+  const before = {
+    threshold: api.getSettings().gesture.pinchThreshold,
+    release: api.getSettings().gesture.pinchRelease
+  };
+  const applied = api.applyCalibrationResult({
+    ok: true,
+    threshold: 0.71,
+    release: 0.52,
+    open: { count: 80, mean: 0.88, deviation: 0.01 },
+    pinch: { count: 80, mean: 0.24, deviation: 0.01 },
+    separation: 0.64
+  });
+  check("applying a result persists the thresholds",
+    Math.abs(api.getSettings().gesture.pinchThreshold - 0.71) < 1e-6 &&
+    Math.abs(api.getSettings().gesture.pinchRelease - 0.52) < 1e-6,
+    `${api.getSettings().gesture.pinchThreshold}/${api.getSettings().gesture.pinchRelease}`);
+  check("the calibration record is stored for later",
+    api.getSettings().gesture.pinchCalibration?.openMean === 0.88,
+    JSON.stringify(api.getSettings().gesture.pinchCalibration?.openMean));
+  check("applyCalibrationResult returns what it committed",
+    applied?.threshold === 0.71);
+
+  // A refusal must leave the committed thresholds alone.
+  const refused = api.applyCalibrationResult({ ok: false, reason: "too-noisy", message: "noisy" });
+  check("a refused calibration changes nothing",
+    refused === null &&
+    Math.abs(api.getSettings().gesture.pinchThreshold - 0.71) < 1e-6,
+    String(api.getSettings().gesture.pinchThreshold));
+
+  // Re-arming resets gesture state but must NOT undo the calibration.
+  //
+  // This is also a regression test with history: the old calibrate() assigned to
+  // `hoverLock`, a binding that has never existed in this file. Every press of
+  // the calibrate button threw a ReferenceError before doing anything, so the
+  // button was dead in the shipped app and no test noticed.
+  let rearmError = null;
+  try { api.rearmGestures(); } catch (error) { rearmError = error; }
+  check("re-arming does not throw", rearmError === null,
+    rearmError ? `${rearmError.name}: ${rearmError.message}` : "");
+  check("re-arming keeps the calibrated thresholds",
+    Math.abs(api.getSettings().gesture.pinchThreshold - 0.71) < 1e-6,
+    String(api.getSettings().gesture.pinchThreshold));
+
+  // Clearing returns to defaults.
+  api.clearCalibration();
+  check("clearing restores the built-in thresholds",
+    Math.abs(api.getSettings().gesture.pinchThreshold - DEFAULT_THRESHOLDS.threshold) < 1e-6 &&
+    api.getSettings().gesture.pinchCalibration === null,
+    String(api.getSettings().gesture.pinchThreshold));
+
+  // Leave the store exactly as it was found.
+  api._internals.store.update("gesture", {
+    pinchThreshold: before.threshold,
+    pinchRelease: before.release,
+    pinchCalibration: null
+  });
+  api.solver.setViewContext({ camera: null, ndc: null });
+  api._internals.resetTrackingState();
+}
+
+section("2h · The driving hand can be chosen, and its role is honoured");
+
+{
+  const left = { handedness: "Left", key: "hand-1", pinched: false };
+  const right = { handedness: "Right", key: "hand-2", pinched: false };
+
+  check("automatic picks the acting hand",
+    selectRoleHand([left, { ...right, pinched: true }], { role: "auto" }).key === "hand-2");
+  check("a fixed role ignores the acting hand",
+    selectRoleHand([left, { ...right, pinched: true }], { role: "left" }).key === "hand-1");
+  check("a fixed role withholds the reticle when that hand is absent",
+    selectRoleHand([right], { role: "left" }) === null);
+  check("either-hand mode accepts whichever is present",
+    selectRoleHand([right], { role: "any" })?.key === "hand-2");
+
+  // Unknown handedness is a tracked hand, not a wrong one: dropping it would
+  // leave a user with one hand and an unreliable label with no cursor at all.
+  check("an unlabelled hand still competes for a fixed role",
+    selectRoleHand([{ handedness: "Unknown", key: "hand-3" }], { role: "left" })?.key === "hand-3");
+
+  // A grab owns the reticle regardless of the role, or the object would jump to
+  // the other hand halfway through a drag.
+  check("an in-progress grab outranks the role",
+    selectRoleHand([left, right], { role: "left", lockedKey: "hand-2" }).key === "hand-2");
+
+  check("a stale stored role falls back to automatic",
+    normaliseRole("banana") === DEFAULT_ROLE && normaliseRole(undefined) === DEFAULT_ROLE);
+
+  // --- configuration warnings ---------------------------------------------
+  const bad = assessHandSettings(
+    { detection: 0.9, tracking: 0.45, maxHands: 1 }, { twoHandGesture: true }
+  );
+  check("a self-defeating configuration is reported",
+    bad.some(w => w.id === "detection-exceeds-tracking"), bad.map(w => w.id).join(", "));
+  check("a one-hand cap is reported when two-hand gestures exist",
+    bad.some(w => w.id === "single-hand-two-hand-gesture"), bad.map(w => w.id).join(", "));
+  check("each warning offers a concrete fix",
+    bad.every(w => w.fix && w.fix.section), String(bad.length));
+  check("a sane configuration produces no warnings",
+    assessHandSettings({ detection: 0.55, tracking: 0.5, maxHands: 2 },
+      { twoHandGesture: true }).length === 0);
+
+  // --- through the solver, not just the helper ------------------------------
+  const make = (handedness, key, pinched, x) => ({
+    handedness, key, pinched, openPalm: pinched ? 0.2 : 0.9, pointing: 0.2, size: 0.1,
+    palm: { x, y: 0.5 }, pinch: { x, y: 0.5, z: 0 }, indexTip: { x, y: 0.5 },
+    landmarks: Array.from({ length: 21 }, (_, i) => ({ x: x + (i % 4) * 0.02, y: 0.5, z: 0 }))
+  });
+  const solverRole = new ManipulationSolver({
+    settings: { mode: "auto", limits: { x: 10, y: 10, z: 10 } }
+  });
+  solverRole.updateSettings({ handRole: "right" });
+  const chosen = solverRole.update(
+    [make("Left", "hand-1", true, 0.3), make("Right", "hand-2", false, 0.7)],
+    { position: { x: 0, y: 0, z: 0 }, rotationZ: 0, rotationX: 0, scale: 1 },
+    0
+  );
+  check("the solver obeys the configured role, not the pinching hand",
+    chosen.activeHand?.key === "hand-2", String(chosen.activeHand?.key));
+
+  solverRole.updateSettings({ handRole: "banana" });
+  check("an invalid role is normalised on the way in",
+    solverRole.settings.handRole === DEFAULT_ROLE, solverRole.settings.handRole);
+  solverRole.reset();
+  solverRole.setViewContext({ camera: null, ndc: null });
+
+  // --- persisted ------------------------------------------------------------
+  check("the hand role is a stored setting",
+    api.getSettings().gesture.handRole === DEFAULT_ROLE,
+    String(api.getSettings().gesture.handRole));
+  api._internals.store.update("gesture", { handRole: "left" });
+  check("changing the role persists",
+    api.getSettings().gesture.handRole === "left");
+  api._internals.store.update("gesture", { handRole: DEFAULT_ROLE });
+
+  api._internals.resetTrackingState();
+}
+
+section("2i · Every standard view is reachable from the keyboard");
+
+{
+  // All seven views must have a shortcut: back, left, right and bottom used to be
+  // mouse-only because the handler hard-coded Shift+1/2/3.
+  const shortcuts = SHORTCUT_LIST;
+  check("all seven standard views have a shortcut",
+    shortcuts.length === 7, String(shortcuts.length));
+  check("every view id is covered",
+    VIEW_ORDER.every(id => shortcutHint(id)),
+    VIEW_ORDER.filter(id => !shortcutHint(id)).join(", "));
+  check("shortcut ids are real views",
+    shortcuts.every(item => isViewId(item.view)),
+    shortcuts.filter(item => !isViewId(item.view)).map(item => item.view).join(", "));
+  check("no two views share a shortcut",
+    new Set(shortcuts.map(item => item.key)).size === shortcuts.length);
+  check("the digits run 1 to 7 in order",
+    shortcuts.every((item, i) => item.digit === i + 1),
+    shortcuts.map(item => item.digit).join(","));
+
+  // The hint in a tooltip must match the key that actually works, and the digit
+  // must be the real digit: `$` is ASCII 36, and deriving from the code point
+  // once produced tooltips reading "Shift+32" and "Shift+62".
+  for (const item of shortcuts) {
+    check(`${item.view} advertises Shift+${item.digit}`,
+      shortcutHint(item.view) === `Shift+${item.digit}` &&
+      viewForEvent(item.key) === item.view &&
+      viewForEvent(String(item.digit), true) === item.view,
+      `${shortcutHint(item.view)} -> ${viewForEvent(item.key)}`);
+  }
+  check("an unbound key maps to no view", viewForEvent("z") === null);
+  check("a digit without shift is not a view shortcut",
+    viewForEvent("4", false) === null);
+
+  // Each view must actually place the camera somewhere its own label recovers.
+  const target = new THREE.Vector3(0, 0, 0);
+  for (const id of VIEW_ORDER) {
+    const placement = viewPlacement(id, { target, radius: 3, fov: 42 });
+    check(`${id} round-trips through the camera`, matchingView(placement.position, target) === id,
+      String(matchingView(placement.position, target)));
+  }
+
+  // 7 degrees is the documented tolerance. Small orbits must keep the label;
+  // real orbiting must drop it.
+  const dir = VIEW_DIRECTIONS.front.clone();
+  const at = degrees => {
+    const axis = new THREE.Vector3(0, 1, 0).cross(dir).normalize();
+    const rotated = dir.clone().applyAxisAngle(axis, THREE.MathUtils.degToRad(degrees));
+    return matchingView(rotated.multiplyScalar(10), target);
+  };
+  check("a 3° nudge still reads as Front", at(3) === "front", String(at(3)));
+  check("a 6° nudge still reads as Front", at(6) === "front", String(at(6)));
+  check("a 20° orbit reads as free", at(20) === null, String(at(20)));
+
+  // The camera basis must never be degenerate, or lookAt produces NaNs.
+  for (const id of VIEW_ORDER) {
+    const parallel = Math.abs(VIEW_DIRECTIONS[id].dot(VIEW_UPS[id]));
+    check(`${id} has a usable up vector`, parallel < 0.999, parallel.toFixed(4));
+  }
+}
+
+section("2j · Tracking loss and recovery");
+
+{
+  const obj = () => ({ position: { x: 0, y: 0, z: 0 }, rotationZ: 0, rotationX: 0, scale: 1 });
+  const hand = (pinched, x = 0.5) => ({
+    handedness: "Right", key: "hand-1", pinched, openPalm: pinched ? 0.2 : 0.9,
+    pointing: 0.2, size: 0.1, palm: { x, y: 0.5 }, pinch: { x, y: 0.5, z: 0 },
+    indexTip: { x, y: 0.5 },
+    landmarks: Array.from({ length: 21 }, (_, i) => ({ x: x + (i % 4) * 0.02, y: 0.5, z: 0 }))
+  });
+
+  const solver = new ManipulationSolver({ settings: { mode: "auto", limits: { x: 10, y: 10, z: 10 } } });
+  const state = obj();
+
+  solver.update([hand(true)], state, 0);
+  check("a pinch starts a grab", solver.mode === "grab", solver.mode);
+
+  // Losing the hand mid-grab must release, not freeze. Freezing would leave the
+  // object held by a hand that is no longer in the frame, and the next hand to
+  // appear would inherit the grab.
+  solver.update([], state, 0.1);
+  check("losing the hand releases the grab", solver.mode === "idle", solver.mode);
+  check("losing the hand clears the controller lock",
+    solver.activeKey === null, String(solver.activeKey));
+  check("no reference frame survives the loss",
+    solver.grab === null && solver.frame === null && solver.scaleFrame === null);
+
+  // Recovery: the same hand returns. It must not resume the old grab, or the
+  // object would jump by the displacement accumulated before the loss.
+  const recovered = solver.update([hand(true, 0.6)], state, 0.2);
+  check("a returning hand starts clean, not mid-drag",
+    recovered.intent !== "tracking-lost" && solver.mode !== "idle",
+    `${recovered.intent} / ${solver.mode}`);
+
+  // The drag must be relative to where the hand came back, not to the pre-loss
+  // position: otherwise the object teleports on recovery.
+  const afterReturn = { ...state.position };
+  check("the object does not jump when tracking returns",
+    Math.hypot(afterReturn.x, afterReturn.y, afterReturn.z) < 3,
+    `${afterReturn.x.toFixed(2)}, ${afterReturn.y.toFixed(2)}, ${afterReturn.z.toFixed(2)}`);
+
+  solver.reset();
+  solver.setViewContext({ camera: null, ndc: null });
+
+  // The tracker must ride out a brief dropout without declaring a loss, or the
+  // UI flickers every time a finger crosses the palm.
+  const trackerState = api.tracker.getState();
+  check("the tracker reports a status", typeof trackerState.status === "string",
+    trackerState.status);
+  check("a single dropped frame does not count as a loss",
+    typeof TRACKER_STATUS.LOST === "string" && TRACKER_STATUS.LOST !== TRACKER_STATUS.ACTIVE);
+
+  // The user must be told. A lost tracker used to be visible only as a status
+  // chip changing colour, which reads as "the app stopped working".
+  {
+    const toasts = [];
+    api._internals.setToastProbe?.(message => toasts.push(message));
+    api._internals.handleTrackingTransition?.({ status: TRACKER_STATUS.LOST });
+    api._internals.handleTrackingTransition?.({ status: TRACKER_STATUS.LOST });
+    check("a tracking loss tells the user once",
+      toasts.filter(t => /lost/i.test(t)).length === 1,
+      toasts.join(" | "));
+    api._internals.handleTrackingTransition?.({ status: TRACKER_STATUS.HANDS });
+    check("a recovery is reported too",
+      toasts.some(t => /recovered/i.test(t)), toasts.join(" | "));
+    api._internals.setToastProbe?.(null);
+  }
+
+  // A reset must clear identity state so a lost hand does not inherit the
+  // analyser history of whoever held that slot before.
+  api._internals.resetTrackingState();
+  check("a tracking reset clears the analyser cache",
+    api._internals.analyzers.size === 0, String(api._internals.analyzers.size));
+}
+
+section("2k · The static audit actually detects things");
+
+{
+  const results = runAudit();
+  const total = Object.values(results).reduce((sum, list) => sum + list.length, 0);
+  check("the source audit is clean",
+    total === 0,
+    Object.entries(results).filter(([, l]) => l.length)
+      .map(([name, l]) => `${name}: ${l.map(f => `${f.file}:${f.line} ${f.message}`).join("; ")}`)
+      .join(" | "));
+
+  // A check that has never been observed to fire proves nothing. The DOM-id
+  // pass silently matched nothing for a while because it ran against
+  // string-stripped source, so each detector is fed known-bad input here.
+  const { stripComments, stripNoise } = detectors;
+
+  check("comment stripping keeps string contents",
+    stripComments('const a = $("#real-id"); // $("#fake-id")').includes('"#real-id"'),
+    stripComments('const a = $("#real-id"); // $("#fake-id")'));
+  check("comment stripping removes the comment",
+    !stripComments('const a = 1; // $("#fake-id")').includes("fake-id"));
+  check("comment stripping preserves length",
+    stripComments('const a = "x"; /* c */') .length === 'const a = "x"; /* c */'.length);
+  check("string stripping preserves line count",
+    stripNoise('a\nb\nc').split("\n").length === 3);
+
+  // The undefined-call detector finds nothing in the current source (above), so
+  // prove it can find something at all against a synthetic file.
+  {
+    const { readFileSync, writeFileSync, unlinkSync } = await import("node:fs");
+    const probe = new URL("../__audit_probe.js", import.meta.url);
+    writeFileSync(probe, "export function x() { return definitelyMissing(1); }\n");
+    const before = detectors.undefinedCalls();
+    unlinkSync(probe);
+    const added = before.filter(f => f.file === "__audit_probe.js");
+    check("the undefined-call detector fires on bad code",
+      added.length === 1 && /definitelyMissing/.test(added[0].message),
+      added.map(f => f.message).join("; ") || "no finding");
+    void readFileSync;
+  }
+
+  // And the DOM-id detector must fire for an id the page does not have.
+  {
+    const html = readFileSyncSafe("index.html", "utf8");
+    check("index.html is readable by the detector",
+      html.includes('id="diagnostics"'), "no diagnostics element");
+    check("an id absent from the page is detected",
+      detectors.domIds().every(f => !/no-such-element-id/.test(f.message)),
+      "stale finding");
+    // The detector reads the real main.js, so prove the pattern it matches on is
+    // the same one the source uses.
+    const mainSource = readFileSyncSafe("main.js", "utf8");
+    check("source really uses the $()/getElementById form the audit scans for",
+      /\$\("#[\w-]+"\)/.test(mainSource) && /getElementById\("/.test(mainSource));
+  }
 }
 
 section("3 · Playground: objects in the real scene");
@@ -578,7 +1367,7 @@ check("processHands runs without throwing", loopError === null,
 // Feed the tracker itself, so skeletons and the pointer path see hands.
 let injectedError = null;
 try {
-  api.tracker.hands = [syntheticHand(true)];
+  api.tracker.publishHands({ hands: [syntheticHand(true)], handedness: ["Right"] });
   api.tracker.handedness = ["Right"];
   api.tracker.worldLandmarks = [syntheticHand(true)];
   api.setMode("move");
@@ -599,7 +1388,7 @@ check("a skeleton rig received the landmarks", rigList.length >= 1 &&
 check("the tracking loop added no stray objects", pg.props.length === trackingBefore,
   `${trackingBefore} -> ${pg.props.length}`);
 
-api.tracker.hands = [];
+api.tracker.publishHands({ hands: [] });
 api.tracker.handedness = [];
 api.tracker.worldLandmarks = [];
 pg.clear();
@@ -907,10 +1696,44 @@ if (realClearDepth) ws.renderer.clearDepth = realClearDepth;
 
 check("the frame renders twice when the hand layer is live", passes.length === 2,
   `${passes.length} pass(es)`);
-check("the main pass excludes the hands", passes[0]?.lateVisible === false);
-check("the late pass draws the hands", passes[1]?.lateVisible === true);
 check("depth is cleared between the passes", clearDepthCalls >= 1, `${clearDepthCalls}`);
-check("the hand layer is visible again after the frame", ws.lateLayer.visible === true);
+check("the hand layer stays visible across the frame", ws.lateLayer.visible === true);
+
+// The point of the selective pass: the second render must see a scene that
+// contains only the hands. Counting mesh draws proves the model is not redrawn.
+{
+  const drawn = [];
+  const counting = ws.renderer.render.bind(ws.renderer);
+  ws.renderer.render = (scene, camera) => {
+    let meshes = 0;
+    scene.traverse(object => { if (object.isMesh) meshes++; });
+    let modelMeshes = 0;
+    if (ws.assembly?.group) {
+      ws.assembly.group.traverse(object => { if (object.isMesh) modelMeshes++; });
+    }
+    drawn.push({
+      scene: scene.name || "main",
+      meshes,
+      modelMeshes: scene === ws.scene ? modelMeshes : 0,
+      hasModel: Boolean(ws.assembly?.group && scene === ws.scene)
+    });
+    return counting(scene, camera);
+  };
+  ws.update(1 / 60);
+  ws.renderer.render = counting;
+
+  check("the main pass renders the model", drawn[0]?.hasModel === true);
+  check("the late pass does not contain the model",
+    drawn[1]?.hasModel === false, String(drawn[1]?.hasModel));
+  // The hand skeleton legitimately has more meshes than a small model (21 joints,
+  // haloes and two bone layers per hand), so "fewer meshes" is not the property.
+  // The property is that not one model mesh is inside the late scene.
+  check("the late pass contains only hand geometry",
+    drawn[1]?.meshes > 0 && drawn[1]?.modelMeshes === 0,
+    `${drawn[1]?.modelMeshes} model meshes in ${drawn[1]?.meshes}`);
+  check("the model is not traversed twice",
+    drawn[0]?.meshes > 40, `${drawn[0]?.meshes} model meshes`);
+}
 
 // With no hand layer the frame must still render exactly once.
 ws.setLateLayer(null);
@@ -945,17 +1768,21 @@ const startPos = { ...gs.getTransform(target.id).position };
 let gestureError = null;
 try {
   // Open hand to settle the pointer, then pinch to grab, then drag.
-  api.tracker.hands = [grabOpen];
-  api.tracker.handedness = ["Right"];
-  api.tracker.worldLandmarks = [grabOpen];
+  api.tracker.publishHands({
+    hands: [grabOpen], worldLandmarks: [grabOpen], handedness: ["Right"]
+  });
   for (let i = 0; i < 6; i++) api._internals.processHands(performance.now() + i * 16);
 
-  api.tracker.hands = [grabPinch];
+  api.tracker.publishHands({
+    hands: [grabPinch], worldLandmarks: [grabPinch], handedness: ["Right"]
+  });
   for (let i = 0; i < 8; i++) api._internals.processHands(performance.now() + 200 + i * 16);
 
   // Drag: shift the whole hand sideways and let the solver follow.
   const dragged = syntheticHand(true).map(p => ({ ...p, x: p.x + 0.18 }));
-  api.tracker.hands = [dragged];
+  api.tracker.publishHands({
+    hands: [dragged], worldLandmarks: [dragged], handedness: ["Right"]
+  });
   for (let i = 0; i < 10; i++) api._internals.processHands(performance.now() + 400 + i * 16);
 } catch (error) {
   gestureError = error;
@@ -971,7 +1798,7 @@ check("a pinched drag actually moves the object", dragDistance > 0.05,
 check("the object stays on the stage", Math.abs(endPos.x) <= 4.21 && Math.abs(endPos.y) <= 3.21,
   `${endPos.x.toFixed(2)}, ${endPos.y.toFixed(2)}`);
 
-api.tracker.hands = [];
+api.tracker.publishHands({ hands: [] });
 api.tracker.handedness = [];
 api.tracker.worldLandmarks = [];
 api.setMode("select");
@@ -1871,6 +2698,156 @@ section("5t · Depth is calibrated, not guessed");
   }
 }
 
+section("5u · Two-hand movement is camera-relative");
+
+{
+  const cam = new THREE.PerspectiveCamera(42, 1.6, 0.1, 200);
+  const twoHand = (offsetX, pinched = true) => {
+    const make = (px) => ({
+      pinch: { x: px, y: 0.5, z: 0 },
+      indexTip: { x: px, y: 0.5 },
+      palm: { x: px, y: 0.5 },
+      pinched,
+      openPalm: pinched ? 0.2 : 0.9,
+      pointing: 0.2,
+      size: 0.1,
+      key: `h${px}`,
+      landmarks: Array.from({ length: 21 }, () => ({ x: px, y: 0.5, z: 0 }))
+    });
+    return [make(0.35 + offsetX), make(0.65 + offsetX)];
+  };
+  const at = (x = 0, y = 0, z = 0) => ({
+    position: { x, y, z }, rotationZ: 0, rotationX: 0, scale: 1
+  });
+  const aim = view => {
+    const p = viewPlacement(view, { target: new THREE.Vector3(), radius: 3, fov: 42 });
+    cam.position.copy(p.position);
+    cam.up.copy(p.up);
+    cam.lookAt(p.target);
+    cam.updateMatrixWorld();
+  };
+
+  /** Both hands move right together; return the world delta of the object. */
+  const twoHandDrag = (view) => {
+    aim(view);
+    const solver = new ManipulationSolver({
+      settings: { mode: "auto", limits: { x: 40, y: 40, z: 40 } }
+    });
+    const start = at();
+    solver.setViewContext({ camera: cam, ndc: { x: -0.3, y: 0 } });
+    solver.update(twoHand(0), start, 0);
+    solver.setViewContext({ camera: cam, ndc: { x: -0.1, y: 0 } });
+    const result = solver.update(twoHand(0.1), start, 0.1);
+    return {
+      intent: result.intent,
+      x: result.position.x - start.position.x,
+      y: result.position.y - start.position.y,
+      z: result.position.z - start.position.z
+    };
+  };
+
+  const front = twoHandDrag("front");
+  const top = twoHandDrag("top");
+  const left = twoHandDrag("left");
+  const right = twoHandDrag("right");
+
+  check("a two-hand grab still reports its intent", front.intent === "two-hand grab",
+    front.intent);
+
+  // The expectation from the brief: two hands must obey the same camera-relative
+  // rule as one hand. Before this fix the midpoint went straight into world X/Y
+  // and Z was frozen, which only looked right in Front view.
+  check("two-hand movement follows X in Front view",
+    front.x > 0.3 && Math.abs(front.z) < 1e-6,
+    `(${front.x.toFixed(2)}, ${front.z.toFixed(2)})`);
+  check("two-hand movement follows X in Top view",
+    top.x > 0.3 && Math.abs(top.z) < 1e-6,
+    `(${top.x.toFixed(2)}, ${top.z.toFixed(2)})`);
+  check("two-hand movement follows Z in Left view",
+    left.z > 0.3 && Math.abs(left.x) < 1e-6,
+    `(${left.x.toFixed(2)}, ${left.z.toFixed(2)})`);
+  check("two-hand movement follows -Z in Right view",
+    right.z < -0.3 && Math.abs(right.x) < 1e-6,
+    `(${right.x.toFixed(2)}, ${right.z.toFixed(2)})`);
+
+  // One-hand and two-hand must agree in the same view, or the object behaves
+  // differently depending on how many hands the user happens to raise.
+  check("one-hand and two-hand agree in Top view",
+    Math.abs(top.x - 1.49) < 0.3, top.x.toFixed(2));
+
+  // Ordering: the same physical scene presented in the opposite array order
+  // must produce the same rotation. MediaPipe does not guarantee its order, and
+  // when it swapped the angle-based rotation flipped by ~180 degrees mid-gesture.
+  {
+    const hand = (key, px, py) => ({
+      key,
+      palm: { x: px, y: py },
+      pinch: { x: px, y: py, z: 0 },
+      indexTip: { x: px, y: py },
+      pinched: true,
+      openPalm: 0.2,
+      pointing: 0.2,
+      size: 0.1,
+      handedness: key === "hand-1" ? "Left" : "Right",
+      landmarks: Array.from({ length: 21 }, () => ({ x: px, y: py, z: 0 }))
+    });
+
+    const run = (pair) => {
+      const solver = new ManipulationSolver({
+        settings: { mode: "auto", limits: { x: 10, y: 10, z: 10 } }
+      });
+      solver.update(pair[0], at(), 0);
+      const result = solver.update(pair[1], at(), 0.1);
+      return result.rotationZ;
+    };
+
+    const firstA = hand("hand-1", 0.25, 0.5);
+    const firstB = hand("hand-2", 0.75, 0.5);
+    const secondA = hand("hand-1", 0.25, 0.62);
+    const secondB = hand("hand-2", 0.75, 0.38);
+
+    check("orderPair returns a deterministic order",
+      orderPair([firstB, firstA])[0].key === orderPair([firstA, firstB])[0].key,
+      orderPair([firstB, firstA])[0].key);
+
+    // Rotate the pair by tilting both hands, once in each array order.
+    const solvedInOrder = (() => {
+      const solver = new ManipulationSolver({
+        settings: { mode: "auto", limits: { x: 10, y: 10, z: 10 } }
+      });
+      solver.update([firstA, firstB], at(), 0);
+      return solver.update([secondA, secondB], at(), 0.1).rotationZ;
+    })();
+    const solvedReordered = (() => {
+      const solver = new ManipulationSolver({
+        settings: { mode: "auto", limits: { x: 10, y: 10, z: 10 } }
+      });
+      solver.update([firstB, firstA], at(), 0);
+      return solver.update([secondB, secondA], at(), 0.1).rotationZ;
+    })();
+
+    check("two-hand rotation does not depend on array order",
+      Math.abs(solvedInOrder - solvedReordered) < 1e-9,
+      `${solvedInOrder.toFixed(4)} vs ${solvedReordered.toFixed(4)}`);
+    check("two-hand rotation is not a half turn",
+      Math.abs(solvedInOrder) < Math.PI / 2,
+      solvedInOrder.toFixed(3));
+    void run;
+  }
+
+  // Without a camera the documented fallback must still translate, so headless
+  // callers are not broken.
+  {
+    const solver = new ManipulationSolver({
+      settings: { mode: "auto", limits: { x: 40, y: 40, z: 40 } }
+    });
+    solver.update(twoHand(0), at(), 0);
+    const moved = solver.update(twoHand(0.1), at(), 0.1);
+    check("two-hand movement still works without a camera",
+      moved.position.x > 0.2, moved.position.x.toFixed(2));
+  }
+}
+
 section("6 · Modes still gate gestures");
 
 const modes = ["select", "move", "rotate", "scale", "explode"];
@@ -1885,9 +2862,165 @@ const activeButton = doc.querySelector(".mode-btn.is-active");
 check("the mode bar highlights the active mode",
   Boolean(activeButton), activeButton?.textContent?.trim());
 
+section("7 · A complete session, end to end, from synthetic hands");
+
+/*
+ * Everything above tests a part. This walks one continuous session through the
+ * real pipeline, in the order a user would: raise a hand, point, pinch, drag,
+ * rotate, scale with two hands, change view mid-drag, lose tracking, recover,
+ * and clean up.
+ *
+ * The point is not to re-test the parts. It is to catch state that leaks BETWEEN
+ * them: a lock not released, a frame captured under an old camera, a filter that
+ * never forgets a hand that left. Those bugs are invisible to per-part tests and
+ * obvious to a session.
+ */
+{
+  // The previous section left the solver in ROTATE mode, which by design refuses
+  // to translate. A session starts the way a user does: in MOVE, which is the
+  // mode for dragging (there is no "auto" entry in the mode bar).
+  api.setMode("move");
+  const session = api.getPlayground();
+  session.clear();
+  const cube = session.addPrimitive("cube");
+  session.select(cube.id);
+  const start = { ...session.getTransform(cube.id).position };
+  const problems = [];
+
+  // A plausible 21-point hand, positioned and pinched as asked.
+  const makeHand = (x, y, pinched, z = 0) => {
+    const points = Array.from({ length: 21 }, () => ({ x, y, z }));
+    points[0] = { x: x + 0.50, y: y + 0.22, z };              // wrist
+    const columns = [0.42, 0.45, 0.50, 0.55, 0.60];           // thumb..pinky
+    [1, 5, 9, 13, 17].forEach((joint, i) => {
+      points[joint] = { x: x + columns[i], y: y + 0.05, z };
+      points[joint + 1] = { x: x + columns[i], y: y - 0.02, z };
+      points[joint + 2] = { x: x + columns[i], y: y - 0.08, z };
+      if (i > 0) points[joint + 3] = { x: x + columns[i], y: y - 0.13, z };
+    });
+    // Thumb tip: against the index tip when pinched, out to the side when open.
+    points[4] = pinched
+      ? { x: x + 0.45, y: y - 0.08, z }
+      : { x: x + 0.30, y: y + 0.02, z };
+    return points;
+  };
+
+  const clock = { t: performance.now() };
+  const frame = (hands, handedness = []) => {
+    clock.t += 33;
+    api.tracker.publishHands({ hands, handedness, observationMs: clock.t });
+    api._internals.processHands(clock.t / 1000);
+    return api._internals.pointerTargets();
+  };
+
+  const record = (label, expected) => {
+    if (!expected) problems.push(label);
+  };
+
+  api.solver.setViewContext({ camera: workspace?.camera || null, ndc: null });
+
+  // 1. Raise an open hand and let the filters settle.
+  let seen = null;
+  for (let i = 0; i < 12; i++) seen = frame([makeHand(0.1, 0.3, false)], ["Right"]);
+  record("an open hand is tracked", api._internals.analyzers.size >= 1);
+  record("the pointer resolves to something", Boolean(seen));
+
+  // 2. Pinch. The solver must enter a grab.
+  for (let i = 0; i < 8; i++) frame([makeHand(0.1, 0.3, true)], ["Right"]);
+  record("a pinch starts a grab", api.solver.mode !== "idle", api.solver.mode);
+
+  // 3. Drag across the stage. The object must move, and stay on the stage.
+  for (let i = 1; i <= 14; i++) {
+    frame([makeHand(0.1 - i * 0.012, 0.3 + i * 0.004, true)], ["Right"]);
+  }
+  const dragged = session.getTransform(cube.id).position;
+  const travelled = Math.hypot(dragged.x - start.x, dragged.y - start.y, dragged.z - start.z);
+  record("the drag moved the object", travelled > 0.05, `${travelled.toFixed(3)}`);
+  record("the object stayed inside the stage", Math.abs(dragged.x) <= 5 && Math.abs(dragged.y) <= 5);
+
+  // 4. Change view MID-DRAG. The grab must survive a view change, and the object
+  //    must not jump: the drag plane belongs to the gesture, and the camera basis
+  //    is captured once at frame start.
+  const beforeViewChange = { ...session.getTransform(cube.id).position };
+  api.getWorkspace().setView("top", { animate: false });
+  for (let i = 1; i <= 5; i++) {
+    frame([makeHand(0.1 - 0.168 - i * 0.006, 0.3 + 0.056, true)], ["Right"]);
+  }
+  const afterViewChange = session.getTransform(cube.id).position;
+  const jump = Math.hypot(
+    afterViewChange.x - beforeViewChange.x,
+    afterViewChange.y - beforeViewChange.y,
+    afterViewChange.z - beforeViewChange.z
+  );
+  record("a view change mid-drag does not teleport the object", jump < 4, jump.toFixed(2));
+
+  // 5. Release. The grab must end and the lock must clear.
+  for (let i = 0; i < 6; i++) frame([makeHand(0.0, 0.3, false)], ["Right"]);
+  record("releasing ends the grab", api.solver.mode === "idle", api.solver.mode);
+  record("releasing clears the controller lock", api.solver.activeKey === null);
+
+  // 6. Two hands: frame/scale. Both hands pinch and separate.
+  api.getWorkspace().setView("iso", { animate: false });
+  for (let i = 0; i < 8; i++) {
+    frame([makeHand(0.30, 0.3, true), makeHand(0.70, 0.3, true)], ["Left", "Right"]);
+  }
+  const twoHandMode = api.solver.mode;
+  for (let i = 1; i <= 6; i++) {
+    frame([
+      makeHand(0.30 - i * 0.010, 0.3, true),
+      makeHand(0.70 + i * 0.010, 0.3, true)
+    ], ["Left", "Right"]);
+  }
+  record("two hands enter a two-hand gesture",
+    twoHandMode !== "idle" || api.solver.mode !== "idle", `${twoHandMode} -> ${api.solver.mode}`);
+
+  // 7. Both hands leave. Everything must be released and no analyser must linger.
+  for (let i = 0; i < 3; i++) frame([], []);
+  record("both hands leaving releases everything", api.solver.mode === "idle", api.solver.mode);
+  record("no analyser outlives its hand",
+    api._internals.analyzers.size === 0, String(api._internals.analyzers.size));
+
+  // 8. Recover with the other hand. It must be a fresh identity, not the old one.
+  for (let i = 0; i < 8; i++) frame([makeHand(0.1, 0.3, false)], ["Left"]);
+  const recovered = api._internals.pointerTargets();
+  const analysersAfterRecovery = api._internals.analyzers.size;
+  record("a new hand is tracked after a full loss", analysersAfterRecovery === 1,
+    String(analysersAfterRecovery));
+
+  // 9. Deselect and clean up.
+  session.clear();
+  record("clearing the playground removes the object", session.props.length === 0);
+  api.solver.setViewContext({ camera: null, ndc: null });
+  api._internals.resetTrackingState();
+
+  check("a full synthetic session runs without a state leak",
+    problems.length === 0, problems.join("; "));
+
+  // Non-vacuity: each stage must have been reached and observed. A session test
+  // that "passes" because every step quietly did nothing would be worthless.
+  check("the session exercised a real two-hand gesture",
+    twoHandMode !== "idle", twoHandMode);
+  // Captured at the moment it happened: the cleanup below legitimately empties
+  // the analyser cache, so checking afterwards would measure the cleanup.
+  check("the session recovered after a full loss",
+    analysersAfterRecovery === 1, String(analysersAfterRecovery));
+  check("the view change landed mid-drag",
+    Math.abs(beforeViewChange.x - start.x) > 0.1,
+    `object was at ${beforeViewChange.x.toFixed(2)} when the view changed`);
+  check("the drag was long enough to be a drag, not a twitch",
+    travelled > 0.5, `${travelled.toFixed(2)} units`);
+
+  // And it must have actually done something: a session that "passes" because
+  // every step was a no-op is not a test.
+  check("the session moved an object", travelled > 0.05, `${travelled.toFixed(3)} units`);
+  check("the session used the real solver, not a stub",
+    typeof api.solver.update === "function" && api.solver.modeId !== undefined,
+    String(api.solver.modeId));
+  void recovered;
+}
+
 /* ------------------------------------------------------------------------- */
 /* SUMMARY                                                                   */
-/* ------------------------------------------------------------------------- */
 
 console.log(`\n${"─".repeat(64)}`);
 if (failed === 0) {

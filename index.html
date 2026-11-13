@@ -276,20 +276,39 @@
         <div class="diag" id="diagnostics" data-open="false">
           <button type="button" class="diag-toggle" id="diag-toggle" aria-expanded="false">
             <span class="diag-dot" aria-hidden="true"></span>
-            RENDER DIAGNOSTICS
+            DIAGNOSTICS
           </button>
-          <dl class="diag-grid" id="diag-grid">
-            <dt>MODEL</dt><dd id="diag-model">—</dd>
-            <dt>MESHES</dt><dd id="diag-meshes">—</dd>
-            <dt>VISIBLE</dt><dd id="diag-visible">—</dd>
-            <dt>TRIANGLES</dt><dd id="diag-tris">—</dd>
-            <dt>BOUNDS</dt><dd id="diag-bounds">—</dd>
-            <dt>CAM DIST</dt><dd id="diag-camdist">—</dd>
-            <dt>ATTACHED</dt><dd id="diag-attached">—</dd>
-            <dt>IN FRAME</dt><dd id="diag-infrustum">—</dd>
-            <dt>RENDER LOOP</dt><dd id="diag-loop">—</dd>
-            <dt>WEBGL ERRORS</dt><dd id="diag-errors">—</dd>
-          </dl>
+          <div class="diag-body">
+            <div class="diag-col">
+              <h3 class="diag-group">RENDER</h3>
+              <dl class="diag-grid" id="diag-grid">
+                <dt>MODEL</dt><dd id="diag-model">—</dd>
+                <dt>MESHES</dt><dd id="diag-meshes">—</dd>
+                <dt>VISIBLE</dt><dd id="diag-visible">—</dd>
+                <dt>TRIANGLES</dt><dd id="diag-tris">—</dd>
+                <dt>BOUNDS</dt><dd id="diag-bounds">—</dd>
+                <dt>CAM DIST</dt><dd id="diag-camdist">—</dd>
+                <dt>ATTACHED</dt><dd id="diag-attached">—</dd>
+                <dt>IN FRAME</dt><dd id="diag-infrustum">—</dd>
+                <dt>RENDER LOOP</dt><dd id="diag-loop">—</dd>
+                <dt>WEBGL ERRORS</dt><dd id="diag-errors">—</dd>
+              </dl>
+            </div>
+            <div class="diag-col">
+              <h3 class="diag-group">TRACKING</h3>
+              <dl class="diag-grid">
+                <dt>TRACKER</dt><dd id="diag-track-status">—</dd>
+                <dt>CAMERA FPS</dt><dd id="diag-track-fps">—</dd>
+                <dt>INFERENCE</dt><dd id="diag-track-inference">—</dd>
+                <dt>DELEGATE</dt><dd id="diag-track-delegate">—</dd>
+                <dt>HANDS</dt><dd id="diag-track-hands">—</dd>
+                <dt>IDENTITY</dt><dd id="diag-track-identity">—</dd>
+                <dt>DUPLICATE FRAMES</dt><dd id="diag-track-duplicate">—</dd>
+                <dt>REJECTED</dt><dd id="diag-track-rejected">—</dd>
+                <dt>OBS LAG</dt><dd id="diag-track-lag">—</dd>
+              </dl>
+            </div>
+          </div>
         </div>
 
         <!-- Floating stage toolbar -->
@@ -548,6 +567,17 @@
           <span>Tracking confidence <b id="val-tracking">0.50</b></span>
           <input type="range" id="set-tracking" min="0.2" max="0.9" step="0.05">
         </label>
+        <label class="field">
+          <span>Driving hand</span>
+          <select id="set-hand-role">
+            <option value="auto">Automatic — whichever hand is acting</option>
+            <option value="right">Right hand drives</option>
+            <option value="left">Left hand drives</option>
+            <option value="any">Either hand drives</option>
+          </select>
+        </label>
+        <div class="settings-hint" id="hint-hand-role"></div>
+        <div class="settings-warn" id="hand-warnings" hidden></div>
       </section>
 
       <section class="settings-group">
@@ -561,8 +591,15 @@
           <input type="range" id="set-release" min="0.15" max="0.85" step="0.02">
         </label>
         <label class="field">
-          <span>Tracking smoothing <b id="val-smoothing">0.45</b></span>
-          <input type="range" id="set-smoothing" min="0" max="1" step="0.05">
+          <span>Tracking profile <b id="val-profile">BALANCED</b></span>
+          <select id="set-tracking-profile">
+            <option value="responsive">Responsive — follows fast hand movement</option>
+            <option value="balanced">Balanced — recommended</option>
+            <option value="precision">Precision — steadiest, for fine placement</option>
+          </select>
+          <small class="field-hint" id="hint-profile">
+            Responsive settles ~300 ms after a quick move; Precision ~470 ms with the least jitter.
+          </small>
         </label>
         <label class="switch-field">
           <span>Rotational inertia on release</span>
@@ -619,16 +656,39 @@
       </section>
 
       <section class="settings-group">
-        <h3>Calibration & reset</h3>
+        <h3>Pinch calibration</h3>
         <p class="settings-note">
-          Calibration re-arms the gesture engine: it forgets any held grab, resets the
-          smoothing filters and returns the object to a neutral pose. Use it whenever
-          the object feels offset from your hands — for a new user, a moved webcam, or
-          after tracking loss.
+          Pinch thresholds are a guess until they have met your hands. Calibration
+          watches you hold an open hand, then a pinch, and fits the thresholds between
+          the two — useful if pinches feel too hard to trigger, or trigger on their own.
+          Camera mode required.
         </p>
-        <button class="btn btn-sm" id="calibrate-btn">Calibrate now</button>
-        <button class="btn btn-sm btn-ghost" id="reset-settings-btn">Reset all settings</button>
+        <div class="calibrate-row">
+          <button class="btn btn-sm" id="calibrate-btn">Calibrate pinch</button>
+          <button class="btn btn-sm btn-ghost" id="calibrate-cancel-btn" hidden>Cancel</button>
+          <button class="btn btn-sm btn-ghost" id="calibrate-clear-btn">Clear</button>
+        </div>
+        <div class="calibrate-step" id="calibrate-step" data-active="false" aria-live="polite">
+          <div class="calibrate-pose">
+            <span id="calibrate-pose-label">—</span>
+            <span class="calibrate-count" id="calibrate-count"></span>
+          </div>
+          <div class="calibrate-bar"><i id="calibrate-progress"></i></div>
+          <div class="calibrate-hint" id="calibrate-hint"></div>
+        </div>
         <div class="calibration-log" id="calibration-log"></div>
+      </section>
+
+      <section class="settings-group">
+        <h3>Re-arm gesture engine</h3>
+        <p class="settings-note">
+          Re-arming forgets any held grab, resets the smoothing filters and returns the
+          object to a neutral pose. Use it whenever the object feels offset from your
+          hands — for a new user, a moved webcam, or after tracking loss. It does not
+          change your pinch thresholds.
+        </p>
+        <button class="btn btn-sm" id="rearm-btn">Re-arm now</button>
+        <button class="btn btn-sm btn-ghost" id="reset-settings-btn">Reset all settings</button>
       </section>
 
       <section class="settings-group">

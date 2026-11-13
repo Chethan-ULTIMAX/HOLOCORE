@@ -32,6 +32,12 @@
 
 import * as THREE from "three";
 import { OneEuroFilter } from "./gestures.js";
+import {
+  normaliseProfile,
+  profileFilterOptions,
+  profileFromLegacySmoothing,
+  TRACKING_PROFILES
+} from "./trackingProfiles.js";
 
 /**
  * Defaults tuned against measured step and jitter responses at 30 fps.
@@ -70,16 +76,13 @@ function tuningFor(index) {
  * would defeat the purpose.
  */
 export class HandJointSmoother {
-  constructor({ timeConstant = 1 } = {}) {
+  constructor({ profile = "balanced" } = {}) {
+    this.profile = normaliseProfile(profile);
     // One OneEuroFilter per joint per axis. Flat arrays keep the per-frame work
     // to indexed writes instead of property lookups on 21 objects.
     this.filters = [];
     for (let i = 0; i < 21; i++) {
-      const tuning = tuningFor(i);
-      const options = {
-        minCutoff: tuning.minCutoff * timeConstant,
-        beta: tuning.beta / Math.max(0.1, timeConstant)
-      };
+      const options = profileFilterOptions(this.profile, tuningFor(i));
       this.filters.push([
         new OneEuroFilter(options),
         new OneEuroFilter(options),
@@ -87,6 +90,26 @@ export class HandJointSmoother {
       ]);
     }
     this._initialised = false;
+  }
+
+  /**
+   * Reconfigure for a profile WITHOUT dropping history.
+   *
+   * A settings change must not reset: `reset()` discards every joint's state, so
+   * the next sample is taken raw and the skeleton visibly jumps before easing
+   * back. One Euro converges from its current value, so reconfiguring the cutoff
+   * is continuous.
+   */
+  configure(profile) {
+    this.profile = normaliseProfile(profile);
+    for (let i = 0; i < 21; i++) {
+      const options = profileFilterOptions(this.profile, tuningFor(i));
+      const [fx, fy, fz] = this.filters[i];
+      fx.configure(options);
+      fy.configure(options);
+      fz.configure(options);
+    }
+    return this.profile;
   }
 
   /** Drop all history so the next sample is taken as-is (tracking regained). */
@@ -153,7 +176,8 @@ export class HandJointSmoother {
 export class HandSmootherRegistry {
   constructor({ settings = {} } = {}) {
     this.smoothers = new Map();
-    this.settings = settings;
+    this.profile = normaliseProfile(settings.profile ?? "balanced");
+    this.settings = { ...settings, profile: this.profile };
   }
 
   /**
@@ -163,7 +187,9 @@ export class HandSmootherRegistry {
   for(key) {
     let smoother = this.smoothers.get(key);
     if (!smoother) {
-      smoother = new HandJointSmoother(this.settings);
+      // New hands inherit the current profile, so a hand that enters after a
+      // settings change is not silently filtered at the old one.
+      smoother = new HandJointSmoother({ profile: this.profile });
       this.smoothers.set(key, smoother);
     }
     return smoother;
@@ -190,26 +216,34 @@ export class HandSmootherRegistry {
     }
   }
 
-  updateSettings({ smoothing } = {}) {
-    if (typeof smoothing !== "number") return;
-    // The settings panel exposes a 0..1 "smoothing" slider; map it onto the
-    // filter's time constant. Low smoothing = wide open, high = heavy.
-    const timeConstant = 0.5 + smoothing * 1.5;
-    this.settings = { ...this.settings, timeConstant };
+  /**
+   * Change the smoothing profile.
+   *
+   * Accepts a named profile ("responsive" | "balanced" | "precision") or, for
+   * backwards compatibility with a saved 0..1 slider value, a number which is
+   * migrated to the nearest profile.
+   *
+   * The filters are RECONFIGURED, never reset. Resetting on a settings change
+   * discarded every hand's history and made the skeleton jump to the raw
+   * landmarks before easing back, which is exactly the visible glitch a settings
+   * change should not produce. One Euro adapts to a new cutoff from its existing
+   * state without a discontinuity.
+   */
+  updateSettings({ smoothing, profile } = {}) {
+    const next = profile
+      ? normaliseProfile(profile)
+      : typeof smoothing === "number"
+        ? profileFromLegacySmoothing(smoothing)
+        : null;
+    if (!next) return this.profile;
+
+    this.profile = next;
+    this.settings = { ...this.settings, profile: next };
+
     for (const smoother of this.smoothers.values()) {
-      smoother.reset();
-      for (let i = 0; i < 21; i++) {
-        const tuning = tuningFor(i);
-        const options = {
-          minCutoff: tuning.minCutoff * timeConstant,
-          beta: tuning.beta / Math.max(0.1, timeConstant)
-        };
-        const [fx, fy, fz] = smoother.filters[i];
-        fx.configure(options);
-        fy.configure(options);
-        fz.configure(options);
-      }
+      smoother.configure(next);
     }
+    return next;
   }
 
   dispose() {

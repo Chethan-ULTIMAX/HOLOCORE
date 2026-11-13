@@ -5,6 +5,11 @@
  * Every value here is wired to real behaviour in main.js — there are no
  * decorative settings.
  */
+import {
+  normaliseProfile,
+  profileFromLegacySmoothing
+} from "./trackingProfiles.js";
+
 
 const KEY = "holocore.settings.v1";
 
@@ -37,7 +42,27 @@ export const DEFAULT_SETTINGS = {
     pinchThreshold: 0.62,
     pinchRelease: 0.44,
     smoothing: 0.45,
-    inertia: true
+    inertia: true,
+    /**
+     * Tracking smoothing profile. Replaces the old 0..1 "smoothing" slider,
+     * which mapped its value onto the filter backwards. A saved numeric value
+     * from an older version is migrated to the nearest profile on load.
+     */
+    trackingProfile: "balanced",
+    /**
+     * Which hand may drive the reticle (§10): auto | left | right | any.
+     * Excluded hands are still tracked and can still join a two-hand gesture.
+     */
+    handRole: "auto",
+    /**
+     * Per-user pinch calibration from §9, or null when never calibrated.
+     *
+     * The defaults above are a reasonable starting point for most hands, but
+     * hand size, camera distance and lighting all shift the raw pinch signal.
+     * Calibration measures the user's own open and closed values and fits the
+     * thresholds between them.
+     */
+    pinchCalibration: null
   },
   object: {
     moveSensitivity: 1,
@@ -84,6 +109,34 @@ function deepMerge(base, override) {
   return out;
 }
 
+/**
+ * Bring a saved settings object up to date.
+ *
+ * Settings live in localStorage, so a user who has run an older build has an
+ * object that predates any new key. `deepMerge` fills in new defaults, but it
+ * cannot know that an old key has been REPLACED by a different one. That is what
+ * this function is for, and it is deliberately a pure function so it can be
+ * asserted directly with a synthetic old-settings object.
+ *
+ * Migration 1: `gesture.smoothing` (0..1 slider) -> `gesture.trackingProfile`.
+ * The slider mapped its value onto the filter backwards, so its old values were
+ * never meaningful; picking the nearest profile preserves the user's intent
+ * (more or less smoothing) rather than replaying a broken mapping.
+ */
+export function migrateSettings(settings) {
+  const gesture = settings?.gesture;
+  if (!gesture) return settings;
+
+  if (gesture.trackingProfile === undefined || gesture.trackingProfile === null) {
+    gesture.trackingProfile = profileFromLegacySmoothing(gesture.smoothing);
+  }
+  // Any value that is not a known profile falls back rather than disabling
+  // smoothing entirely, which an unknown string would otherwise do.
+  gesture.trackingProfile = normaliseProfile(gesture.trackingProfile);
+  return settings;
+}
+
+/* ------------------------------------------------------------------------- */
 export class SettingsStore {
   constructor() {
     this.listeners = new Set();
@@ -94,7 +147,7 @@ export class SettingsStore {
     try {
       const raw = localStorage.getItem(KEY);
       if (!raw) return structuredClone(DEFAULT_SETTINGS);
-      return deepMerge(DEFAULT_SETTINGS, JSON.parse(raw));
+      return migrateSettings(deepMerge(DEFAULT_SETTINGS, JSON.parse(raw)));
     } catch {
       return structuredClone(DEFAULT_SETTINGS);
     }

@@ -80,6 +80,10 @@ export class HandTracker {
     this.handedness = [];
     this.lastVideoTime = -1;
     this.frameCount = 0;
+    /** Increments once per processed camera frame; never repeats. */
+    this.observationSeq = 0;
+    /** Arrival time of the newest observation, in milliseconds. */
+    this.observationMs = null;
     this.droppedFrames = 0;
     this.fps = 0;
     this.inferenceMs = 0;
@@ -323,13 +327,18 @@ export class HandTracker {
     this.fps = span > 0 ? Math.round(((this._fpsSamples.length - 1) / span) * 1000) : 0;
 
     const landmarks = result?.landmarks || [];
-    this.hands = landmarks;
     // Metric landmarks (metres, wrist-relative) give the 3D skeleton its real
     // shape and foreshortening. They are reported alongside the normalised
     // image landmarks and are what lets a rotating hand read as 3D rather than
     // as a flat billboard.
-    this.worldLandmarks = result?.worldLandmarks || [];
-    this.handedness = (result?.handednesses || []).map(entry => entry?.[0]?.categoryName || "Unknown");
+    this.publishHands({
+      hands: landmarks,
+      worldLandmarks: result?.worldLandmarks || [],
+      handedness: (result?.handednesses || []).map(
+        entry => entry?.[0]?.categoryName || "Unknown"
+      ),
+      observationMs: started
+    });
 
     if (landmarks.length > 0) {
       this._lostSince = null;
@@ -347,11 +356,129 @@ export class HandTracker {
     this.onFrame(this.getState());
   }
 
+  /**
+   * Publish a set of hands as a new observation.
+   *
+   * This is the single entry point for "new tracking data exists". It is called
+   * by `_processFrame()` once per camera frame, and can also be called by a
+   * replay source or a test that needs to simulate camera frames faithfully.
+   *
+   * Every published set gets a monotonically increasing sequence number, so the
+   * application can analyse each observation exactly once no matter how many
+   * display frames happen in between.
+   *
+   * @param {object} observation
+   * @param {Array} observation.hands normalised landmarks, per hand
+   * @param {Array} [observation.worldLandmarks] metric landmarks, per hand
+   * @param {string[]} [observation.handedness]
+   * @param {number} [observation.observationMs] arrival time, milliseconds
+   * @returns {number} the new sequence number
+   */
+  publishHands({
+    hands = [],
+    worldLandmarks = [],
+    handedness = [],
+    observationMs = null
+  } = {}) {
+    // Defensive: `hands = []` only covers an omitted argument. A caller that
+    // passes null, or a landmark list that is not an array of 21 points, must not
+    // reach the analysers -- a malformed frame used to surface as
+    // "Cannot read properties of undefined" from deep inside the pinch maths,
+    // which is a hard crash with no indication of where the bad data came from.
+    const validHands = Array.isArray(hands)
+      ? hands.filter(landmarks => Array.isArray(landmarks) && landmarks.length >= 21)
+      : [];
+    const validWorld = Array.isArray(worldLandmarks) ? worldLandmarks : [];
+
+    this.hands = validHands;
+    this.worldLandmarks = validWorld;
+    this.handedness = validHands.map((_, index) =>
+      Array.isArray(handedness) ? (handedness[index] || "Unknown") : "Unknown"
+    );
+    this.rejectedHands = (Array.isArray(hands) ? hands.length : 0) - validHands.length;
+    // Arrival time, not the display clock: this is what observation-interval
+    // filtering and pose-age diagnostics must measure against.
+    this.observationMs = observationMs ?? performance.now();
+    this.observationSeq += 1;
+    return this.observationSeq;
+  }
+
   /* --------------------------------------------------------------------- */
   /* CONTROL                                                               */
   /* --------------------------------------------------------------------- */
 
   /** Used by manual calibration: forget all tracking history. */
+  /**
+   * Begin a calibration capture, or keep feeding the one in progress.
+   *
+   * Calibration has to observe raw pinch strength, not the gated pinch state:
+   * the gate is what is being calibrated. Each call adds one sample and returns
+   * the accumulated statistics.
+   *
+   * @param {number} strength raw pinch strength 0..1 for one hand
+   * @returns {{samples:number, mean:number, deviation:number, ready:boolean}|null}
+   */
+  sampleCalibration(strength) {
+    if (!this._calibration) return null;
+    if (!Number.isFinite(strength)) return this.calibrationSummary();
+    this._calibration.samples.push(Math.max(0, Math.min(1, strength)));
+    // Keep a bounded window; a long calibration should describe the last few
+    // seconds, not average a hand that has since moved.
+    if (this._calibration.samples.length > 240) this._calibration.samples.shift();
+    return this.calibrationSummary();
+  }
+
+  /** Discard any calibration capture. */
+  cancelCalibration() {
+    this._calibration = null;
+    return null;
+  }
+
+  /**
+   * Start recording pinch strength.
+   *
+   * @param {number} durationMs how long the user must hold the pose
+   */
+  startCalibration(durationMs = 2500) {
+    this._calibration = {
+      startedAt: performance.now(),
+      durationMs,
+      samples: [],
+      minSamples: 20
+    };
+    return this.calibrationSummary();
+  }
+
+  /**
+   * Current calibration statistics.
+   *
+   * `ready` means there are enough samples AND the capture window has elapsed.
+   * The deviation is reported because it is actionable: a wide spread means the
+   * hand was moving or the lighting is poor, and committing thresholds from it
+   * would be worse than leaving the previous ones alone.
+   */
+  calibrationSummary() {
+    const capture = this._calibration;
+    if (!capture) return null;
+
+    const samples = capture.samples;
+    const count = samples.length;
+    const mean = count ? samples.reduce((sum, v) => sum + v, 0) / count : 0;
+    const deviation = count > 1
+      ? Math.sqrt(samples.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (count - 1))
+      : 0;
+    const elapsed = performance.now() - capture.startedAt;
+
+    return {
+      samples: count,
+      mean,
+      deviation,
+      elapsedMs: elapsed,
+      progress: capture.durationMs ? Math.min(1, elapsed / capture.durationMs) : 1,
+      ready: count >= capture.minSamples && elapsed >= capture.durationMs
+    };
+  }
+
   resetTracking() {
     this.hands = [];
     this.worldLandmarks = [];
@@ -360,6 +487,7 @@ export class HandTracker {
     this._fpsSamples = [];
     this.fps = 0;
     this._lostSince = null;
+    this._calibration = null;
     if (this._running) this._setStatus(TRACKER_STATUS.ACTIVE);
     return this.getState();
   }
