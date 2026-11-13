@@ -54,6 +54,7 @@ import {
 } from "../trackingProfiles.js";
 import { HandSkeleton3D } from "../handSkeleton3d.js";
 import { HandIdentityTracker } from "../handIdentity.js";
+import { TRACKER_STATUS } from "../handTracking.js";
 import {
   CalibrationSession, fitThresholds, DEFAULT_THRESHOLDS
 } from "../calibration.js";
@@ -927,6 +928,81 @@ section("2i · Every standard view is reachable from the keyboard");
     const parallel = Math.abs(VIEW_DIRECTIONS[id].dot(VIEW_UPS[id]));
     check(`${id} has a usable up vector`, parallel < 0.999, parallel.toFixed(4));
   }
+}
+
+section("2j · Tracking loss and recovery");
+
+{
+  const obj = () => ({ position: { x: 0, y: 0, z: 0 }, rotationZ: 0, rotationX: 0, scale: 1 });
+  const hand = (pinched, x = 0.5) => ({
+    handedness: "Right", key: "hand-1", pinched, openPalm: pinched ? 0.2 : 0.9,
+    pointing: 0.2, size: 0.1, palm: { x, y: 0.5 }, pinch: { x, y: 0.5, z: 0 },
+    indexTip: { x, y: 0.5 },
+    landmarks: Array.from({ length: 21 }, (_, i) => ({ x: x + (i % 4) * 0.02, y: 0.5, z: 0 }))
+  });
+
+  const solver = new ManipulationSolver({ settings: { mode: "auto", limits: { x: 10, y: 10, z: 10 } } });
+  const state = obj();
+
+  solver.update([hand(true)], state, 0);
+  check("a pinch starts a grab", solver.mode === "grab", solver.mode);
+
+  // Losing the hand mid-grab must release, not freeze. Freezing would leave the
+  // object held by a hand that is no longer in the frame, and the next hand to
+  // appear would inherit the grab.
+  solver.update([], state, 0.1);
+  check("losing the hand releases the grab", solver.mode === "idle", solver.mode);
+  check("losing the hand clears the controller lock",
+    solver.activeKey === null, String(solver.activeKey));
+  check("no reference frame survives the loss",
+    solver.grab === null && solver.frame === null && solver.scaleFrame === null);
+
+  // Recovery: the same hand returns. It must not resume the old grab, or the
+  // object would jump by the displacement accumulated before the loss.
+  const recovered = solver.update([hand(true, 0.6)], state, 0.2);
+  check("a returning hand starts clean, not mid-drag",
+    recovered.intent !== "tracking-lost" && solver.mode !== "idle",
+    `${recovered.intent} / ${solver.mode}`);
+
+  // The drag must be relative to where the hand came back, not to the pre-loss
+  // position: otherwise the object teleports on recovery.
+  const afterReturn = { ...state.position };
+  check("the object does not jump when tracking returns",
+    Math.hypot(afterReturn.x, afterReturn.y, afterReturn.z) < 3,
+    `${afterReturn.x.toFixed(2)}, ${afterReturn.y.toFixed(2)}, ${afterReturn.z.toFixed(2)}`);
+
+  solver.reset();
+  solver.setViewContext({ camera: null, ndc: null });
+
+  // The tracker must ride out a brief dropout without declaring a loss, or the
+  // UI flickers every time a finger crosses the palm.
+  const trackerState = api.tracker.getState();
+  check("the tracker reports a status", typeof trackerState.status === "string",
+    trackerState.status);
+  check("a single dropped frame does not count as a loss",
+    typeof TRACKER_STATUS.LOST === "string" && TRACKER_STATUS.LOST !== TRACKER_STATUS.ACTIVE);
+
+  // The user must be told. A lost tracker used to be visible only as a status
+  // chip changing colour, which reads as "the app stopped working".
+  {
+    const toasts = [];
+    api._internals.setToastProbe?.(message => toasts.push(message));
+    api._internals.handleTrackingTransition?.({ status: TRACKER_STATUS.LOST });
+    api._internals.handleTrackingTransition?.({ status: TRACKER_STATUS.LOST });
+    check("a tracking loss tells the user once",
+      toasts.filter(t => /lost/i.test(t)).length === 1,
+      toasts.join(" | "));
+    api._internals.handleTrackingTransition?.({ status: TRACKER_STATUS.HANDS });
+    check("a recovery is reported too",
+      toasts.some(t => /recovered/i.test(t)), toasts.join(" | "));
+    api._internals.setToastProbe?.(null);
+  }
+
+  // A reset must clear identity state so a lost hand does not inherit the
+  // analyser history of whoever held that slot before.
+  api._internals.resetTrackingState();
+  check("a tracking reset clears the analyser cache",
+    api._internals.analyzers.size === 0, String(api._internals.analyzers.size));
 }
 
 section("3 · Playground: objects in the real scene");

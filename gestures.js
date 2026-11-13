@@ -1259,6 +1259,13 @@ export class ManipulationSolver {
     this.rotationFrame = null;
     this.scaleFrame = null;
     this.explodeFrame = null;
+    // The controller lock belongs to the gesture, not to the hand. Leaving it set
+    // after a release means `activeKey` names a hand that may not even be in the
+    // frame any more. The next update clears it anyway, but a caller that reads
+    // the lock between frames -- a test, or a future hover rule -- would be told
+    // a hand still holds the controller when nothing is being held.
+    this.activeKey = null;
+    this.grabbing = false;
     this._setMode("idle");
   }
 

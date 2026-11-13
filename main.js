@@ -257,6 +257,7 @@ const state = {
   /** True while the workspace video element is actually showing frames. */
   cameraLive: false,
   diagnosticsOpen: false,
+  trackingWasLost: false,
   /** Per-part transform captured when a MOVE/ROTATE/SCALE gesture begins. */
   gestureTarget: null,
   gestureStart: null,
@@ -311,7 +312,10 @@ function finishBoot() {
 /* TOASTS                                                                    */
 /* ------------------------------------------------------------------------- */
 
+let toastProbe = null;
+
 function toast(message, kind = "", duration = 3200) {
+  toastProbe?.(message, kind);
   if (!dom.toastStack) return;
   const el = document.createElement("div");
   el.className = `toast ${kind}`.trim();
@@ -1407,8 +1411,38 @@ const STATUS_CLASS = {
   [TRACKER_STATUS.STOPPED]: ["CAMERA OFF", ""]
 };
 
+/**
+ * Was tracking lost, and has it come back?
+ *
+ * The status chip shows the current state, but a loss is easy to miss: the app
+ * simply stops responding to hands, which is indistinguishable from a gesture
+ * engine that has stopped working. Tell the user once when it happens and again
+ * when it recovers, and say what to do about it.
+ */
+function handleTrackingTransition(trackerState) {
+  const status = trackerState.status;
+  const wasLost = state.trackingWasLost === true;
+
+  if (status === TRACKER_STATUS.LOST && !wasLost) {
+    state.trackingWasLost = true;
+    setCalibrationLog(
+      "Tracking lost — no hands seen for a moment. Step back so your hands are " +
+      "in frame, and check the lighting. Gestures resume on their own.",
+      "bad"
+    );
+    toast("Tracking lost — move your hands into view", "warn", 3000);
+    return;
+  }
+
+  if (status !== TRACKER_STATUS.LOST && wasLost) {
+    state.trackingWasLost = false;
+    toast("Tracking recovered", "", 1600);
+  }
+}
+
 function updateTrackingUI(trackerState) {
   if (!trackerState) return;
+  handleTrackingTransition(trackerState);
 
   const [label, cls] = STATUS_CLASS[trackerState.status] || ["UNKNOWN", ""];
   dom.trackingState.textContent = label;
@@ -4311,6 +4345,8 @@ window.HOLOCORE = {
     // Identity and analyser state are process-wide, exactly like the tracker and
     // the solver. A test that wants a clean slate should reset all of them.
     resetTrackingState,
+    handleTrackingTransition,
+    setToastProbe: fn => { toastProbe = fn || null; },
     updateDiagnostics,
     getDocument: () => document,
     hoverNdc: () => ({ ...state.hoverNdc })
